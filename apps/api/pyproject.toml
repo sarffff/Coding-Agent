@@ -1,0 +1,16 @@
+[project]
+name = "coding-agent-api"
+version = "0.1.0"
+description = "FastAPI service foundation for Coding Agent"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "pydantic-settings>=2.5.0"
+]
+
+[tool.uvicorn]
+factory = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
