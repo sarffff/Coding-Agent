@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import os
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from pydantic import BaseModel
 
 from .config import Settings
 from .models import (
@@ -18,6 +21,15 @@ from .models import (
     RollbackResponse,
 )
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
+from .store import StateStore
+
+
+class PersistedCheckpoint(BaseModel):
+    """Checkpoint metadata; file contents live next to it under the state directory."""
+
+    summary: CheckpointSummary
+    applied_hashes: dict[str, str] = {}
+    missing: list[str] = []
 
 
 @dataclass(slots=True)
@@ -43,11 +55,55 @@ class Checkpoint:
 
 
 class PatchService:
-    def __init__(self, repositories: RepositoryService, settings: Settings):
+    def __init__(self, repositories: RepositoryService, settings: Settings, store: StateStore | None = None):
         self.repositories = repositories
         self.settings = settings
+        self.store = store
+        self.checkpoint_dir = (settings.state_dir / "checkpoints").resolve()
         self._patches: dict[str, PendingPatch] = {}
         self._checkpoints: dict[str, Checkpoint] = {}
+        self._keys: dict[str, str] = {}
+        if store:
+            for key, persisted in store.models("checkpoints", PersistedCheckpoint):
+                backup_dir = self.checkpoint_dir / persisted.summary.id
+                if not backup_dir.is_dir():
+                    continue
+                snapshots: dict[str, bytes | None] = {}
+                for name in persisted.summary.files:
+                    if name in persisted.missing:
+                        snapshots[name] = None
+                    else:
+                        snapshot = self._backup_path(backup_dir, name)
+                        snapshots[name] = snapshot.read_bytes() if snapshot.is_file() else b""
+                checkpoint = Checkpoint(
+                    summary=persisted.summary,
+                    backup_dir=backup_dir,
+                    snapshots=snapshots,
+                    applied_hashes=persisted.applied_hashes,
+                )
+                self._checkpoints[persisted.summary.id] = checkpoint
+                self._keys[persisted.summary.id] = key
+
+    def _persist(self, checkpoint: Checkpoint) -> None:
+        if not self.store:
+            return
+        key = self._keys.setdefault(checkpoint.summary.id, self.store.next_key("checkpoints"))
+        self.store.put(
+            "checkpoints",
+            key,
+            PersistedCheckpoint(
+                summary=checkpoint.summary,
+                applied_hashes=checkpoint.applied_hashes,
+                missing=[name for name, content in checkpoint.snapshots.items() if content is None],
+            ),
+            checkpoint.summary.created_at.isoformat(),
+        )
+
+    def _backup_path(self, backup_dir: Path, relative_path: str) -> Path:
+        target = (backup_dir / relative_path).resolve()
+        if not target.is_relative_to(backup_dir):
+            raise RepositoryError("INVALID_CHECKPOINT_PATH", "A checkpoint file escapes its backup directory.")
+        return target
 
     def list_checkpoints(self, checkpoint_ids: list[str]) -> list[CheckpointSummary]:
         return [self._checkpoints[item].summary for item in checkpoint_ids if item in self._checkpoints]
@@ -155,6 +211,7 @@ class PatchService:
         checkpoint = self._create_checkpoint(repository, patch.files)
         checkpoint.summary.run_id = patch.run_id
         checkpoint.applied_hashes = {item.path: self._content_hash(None if item.operation == "delete" else item.content) for item in patch.files}
+        self._persist(checkpoint)
         try:
             for patch_file in patch.files:
                 target = self._safe_target(repository, patch_file.path)
@@ -207,18 +264,20 @@ class PatchService:
             raise RepositoryError("ROLLBACK_FAILED", "Rollback failed; original file contents were restored.") from exc
         for item in chain:
             item.summary.restored = True
+            self._persist(item)
         return RollbackResponse(checkpoint=checkpoint.summary, restored_files=sorted(original), restored_checkpoint_ids=[item.summary.id for item in chain])
 
     def _create_checkpoint(self, repository: RepositoryRecord, files: list[PatchFile]) -> Checkpoint:
         checkpoint_id = f"checkpoint-{uuid4().hex[:12]}"
-        backup_dir = Path(tempfile.mkdtemp(prefix=f"forge-{checkpoint_id}-"))
+        backup_dir = self.checkpoint_dir / checkpoint_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
         snapshots: dict[str, bytes | None] = {}
         for patch_file in files:
             target = self._safe_target(repository, patch_file.path)
             content = target.read_bytes() if target.exists() else None
             snapshots[patch_file.path] = content
             if content is not None:
-                backup = backup_dir / patch_file.path
+                backup = self._backup_path(backup_dir, patch_file.path)
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 backup.write_bytes(content)
         summary = CheckpointSummary(
@@ -229,6 +288,7 @@ class PatchService:
         )
         checkpoint = Checkpoint(summary=summary, backup_dir=backup_dir, snapshots=snapshots)
         self._checkpoints[checkpoint_id] = checkpoint
+        self._persist(checkpoint)
         return checkpoint
 
     def _restore_checkpoint(self, checkpoint: Checkpoint) -> None:

@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from pydantic import BaseModel
+
 from .models import (
     TaskCheckpoint,
     TaskIteration,
@@ -13,6 +15,7 @@ from .models import (
     TestRunResponse,
 )
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
+from .store import StateStore
 
 
 class TaskStateError(RepositoryError):
@@ -25,6 +28,14 @@ class TaskRecord:
     summary: TaskSummary
     iterations: list[TaskIteration] = field(default_factory=list)
     checkpoints: list[TaskCheckpoint] = field(default_factory=list)
+
+
+class PersistedTask(BaseModel):
+    """Storage shape for one task: its summary plus the iterations and checkpoints it owns."""
+
+    summary: TaskSummary
+    iterations: list[TaskIteration] = []
+    checkpoints: list[TaskCheckpoint] = []
 
 
 class TaskService:
@@ -48,9 +59,53 @@ class TaskService:
         "running": {"testing", "paused", "failed", "cancelled"},
     }
 
-    def __init__(self, repositories: RepositoryService):
+    IN_FLIGHT_STATES: set[TaskStatus] = {"queued", "planning", "running", "coding", "testing", "repairing", "awaiting_approval", "ready_for_pr"}
+
+    def __init__(self, repositories: RepositoryService, store: StateStore | None = None):
         self.repositories = repositories
+        self.store = store
         self._tasks: dict[str, TaskRecord] = {}
+        self._keys: dict[str, str] = {}
+        if store:
+            for key, stored in store.models("tasks", PersistedTask):
+                record = TaskRecord(summary=stored.summary, iterations=stored.iterations, checkpoints=stored.checkpoints)
+                if record.summary.status in self.IN_FLIGHT_STATES:
+                    record.summary.requires_recovery = True
+                    record.summary.next_action = "服务已重启。请确认要继续该任务，或选择回滚与取消。"
+                    store.put("tasks", key, PersistedTask(summary=record.summary, iterations=record.iterations, checkpoints=record.checkpoints), record.summary.updated_at.isoformat())
+                self._tasks[record.summary.id] = record
+                self._keys[record.summary.id] = key
+
+    def _persist(self, record: TaskRecord) -> None:
+        if not self.store:
+            return
+        task_id = record.summary.id
+        key = self._keys.setdefault(task_id, self.store.next_key("tasks"))
+        self.store.put(
+            "tasks",
+            key,
+            PersistedTask(summary=record.summary, iterations=record.iterations, checkpoints=record.checkpoints),
+            record.summary.updated_at.isoformat(),
+        )
+
+    def assert_recovered(self, task_id: str) -> None:
+        summary = self._record(task_id).summary
+        if summary.requires_recovery:
+            raise RepositoryError(
+                "RECOVERY_CONFIRMATION_REQUIRED",
+                "The task was in flight when the API restarted. Confirm recovery before any further write.",
+                {"task_id": task_id, "status": summary.status},
+            )
+
+    def recover(self, task_id: str) -> TaskSummary:
+        record = self._record(task_id)
+        if not record.summary.requires_recovery:
+            raise TaskStateError("Only tasks restored from a restart need recovery.", {"status": record.summary.status})
+        record.summary.requires_recovery = False
+        record.summary.updated_at = datetime.now(timezone.utc)
+        record.summary.next_action = "Continue the task from the last checkpoint."
+        self._persist(record)
+        return record.summary
 
     def create(self, goal: str, repository_id: str | None = None) -> TaskSummary:
         repository: RepositoryRecord | None = None
@@ -71,6 +126,7 @@ class TaskService:
             next_action="Review and approve the task plan before the first coding iteration.",
         )
         self._tasks[task_id] = TaskRecord(summary=summary)
+        self._persist(self._tasks[task_id])
         return summary
 
     def list(self) -> list[TaskSummary]:
@@ -89,6 +145,7 @@ class TaskService:
         record.summary.dirty_files = changed_files
         record.summary.base_branch = record.summary.base_branch or branch
         record.summary.updated_at = datetime.now(timezone.utc)
+        self._persist(record)
         return record.summary
 
     def changed_files(self, task_id: str) -> list[str]:
@@ -124,6 +181,7 @@ class TaskService:
         record.summary.current_iteration = number
         record.summary.next_action = "Prepare and review a patch for this iteration."
         record.summary.updated_at = now
+        self._persist(record)
         return iteration
 
     def mark_patch_applied(self, run_id: str, patch_id: str, checkpoint_id: str, files: list[str]) -> TaskIteration:
@@ -137,6 +195,7 @@ class TaskService:
         iteration.updated_at = datetime.now(timezone.utc)
         self._transition(record, "testing")
         record.summary.next_action = "Run the selected tests for this iteration."
+        self._persist(record)
         return iteration
 
     def assert_patch_allowed(self, run_id: str) -> None:
@@ -156,6 +215,7 @@ class TaskService:
         if record.summary.status in {"paused", "cancelled"} or result.status == "cancelled":
             if record.summary.status != "cancelled":
                 iteration.status = "coding"
+            self._persist(record)
             return iteration
         if result.status == "passed":
             iteration.status = "passed"
@@ -167,6 +227,7 @@ class TaskService:
             record.summary.retry_count += 1
             self._transition(record, "failed")
             record.summary.next_action = "Inspect the failure and start a repair iteration."
+        self._persist(record)
         return iteration
 
     def begin_test_run(self, run_id: str) -> TaskIteration | None:
@@ -181,6 +242,7 @@ class TaskService:
         iteration.status = "testing"
         iteration.updated_at = datetime.now(timezone.utc)
         record.summary.next_action = "Wait for the selected tests to finish."
+        self._persist(record)
         return iteration
 
     def start_repair(self, task_id: str, feedback: str | None = None) -> TaskIteration:
@@ -199,6 +261,7 @@ class TaskService:
         record.summary.resume_state = previous_state
         record.summary.next_action = "Resume the task after reviewing the latest checkpoint."
         self._save_checkpoint(record, previous_state)
+        self._persist(record)
         return record.summary
 
     def resume(self, task_id: str) -> TaskSummary:
@@ -209,6 +272,7 @@ class TaskService:
         self._transition(record, target)
         record.summary.resume_state = None
         record.summary.next_action = "Rerun validation for the current iteration." if target == "testing" else "Continue the current coding iteration."
+        self._persist(record)
         return record.summary
 
     def cancel(self, task_id: str) -> TaskSummary:
@@ -218,6 +282,7 @@ class TaskService:
         record.summary.resume_state = None
         if record.iterations and record.iterations[-1].status in {"coding", "testing"}:
             record.iterations[-1].status = "cancelled"
+        self._persist(record)
         return record.summary
 
     def record_rollback(self, run_id: str, checkpoint_ids: list[str]) -> TaskSummary:
@@ -230,6 +295,7 @@ class TaskService:
         record.summary.resume_state = None
         record.summary.next_action = "Start a new coding iteration after reviewing the restored files."
         record.summary.updated_at = datetime.now(timezone.utc)
+        self._persist(record)
         return record.summary
 
     def _save_checkpoint(self, record: TaskRecord, state: TaskStatus) -> TaskCheckpoint:

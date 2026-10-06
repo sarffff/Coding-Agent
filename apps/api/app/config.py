@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     """Runtime limits and local workspace policy for the Phase 1 API."""
 
     workspace_root: Path = Path.cwd()
+    state_dir: Path = Path(".forge/state")
     max_file_size_bytes: int = 1_000_000
     max_tree_entries: int = 5_000
     max_search_results: int = 200

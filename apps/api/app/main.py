@@ -10,7 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from .config import get_settings
 from .models import (
     ApiError,
     AuditEventListResponse,
@@ -53,23 +52,19 @@ from .models import (
     TaskSummary,
     WorkspaceSummary,
 )
-from .repository_service import RepositoryError, RepositoryService
-from .task_service import TaskService
-from .patch_service import PatchService
-from .test_service import TestService
-from .audit_service import AuditService
-from .git_service import GitService
-from .approval_service import ApprovalService
+from .repository_service import RepositoryError
+from .services import build_services
 
 
-settings = get_settings()
-repository_service = RepositoryService(settings)
-task_service = TaskService(repository_service)
-patch_service = PatchService(repository_service, settings)
-test_service = TestService(repository_service, settings)
-audit_service = AuditService()
-git_service = GitService(repository_service, settings)
-approval_service = ApprovalService()
+services = build_services()
+settings = services.settings
+repository_service = services.repository_service
+task_service = services.task_service
+patch_service = services.patch_service
+test_service = services.test_service
+audit_service = services.audit_service
+git_service = services.git_service
+approval_service = services.approval_service
 
 app = FastAPI(
     title="Coding Agent API",
@@ -228,6 +223,7 @@ async def get_task(task_id: str) -> TaskSummary:
 
 @app.post("/api/v1/tasks/{task_id}/iterations", response_model=TaskIteration, status_code=201)
 async def start_iteration(task_id: str, payload: IterationCreateRequest):
+    task_service.assert_recovered(task_id)
     task = task_service.get(task_id)
     if task.status == "awaiting_approval" and not approval_service.has_approved(task_id, "plan", plan_scope_hash(task)):
         raise RepositoryError("APPROVAL_REQUIRED", "Plan approval is required before the first coding iteration.", {"type": "plan"})
@@ -251,6 +247,7 @@ async def list_task_checkpoints(task_id: str) -> TaskCheckpointListResponse:
 
 @app.post("/api/v1/tasks/{task_id}/repairs", response_model=TaskIteration, status_code=201)
 async def start_repair(task_id: str, payload: RepairCreateRequest):
+    task_service.assert_recovered(task_id)
     iteration = task_service.start_repair(task_id, payload.feedback)
     task = task_service.get(task_id)
     audit_service.record("iteration.repair", "succeeded", f"Started repair iteration {iteration.number}", task_id=task_id, run_id=task.run_id, details={"iteration_id": iteration.id, "number": iteration.number})
@@ -282,6 +279,13 @@ async def cancel_task(task_id: str) -> TaskActionResponse:
     return TaskActionResponse(task=task, action="cancelled")
 
 
+@app.post("/api/v1/tasks/{task_id}/recover", response_model=TaskActionResponse)
+async def recover_task(task_id: str) -> TaskActionResponse:
+    task = task_service.recover(task_id)
+    audit_service.record("task.recover", "succeeded", "Confirmed task recovery after restart", task_id=task.id, run_id=task.run_id)
+    return TaskActionResponse(task=task, action="recovered")
+
+
 @app.get("/api/v1/tasks/{task_id}/approvals", response_model=ApprovalListResponse)
 async def list_task_approvals(task_id: str) -> ApprovalListResponse:
     task = task_service.get(task_id)
@@ -306,8 +310,10 @@ async def decide_approval(approval_id: str, payload: ApprovalDecisionRequest) ->
     return approval
 
 
-def repository_id_for_task(task_id: str) -> str:
+def repository_id_for_task(task_id: str, require_recovered: bool = True) -> str:
     task = task_service.get(task_id)
+    if require_recovered:
+        task_service.assert_recovered(task_id)
     if not task.repository_id:
         raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Task must be connected to a repository before Git operations.")
     return task.repository_id
@@ -370,8 +376,10 @@ async def create_task_commit(task_id: str, payload: CommitCreateRequest) -> GitS
         return GitSnapshotResponse(branch=snapshot.branch, head=head, changed_files=snapshot.changed_files, clean=snapshot.clean)
 
 
-def repository_id_for_run(run_id: str) -> str:
+def repository_id_for_run(run_id: str, require_recovered: bool = True) -> str:
     task = task_service.get_by_run(run_id)
+    if require_recovered:
+        task_service.assert_recovered(task.id)
     if not task.repository_id:
         raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Task must be connected to a repository before editing files.")
     return task.repository_id
@@ -402,7 +410,7 @@ async def apply_patch(run_id: str, payload: PatchApplyRequest) -> PatchApplyResp
 
 @app.post("/api/v1/runs/{run_id}/rollback", response_model=RollbackResponse)
 async def rollback_run(run_id: str, payload: RollbackRequest) -> RollbackResponse:
-    repository_id = repository_id_for_run(run_id)
+    repository_id = repository_id_for_run(run_id, require_recovered=False)
     if test_service.is_running(run_id):
         raise RepositoryError("TEST_ALREADY_RUNNING", "Stop validation before restoring files.")
     if task_service.get_by_run(run_id).status in {"cancelled", "completed", "done", "pr_created"}:

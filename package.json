@@ -8,6 +8,7 @@
     "preview": "pnpm --filter @coding-agent/desktop preview",
     "api:dev": "python -m uvicorn app.main:app --reload --reload-dir apps/api/app --app-dir apps/api",
     "api:test": "python -m pytest apps/api/tests -q",
+    "api:init": "python scripts/init_state.py",
     "start": "node run.js",
     "check": "pnpm --filter @coding-agent/desktop typecheck",
     "demo:init": "python scripts/create_demo.py"

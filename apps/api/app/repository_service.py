@@ -5,12 +5,14 @@ import re
 import hashlib
 import os
 import subprocess
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from .config import Settings
+from .store import StateStore
 from .models import (
     RepositorySummary,
     RepositoryContext,
@@ -50,8 +52,7 @@ class RepositoryError(Exception):
         self.details = details or {}
 
 
-@dataclass(slots=True)
-class RepositoryRecord:
+class RepositoryRecord(BaseModel):
     id: str
     name: str
     path: Path
@@ -59,9 +60,21 @@ class RepositoryRecord:
 
 
 class RepositoryService:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, store: StateStore | None = None):
         self.settings = settings
+        self.store = store
         self._repositories: dict[str, RepositoryRecord] = {}
+        self._keys: dict[str, str] = {}
+        if store:
+            for key, record in store.models("repositories", RepositoryRecord):
+                self._repositories[record.id] = record
+                self._keys[record.id] = key
+
+    def _persist(self, record: RepositoryRecord) -> None:
+        if not self.store:
+            return
+        key = self._keys.setdefault(record.id, self.store.next_key("repositories"))
+        self.store.put("repositories", key, record, record.registered_at.isoformat())
 
     def _workspace_root(self) -> Path:
         return self.settings.workspace_root.expanduser().resolve()
@@ -136,6 +149,7 @@ class RepositoryService:
             registered_at=datetime.now(timezone.utc),
         )
         self._repositories[repository_id] = record
+        self._persist(record)
         return self.summary(record)
 
     def list(self) -> list[RepositorySummary]:

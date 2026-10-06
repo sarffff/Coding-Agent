@@ -185,6 +185,7 @@ class TaskSummary(BaseModel):
     dirty_files: list[str] = Field(default_factory=list)
     task_branch: str | None = None
     resume_state: TaskStatus | None = None
+    requires_recovery: bool = False
 
 
 IterationStatus = Literal["coding", "testing", "passed", "failed", "cancelled"]
@@ -223,7 +224,7 @@ class RepairCreateRequest(BaseModel):
 
 class TaskActionResponse(BaseModel):
     task: TaskSummary
-    action: Literal["paused", "resumed", "cancelled"]
+    action: Literal["paused", "resumed", "cancelled", "recovered"]
 
 
 class TaskCheckpoint(BaseModel):

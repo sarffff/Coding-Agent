@@ -24,7 +24,7 @@ def repository(tmp_path: Path) -> tuple[Path, RepositoryService]:
     (repo_path / "README.md").write_text("# Demo\n", encoding="utf-8")
     git(repo_path, "add", ".")
     git(repo_path, "commit", "-m", "initial", "-q")
-    return repo_path, RepositoryService(Settings(workspace_root=tmp_path))
+    return repo_path, RepositoryService(Settings(workspace_root=tmp_path, state_dir=tmp_path / "state"))
 
 
 def test_register_summary_tree_and_search(repository: tuple[Path, RepositoryService]) -> None:
@@ -57,7 +57,7 @@ def test_rejects_path_outside_workspace(repository: tuple[Path, RepositoryServic
 def test_patch_apply_and_rollback(repository: tuple[Path, RepositoryService]) -> None:
     repo_path, service = repository
     summary = service.register(str(repo_path))
-    patches = PatchService(service, Settings(workspace_root=repo_path.parent))
+    patches = PatchService(service, Settings(workspace_root=repo_path.parent, state_dir=repo_path.parent / "state"))
     original = (repo_path / "app.py").read_text(encoding="utf-8")
 
     preview = patches.preview(summary.id, [PatchFile(path="app.py", content="def hello():\n    return 'updated'\n")])

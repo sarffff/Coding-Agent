@@ -6,16 +6,28 @@ from uuid import uuid4
 
 from .models import ApprovalDecisionRequest, ApprovalRequestCreate, ApprovalSummary
 from .repository_service import RepositoryError
+from .store import StateStore
 
 
 @dataclass(slots=True)
 class ApprovalRecord:
     summary: ApprovalSummary
+    key: str = ""
 
 
 class ApprovalService:
-    def __init__(self) -> None:
+    def __init__(self, store: StateStore | None = None) -> None:
+        self.store = store
         self._items: dict[str, ApprovalRecord] = {}
+        if store:
+            for key, summary in store.models("approvals", ApprovalSummary):
+                self._items[summary.id] = ApprovalRecord(summary=summary, key=key)
+
+    def _persist(self, record: ApprovalRecord) -> None:
+        if not self.store:
+            return
+        record.key = record.key or self.store.next_key("approvals")
+        self.store.put("approvals", record.key, record.summary, record.summary.requested_at.isoformat())
 
     def create(self, task_id: str, run_id: str, payload: ApprovalRequestCreate) -> ApprovalSummary:
         now = datetime.now(timezone.utc)
@@ -30,6 +42,7 @@ class ApprovalService:
                     item.summary.reason = "Superseded by a new task scope."
                     item.summary.decided_at = now
                     item.summary.decided_by = "system"
+                    self._persist(item)
         summary = ApprovalSummary(
             id=f"approval-{uuid4().hex[:12]}",
             task_id=task_id,
@@ -41,7 +54,9 @@ class ApprovalService:
             requested_at=now,
             expires_at=now + timedelta(minutes=payload.expires_in_minutes),
         )
-        self._items[summary.id] = ApprovalRecord(summary=summary)
+        record = ApprovalRecord(summary=summary)
+        self._items[summary.id] = record
+        self._persist(record)
         return summary
 
     def get(self, approval_id: str) -> ApprovalSummary:
@@ -77,6 +92,7 @@ class ApprovalService:
         record.summary.reason = payload.reason.strip() if payload.reason else None
         record.summary.decided_at = datetime.now(timezone.utc)
         record.summary.decided_by = decided_by
+        self._persist(record)
         return record.summary
 
     def has_approved(self, task_id: str, approval_type: str, scope_hash: str | None = None) -> bool:
@@ -87,8 +103,7 @@ class ApprovalService:
             for item in self.list_for_task(task_id)
         )
 
-    @staticmethod
-    def _expire_if_needed(record: ApprovalRecord) -> None:
+    def _expire_if_needed(self, record: ApprovalRecord) -> None:
         if record.summary.status in {"pending", "approved"} and record.summary.expires_at <= datetime.now(timezone.utc):
             record.summary.status = "expired"
-
+            self._persist(record)

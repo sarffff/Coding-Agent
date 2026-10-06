@@ -13,6 +13,23 @@ def git_output(directory: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=directory, check=True, capture_output=True, text=True, encoding="utf-8").stdout
 
 
+def test_settings(demo_repository: Path, tmp_path: Path):
+    from app.config import Settings
+
+    return Settings(workspace_root=demo_repository.parent, state_dir=tmp_path / "state", command_timeout_seconds=15)
+
+
+def mount_services(monkeypatch, settings) -> object:
+    """Point the app's module-level service aliases at a freshly built graph."""
+    from app import main
+    from app.services import build_services
+
+    services = build_services(settings)
+    for name in ("settings", "repository_service", "task_service", "patch_service", "test_service", "audit_service", "git_service", "approval_service"):
+        monkeypatch.setattr(main, name, getattr(services, name))
+    return services
+
+
 @pytest.fixture
 def demo_repository(tmp_path):
     directory = tmp_path / "demo"
@@ -31,37 +48,50 @@ def demo_repository(tmp_path):
 
 
 @pytest.fixture
-def git_services(demo_repository):
+def git_services(demo_repository, tmp_path):
     from app.config import Settings
     from app.repository_service import RepositoryService
     from app.git_service import GitService
-    settings = Settings(workspace_root=demo_repository.parent)
+    settings = Settings(workspace_root=demo_repository.parent, state_dir=tmp_path / "state")
     repositories = RepositoryService(settings)
     repository = repositories.register(str(demo_repository))
     return repositories, GitService(repositories, settings), repository.id
 
 
 @pytest.fixture
-def api_client(demo_repository, monkeypatch):
+def api_client(demo_repository, tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from app import main
-    from app.approval_service import ApprovalService
-    from app.audit_service import AuditService
     from app.config import Settings
-    from app.git_service import GitService
-    from app.patch_service import PatchService
-    from app.repository_service import RepositoryService
-    from app.task_service import TaskService
-    from app.test_service import TestService
-    settings = Settings(workspace_root=demo_repository.parent, command_timeout_seconds=15)
-    repositories = RepositoryService(settings)
-    services = {
-        "settings": settings, "repository_service": repositories,
-        "task_service": TaskService(repositories), "patch_service": PatchService(repositories, settings),
-        "test_service": TestService(repositories, settings), "audit_service": AuditService(),
-        "git_service": GitService(repositories, settings), "approval_service": ApprovalService(),
-    }
-    for name, value in services.items():
-        monkeypatch.setattr(main, name, value)
+
+    services = mount_services(monkeypatch, test_settings(demo_repository, tmp_path))
     with TestClient(main.app) as client:
         yield client
+    services.store.close()
+
+
+@pytest.fixture
+def api_stack(demo_repository, tmp_path, monkeypatch):
+    """Rebuilds the whole service graph over the same state directory.
+
+    Each rebuild is a process restart for the purposes of these tests: state
+    must come back from disk and in-flight tasks must ask for confirmation.
+    """
+
+    from fastapi.testclient import TestClient
+    from app import main
+
+    class RestartableApi:
+        services: object = None
+
+        def restart(self):
+            if self.services is not None:
+                self.services.store.close()
+            self.services = mount_services(monkeypatch, test_settings(demo_repository, tmp_path))
+            return TestClient(main.app)
+
+        @property
+        def task_service(self):
+            return self.services.task_service
+
+    return RestartableApi()
