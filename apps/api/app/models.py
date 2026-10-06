@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -72,6 +73,34 @@ class TreeResponse(BaseModel):
     repository_id: str
     base_path: str
     items: list[TreeEntry]
+    truncated: bool = False
+
+
+class SymbolInfo(BaseModel):
+    name: str
+    kind: str
+    line: int
+
+
+class FileContentResponse(BaseModel):
+    repository_id: str
+    path: str
+    content: str
+    content_hash: str
+    size: int
+    language: str | None = None
+    line_count: int
+    symbols: list[SymbolInfo] = Field(default_factory=list)
+
+
+class RepositoryContext(BaseModel):
+    repository_id: str
+    languages: dict[str, int]
+    package_manager: str | None = None
+    entry_files: list[str]
+    test_directories: list[str]
+    config_files: list[str]
+    file_count: int
     truncated: bool = False
 
 
@@ -154,6 +183,8 @@ class TaskSummary(BaseModel):
     base_branch: str | None = None
     head: str | None = None
     dirty_files: list[str] = Field(default_factory=list)
+    task_branch: str | None = None
+    resume_state: TaskStatus | None = None
 
 
 IterationStatus = Literal["coding", "testing", "passed", "failed", "cancelled"]
@@ -170,7 +201,9 @@ class TaskIteration(BaseModel):
     patch_id: str | None = None
     checkpoint_id: str | None = None
     test_result: "TestRunResponse | None" = None
+    test_runs: list["TestRunResponse"] = Field(default_factory=list)
     failure_summary: str | None = None
+    rolled_back: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -209,7 +242,6 @@ class TaskCheckpointListResponse(BaseModel):
 
 class BranchCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
-    allow_dirty: bool = False
 
 
 class GitSnapshotResponse(BaseModel):
@@ -228,6 +260,7 @@ class CommitPreviewResponse(BaseModel):
     head: str
     diff: str
     changed_files: list[str] = Field(default_factory=list)
+    excluded_files: list[str] = Field(default_factory=list)
     commit_message: str
     scope_hash: str
     ready: bool
@@ -235,6 +268,7 @@ class CommitPreviewResponse(BaseModel):
 
 class CommitCreateRequest(BaseModel):
     message: str = Field(min_length=1, max_length=200)
+    scope_hash: str = Field(min_length=64, max_length=64)
 
 
 ApprovalType = Literal["plan", "write", "push", "pr"]
@@ -311,6 +345,8 @@ class PatchApplyRequest(BaseModel):
 
 class CheckpointSummary(BaseModel):
     id: str
+    run_id: str | None = None
+    restored: bool = False
     repository_id: str
     files: list[str]
     created_at: datetime
@@ -329,14 +365,16 @@ class RollbackRequest(BaseModel):
 class RollbackResponse(BaseModel):
     checkpoint: CheckpointSummary
     restored_files: list[str]
+    restored_checkpoint_ids: list[str] = Field(default_factory=list)
 
 
-TestKind = Literal["auto", "pytest", "frontend"]
+TestKind = Literal["auto", "pytest", "frontend", "static"]
 
 
 class TestRunRequest(BaseModel):
     kind: TestKind = "auto"
     timeout_seconds: int = Field(default=30, ge=1, le=300)
+    target: str | None = Field(default=None, max_length=500)
 
 
 class TestFailure(BaseModel):
@@ -347,15 +385,18 @@ class TestFailure(BaseModel):
 
 
 class TestRunResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"test-{uuid4().hex[:12]}")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     run_id: str
     kind: TestKind
     command: list[str]
-    status: Literal["passed", "failed", "timed_out", "not_found", "blocked"]
+    status: Literal["passed", "failed", "timed_out", "not_found", "blocked", "cancelled"]
     exit_code: int | None = None
     duration_ms: int
     stdout: str
     stderr: str
     output_truncated: bool = False
+    validation_hash: str | None = None
     failed_tests: list[TestFailure] = Field(default_factory=list)
 
 

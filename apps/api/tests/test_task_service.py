@@ -1,6 +1,6 @@
 import pytest
 
-from app.models import TestRunResponse
+from app.models import TestRunResponse as RunResult
 from app.repository_service import RepositoryService
 from app.task_service import TaskService, TaskStateError
 
@@ -14,7 +14,7 @@ def test_task_can_run_two_coding_iterations(repository_service: RepositoryServic
     assert service.get(task.id).status == "coding"
 
     service.mark_patch_applied(task.run_id, "patch-one", "checkpoint-one", ["parser.py"])
-    failed = TestRunResponse(
+    failed = RunResult(
         run_id=task.run_id,
         kind="pytest",
         command=["pytest", "-q"],
@@ -49,10 +49,32 @@ def test_pause_resume_and_invalid_transition(repository_service: RepositoryServi
     assert len(service.list_checkpoints(task.id)) == 1
     assert service.resume(task.id).status == "coding"
 
+    assert service.pause(task.id).status == "paused"
+    assert len(service.list_checkpoints(task.id)) == 2
+    assert service.pause(task.id).status == "paused"
+    assert len(service.list_checkpoints(task.id)) == 2
+    service.cancel(task.id)
     with pytest.raises(TaskStateError):
-        service.pause(task.id)
+        service.resume(task.id)
+    with pytest.raises(TaskStateError):
+        service.start_iteration(task.id)
 
 
 @pytest.fixture
-def repository_service():
-    return RepositoryService.__new__(RepositoryService)
+def repository_service(tmp_path):
+    from app.config import Settings
+    return RepositoryService(Settings(workspace_root=tmp_path))
+
+
+def test_paused_task_cannot_write_or_test_and_restores_step(repository_service):
+    service = TaskService(repository_service)
+    task = service.create("Repair a validation failure")
+    service.start_iteration(task.id)
+    service.mark_patch_applied(task.run_id, "patch", "checkpoint", ["app.py"])
+    service.pause(task.id)
+    assert service.list_checkpoints(task.id)[-1].state == "testing"
+    with pytest.raises(TaskStateError):
+        service.assert_patch_allowed(task.run_id)
+    with pytest.raises(TaskStateError):
+        service.begin_test_run(task.run_id)
+    assert service.resume(task.id).status == "testing"

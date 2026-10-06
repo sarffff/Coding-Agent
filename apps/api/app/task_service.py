@@ -43,7 +43,7 @@ class TaskService:
         "completed": set(),
         "done": set(),
         "failed": {"testing", "repairing", "coding", "paused", "cancelled"},
-        "paused": {"coding", "testing", "repairing", "cancelled"},
+        "paused": {"coding", "testing", "repairing", "failed", "running", "cancelled"},
         "cancelled": set(),
         "running": {"testing", "paused", "failed", "cancelled"},
     }
@@ -91,6 +91,9 @@ class TaskService:
         record.summary.updated_at = datetime.now(timezone.utc)
         return record.summary
 
+    def changed_files(self, task_id: str) -> list[str]:
+        return sorted({name for iteration in self._record(task_id).iterations if not iteration.rolled_back for name in iteration.changed_files})
+
     def list_iterations(self, task_id: str) -> list[TaskIteration]:
         return list(self._record(task_id).iterations)
 
@@ -101,7 +104,7 @@ class TaskService:
         record = self._record(task_id)
         if record.summary.status == "awaiting_approval":
             self._transition(record, "coding")
-        elif record.summary.status in {"repairing", "paused", "failed"}:
+        elif record.summary.status in {"repairing", "failed"}:
             self._transition(record, "coding")
         elif record.summary.status != "coding":
             raise TaskStateError("A coding iteration cannot start in the current task state.", {"status": record.summary.status})
@@ -126,7 +129,7 @@ class TaskService:
     def mark_patch_applied(self, run_id: str, patch_id: str, checkpoint_id: str, files: list[str]) -> TaskIteration:
         record = self._record_by_run(run_id)
         iteration = self._current_iteration(record)
-        if record.summary.status not in {"coding", "repairing", "paused", "failed"}:
+        if record.summary.status not in {"coding", "repairing", "failed"}:
             raise TaskStateError("A patch can only be applied during a coding iteration.", {"status": record.summary.status})
         iteration.patch_id = patch_id
         iteration.checkpoint_id = checkpoint_id
@@ -138,16 +141,22 @@ class TaskService:
 
     def assert_patch_allowed(self, run_id: str) -> None:
         record = self._record_by_run(run_id)
-        if not record.iterations:
+        if not record.iterations or record.iterations[-1].rolled_back:
             raise TaskStateError("Start a coding iteration before applying a patch.", {"status": record.summary.status})
-        if record.summary.status not in {"coding", "repairing", "paused", "failed"}:
+        if record.summary.status not in {"coding", "repairing", "failed"}:
             raise TaskStateError("A patch can only be applied during a coding iteration.", {"status": record.summary.status})
 
     def record_test_result(self, run_id: str, result: TestRunResponse) -> TaskIteration:
         record = self._record_by_run(run_id)
         iteration = self._current_iteration(record)
         iteration.test_result = result
+        iteration.test_runs.append(result)
+        iteration.failure_summary = None
         iteration.updated_at = datetime.now(timezone.utc)
+        if record.summary.status in {"paused", "cancelled"} or result.status == "cancelled":
+            if record.summary.status != "cancelled":
+                iteration.status = "coding"
+            return iteration
         if result.status == "passed":
             iteration.status = "passed"
             self._transition(record, "ready_for_pr")
@@ -162,10 +171,10 @@ class TaskService:
 
     def begin_test_run(self, run_id: str) -> TaskIteration | None:
         record = self._record_by_run(run_id)
-        if not record.iterations:
+        if not record.iterations or record.iterations[-1].rolled_back:
             raise TaskStateError("Start a coding iteration before running tests.", {"status": record.summary.status})
         iteration = self._current_iteration(record)
-        if record.summary.status not in {"coding", "testing", "failed", "ready_for_pr", "paused"}:
+        if record.summary.status not in {"coding", "testing", "failed", "ready_for_pr"}:
             raise TaskStateError("Tests cannot run in the current task state.", {"status": record.summary.status})
         if record.summary.status != "testing":
             self._transition(record, "testing")
@@ -176,38 +185,59 @@ class TaskService:
 
     def start_repair(self, task_id: str, feedback: str | None = None) -> TaskIteration:
         record = self._record(task_id)
-        if record.summary.status not in {"failed", "paused", "repairing"}:
+        if record.summary.status not in {"failed", "repairing"}:
             raise TaskStateError("A repair iteration requires a failed or paused task.", {"status": record.summary.status})
         self._transition(record, "repairing")
         return self.start_iteration(task_id, feedback or "Repair the latest test failure and rerun validation.")
 
     def pause(self, task_id: str) -> TaskSummary:
         record = self._record(task_id)
+        if record.summary.status == "paused":
+            return record.summary
+        previous_state = record.summary.status
         self._transition(record, "paused")
+        record.summary.resume_state = previous_state
         record.summary.next_action = "Resume the task after reviewing the latest checkpoint."
-        self._save_checkpoint(record)
+        self._save_checkpoint(record, previous_state)
         return record.summary
 
     def resume(self, task_id: str) -> TaskSummary:
         record = self._record(task_id)
         if record.summary.status != "paused":
             raise TaskStateError("Only paused tasks can be resumed.", {"status": record.summary.status})
-        self._transition(record, "coding")
-        record.summary.next_action = "Continue the current coding iteration."
+        target = record.summary.resume_state or "coding"
+        self._transition(record, target)
+        record.summary.resume_state = None
+        record.summary.next_action = "Rerun validation for the current iteration." if target == "testing" else "Continue the current coding iteration."
         return record.summary
 
     def cancel(self, task_id: str) -> TaskSummary:
         record = self._record(task_id)
         self._transition(record, "cancelled")
         record.summary.next_action = None
+        record.summary.resume_state = None
+        if record.iterations and record.iterations[-1].status in {"coding", "testing"}:
+            record.iterations[-1].status = "cancelled"
         return record.summary
 
-    def _save_checkpoint(self, record: TaskRecord) -> TaskCheckpoint:
+    def record_rollback(self, run_id: str, checkpoint_ids: list[str]) -> TaskSummary:
+        record = self._record_by_run(run_id)
+        for iteration in record.iterations:
+            if iteration.checkpoint_id in checkpoint_ids:
+                iteration.rolled_back = True
+                iteration.status = "cancelled"
+        record.summary.status = "coding"
+        record.summary.resume_state = None
+        record.summary.next_action = "Start a new coding iteration after reviewing the restored files."
+        record.summary.updated_at = datetime.now(timezone.utc)
+        return record.summary
+
+    def _save_checkpoint(self, record: TaskRecord, state: TaskStatus) -> TaskCheckpoint:
         checkpoint = TaskCheckpoint(
             id=f"task-checkpoint-{uuid4().hex[:10]}",
             task_id=record.summary.id,
             run_id=record.summary.run_id,
-            state=record.summary.status,
+            state=state,
             iteration=record.summary.current_iteration,
             created_at=datetime.now(timezone.utc),
         )

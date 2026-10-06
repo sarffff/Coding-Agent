@@ -89,6 +89,6 @@ class ApprovalService:
 
     @staticmethod
     def _expire_if_needed(record: ApprovalRecord) -> None:
-        if record.summary.status == "pending" and record.summary.expires_at <= datetime.now(timezone.utc):
+        if record.summary.status in {"pending", "approved"} and record.summary.expires_at <= datetime.now(timezone.utc):
             record.summary.status = "expired"
 
