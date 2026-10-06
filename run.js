@@ -41,7 +41,7 @@ function startBackend() {
         // uvicorn app.main:app --reload --port 8000 --app-dir apps/api
         const backend = spawn(
             PYTHON_CMD,
-            ["-m", "uvicorn", "app.main:app", "--reload", "--port", "8000", "--app-dir", "apps/api"],
+            ["-m", "uvicorn", "app.main:app", "--reload", "--reload-dir", "apps/api/app", "--port", "8000", "--app-dir", "apps/api"],
             {
                 cwd: BACKEND_DIR,
                 shell: true,
