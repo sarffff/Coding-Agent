@@ -91,3 +91,12 @@ def test_dirty_branch_creation_and_sensitive_paths_are_blocked(demo_repository, 
     with pytest.raises(RepositoryError) as error:
         service.preview(repository_id, [".env"], "task: credentials")
     assert error.value.code == "PROTECTED_PATH"
+
+
+def test_commit_scratch_is_kept_inside_the_state_directory(git_services):
+    """An inherited TMP may point somewhere this process cannot write."""
+    _, service, _ = git_services
+    with service._temporary_directory("probe") as directory:
+        created = Path(directory)
+        assert created.parent == service.settings.state_dir.resolve()
+        assert created.is_dir()

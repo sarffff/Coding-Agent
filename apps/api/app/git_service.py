@@ -14,6 +14,7 @@ from threading import RLock
 
 from .config import Settings
 from .file_policy import is_protected_path
+from .process_env import child_env, is_process_startup_failure
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
 
 
@@ -86,7 +87,7 @@ class GitService:
 
     def preview(self, repository_id: str, files: list[str], message: str) -> PreparedCommit:
         repository = self.repositories.get(repository_id)
-        with self.lock(repository_id), tempfile.TemporaryDirectory(prefix="forge-git-") as directory:
+        with self.lock(repository_id), self._temporary_directory("git-") as directory:
             env = {"GIT_INDEX_FILE": str(Path(directory) / "preview.index")}
             snapshot = self.snapshot(repository_id)
             selected = self._safe_files(repository, files)
@@ -146,6 +147,14 @@ class GitService:
                 return head
 
     @contextmanager
+    def _temporary_directory(self, prefix: str):
+        # Scratch lives in the state directory: an inherited TMP may point at a
+        # sandbox-owned path this process cannot write to.
+        self.settings.state_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f"forge-{prefix}-", dir=self.settings.state_dir) as directory:
+            yield directory
+
+    @contextmanager
     def _locked_index(self, repository: RepositoryRecord):
         raw_path = self._run(repository, ["rev-parse", "--git-path", "index"]).strip()
         index_path = (repository.path / raw_path).resolve()
@@ -157,7 +166,7 @@ class GitService:
         os.close(descriptor)
         lock_state = {"published": False}
         try:
-            with tempfile.TemporaryDirectory(prefix="forge-index-") as directory:
+            with self._temporary_directory("index") as directory:
                 copied_index = Path(directory) / "index"
                 env = {"GIT_INDEX_FILE": str(copied_index)}
                 if index_path.exists():
@@ -196,8 +205,7 @@ class GitService:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _run(self, repository: RepositoryRecord, args: list[str], *, env: dict[str, str] | None = None, input_text: str | None = None) -> str:
-        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-        environment.update({"GIT_LITERAL_PATHSPECS": "1", **(env or {})})
+        environment = child_env({"GIT_LITERAL_PATHSPECS": "1", **(env or {})})
         try:
             result = subprocess.run(
                 ["git", *args], cwd=repository.path, capture_output=True, input=input_text,
@@ -206,6 +214,8 @@ class GitService:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RepositoryError("GIT_COMMAND_FAILED", "The Git command could not be completed.") from exc
+        if is_process_startup_failure(result.returncode):
+            raise RepositoryError("GIT_UNAVAILABLE", "The API process could not start Git. Restart the API from a normal shell.", {"command": args, "exit_code": result.returncode})
         if result.returncode != 0:
             raise RepositoryError("GIT_COMMAND_FAILED", "The Git command was rejected.", {"command": args, "stderr": result.stderr[-2_000:]})
         return result.stdout

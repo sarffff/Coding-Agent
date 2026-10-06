@@ -26,6 +26,7 @@ from .models import (
 
 
 from .file_policy import IGNORED_DIRECTORIES, is_protected_path
+from .process_env import child_env, is_process_startup_failure
 
 
 LANGUAGE_BY_EXTENSION = {
@@ -102,6 +103,7 @@ class RepositoryService:
                 encoding="utf-8",
                 errors="replace",
                 timeout=self.settings.git_timeout_seconds,
+                env=child_env(),
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -109,6 +111,8 @@ class RepositoryService:
         except subprocess.TimeoutExpired as exc:
             raise RepositoryError("GIT_TIMEOUT", "Git command timed out.") from exc
 
+        if is_process_startup_failure(result.returncode):
+            raise RepositoryError("GIT_UNAVAILABLE", "The API process could not start Git. Restart the API from a normal shell.", {"command": ["git", *args], "exit_code": result.returncode})
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RepositoryError("GIT_COMMAND_FAILED", detail or "Git command failed.", {"command": ["git", *args], "exit_code": result.returncode})

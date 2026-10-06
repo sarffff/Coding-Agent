@@ -117,7 +117,12 @@ def plan_scope_hash(task: TaskSummary) -> str:
 
 @app.exception_handler(RepositoryError)
 async def repository_error_handler(request: Request, exc: RepositoryError) -> JSONResponse:
-    status_code = 404 if exc.code in {"REPOSITORY_NOT_FOUND", "TASK_NOT_FOUND", "RUN_NOT_FOUND", "PATCH_NOT_FOUND", "CHECKPOINT_NOT_FOUND", "PATH_NOT_FOUND", "TREE_PATH_NOT_FOUND"} else 400
+    if exc.code in {"GIT_UNAVAILABLE", "GIT_BUSY"}:
+        status_code = 503
+    elif exc.code in {"REPOSITORY_NOT_FOUND", "TASK_NOT_FOUND", "RUN_NOT_FOUND", "PATCH_NOT_FOUND", "CHECKPOINT_NOT_FOUND", "PATH_NOT_FOUND", "TREE_PATH_NOT_FOUND"}:
+        status_code = 404
+    else:
+        status_code = 400
     return error_response(request, status_code, exc.code, exc.message, exc.details)
 
 

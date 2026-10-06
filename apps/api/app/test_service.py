@@ -14,6 +14,7 @@ from threading import Event, Lock
 
 from .config import Settings
 from .models import TestFailure, TestKind, TestRunResponse
+from .process_env import child_env, is_process_startup_failure
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
 
 
@@ -61,9 +62,13 @@ class TestService:
                 return self._result(run_id, kind, command, "not_found", started, stderr="The required validation executable is not available.")
             if cancel.is_set():
                 return self._result(run_id, kind, command, "cancelled", started)
-            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            # Capture output in the state directory: an inherited TMP may point at
+            # a sandbox-owned path this process cannot write to.
+            self.settings.state_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=self.settings.state_dir) as stdout, tempfile.TemporaryFile(dir=self.settings.state_dir) as stderr:
                 process = subprocess.Popen(
                     [executable, *command[1:]], cwd=repository.path, stdout=stdout, stderr=stderr,
+                    env=child_env(),
                     shell=False, start_new_session=os.name != "nt",
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
                 )
@@ -81,7 +86,7 @@ class TestService:
                     cancel.wait(0.05)
                 process.wait()
                 if status == "passed" and process.returncode:
-                    status = "failed"
+                    status = "blocked" if is_process_startup_failure(process.returncode) else "failed"
                 stdout.seek(0)
                 stderr.seek(0)
                 out = stdout.read(self.OUTPUT_LIMIT + 1)
@@ -89,6 +94,8 @@ class TestService:
                 result = self._result(run_id, kind, command, status, started, stdout=out[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), stderr=err[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"))
                 result.exit_code = process.returncode
                 result.output_truncated = len(out) > self.OUTPUT_LIMIT or len(err) > self.OUTPUT_LIMIT
+                if status == "blocked":
+                    result.stderr = (result.stderr + "\n" if result.stderr else "") + "The validation process could not be started by the API process. Restart the API from a normal shell."
                 if status == "timed_out":
                     result.stderr += "\nValidation exceeded its time limit."
                 if status == "cancelled":
