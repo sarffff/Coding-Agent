@@ -59,7 +59,7 @@ Phase 3 不能立即开工：Phase 2 的**远程段为 0%**，而 CI 交互依�
 
 - [ ] 第 0 节全部完成（持久化、恢复语义、幂等键）
 - [ ] Phase 2 §3 推送与 §4 Provider/PR 已完成并通过审批门禁
-- [ ] 已选定首个 Provider，并记录其 API 版本、限流口径与最小权限 token 申请方式
+- [x] 已选定首个 Provider：**GitHub**，只走 REST（`api.github.com`，不引入 GraphQL），基础地址可由 `FORGE_GITHUB_API_URL` 指向 GHES。凭据为 fine-grained PAT，仅授权演示仓库，权限限定 `Contents: read/write` 与 `Pull requests: read/write`，不含组织与管理权限，仅经 `FORGE_GITHUB_TOKEN` 环境变量注入。限流口径按 REST 的 `x-ratelimit-*` 响应头处理。
 - [ ] 已准备专用演示仓库：不含生产凭据、允许创建与删除任务分支
 - [ ] 已定义 CI 失败的自动修复白名单与必须转人工的黑名单
 - [ ] 已定义连续失败阈值与预算上限的具体数值（谁批准提高上限）

@@ -89,7 +89,8 @@ pnpm build        # Desktop 生产构建
 
 ## 故障排查
 
-- **`GIT_COMMAND_FAILED`**：确认 `git` 在 PATH 中，且 API 进程能进入目标仓库目录。Windows 上若长时间运行的重载进程报 `exit_code 3221225794`（0xC0000142），重启 API 进程即可，属于进程环境问题而非代码问题。
+- **`GIT_COMMAND_FAILED`**：确认 `git` 在 PATH 中，且 API 进程能进入目标仓库目录。
+- **`GIT_UNAVAILABLE`（HTTP 503）**：API 进程连 `git` 子进程都拉不起来（Windows 上常见退出码 `3221225794` = `STATUS_DLL_INIT_FAILED`）。这属于该进程自身的启动上下文问题，从普通终端重启 API 即可；子进程环境块已由 `process_env.child_env()` 统一补全并清洗 `GIT_*`，因此不再依赖启动时的临时目录与 git 配置。
 - **界面显示 0 仓库 0 任务但 API 有数据**：多为 CORS 或 API 地址不匹配，检查 `FORGE_CORS_ORIGINS` 与 `VITE_API_BASE_URL`。
 - **`WORKTREE_NOT_CLEAN`**：任务分支必须在干净工作区上创建，先提交或还原本地改动。
 - **`COMMIT_PREVIEW_STALE` / `TEST_RESULTS_STALE`**：审批绑定的是具体的 diff 与验证结果；改动文件或消息后需重新预览、重新审批。
@@ -103,7 +104,7 @@ Phase 1（单仓库理解 → 计划 → 低风险修改 → 测试 → 审计 �
 Phase 2 的本地部分（多轮编码、验证循环、审批门禁、任务分支与提交）已完成；**远程部分尚未实现**。
 
 - 状态保存在本地 sqlite（默认 `.forge/state`，含检查点文件）；API 重启后未完成任务必须显式确认才继续写入。仍缺记录保留期限。
-- 没有推送、远程 Provider（GitHub/GitLab）、PR/MR 创建与查询；`push`、`pr` 审批类型只是占位。
+- 没有推送、远程 Provider、PR/MR 创建与查询；`push`、`pr` 审批类型只是占位。首个 Provider 已定为 GitHub（REST + 单仓库 fine-grained PAT），范围见 `docs/phase-3-todolist.md`。
 - 没有幂等键：重复请求可能重复创建分支或提交。
 - 没有预算熔断：不限制最大轮次、总耗时与远程调用次数，连续失败不会自动转人工。
 - 计划由规则/模板生成，尚未接入 LangGraph 等真实推理编排；无沙箱容器，命令在主机上以受控白名单方式执行。
