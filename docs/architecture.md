@@ -11,7 +11,9 @@ apps/desktop (React + Vite + TypeScript)
 
 apps/api/app/
   main.py                 路由、错误格式、trace id、跨服务编排与门禁
-  config.py               FORGE_* 运行限制与工作区根目录
+  services.py             用同一个状态存储装配全部服务（重启即重新构建）
+  store.py                sqlite3 写穿存储与恢复序号
+  config.py               FORGE_* 运行限制、工作区根目录与状态目录
   repository_service.py   仓库注册、路径归属校验、文件树、搜索、读文件、符号、仓库摘要
   file_policy.py          敏感与忽略路径的单一判定来源（搜索 / 补丁 / 提交共用）
   task_service.py         任务状态机、编码轮次、检查点记录、暂停/恢复/取消
@@ -36,7 +38,9 @@ apps/api/app/
 
 ## Persistence
 
-当前全部状态保存在进程内存（`repository_service`、`task_service`、`patch_service`、`approval_service`、`audit_service` 各自的 dict/list），API 重启即丢失，也不存在“重启后需人工确认”的恢复语义。持久化与恢复是 Phase 2 §6 的未完成项。
+`app/services.py:build_services()` 用同一个 `StateStore`（`app/store.py`，标准库 sqlite3，无额外依赖）装配全部服务：仓库、任务（含轮次与任务检查点）、审批、审计事件与文件检查点元数据写入 `FORGE_STATE_DIR/state.db`（默认 `.forge/state`），检查点的文件内容写在 `state.db` 同级的 `checkpoints/<id>/` 下。
+
+重启等于再调用一次 `build_services()`：记录按插入顺序回灌，处于执行中状态的任务被标记 `requires_recovery`，此后除回滚、取消、查询与 `POST /api/v1/tasks/{id}/recover` 之外的写端点一律返回 `RECOVERY_CONFIRMATION_REQUIRED`，不会静默续跑。补丁预览（`patch_id`）是进程内对象，不持久化：重启后需要重新预览，这是有意为之——未经审阅的 diff 不应该跨进程存活。
 
 ## Phase status
 
