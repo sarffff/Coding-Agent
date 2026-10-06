@@ -58,6 +58,7 @@ import {
   startRepair,
   pauseTask,
   cancelTask,
+  recoverTask,
   type AgentTask,
   type AuditEvent,
   type CommitPreview,
@@ -89,6 +90,7 @@ type Task = {
   currentIteration: number;
   retryCount: number;
   nextAction: string | null;
+  requiresRecovery: boolean;
   title: string;
   repo: string;
   branch: string;
@@ -118,6 +120,7 @@ function taskFromApi(task: AgentTask): Task {
     currentIteration: task.current_iteration,
     retryCount: task.retry_count,
     nextAction: task.next_action,
+    requiresRecovery: task.requires_recovery,
     title: task.goal,
     repo: task.plan?.repository_summary ?? "workspace",
     branch: task.branch ?? task.run_id,
@@ -591,6 +594,19 @@ function App() {
     }
   };
 
+  const confirmRecovery = async () => {
+    if (!activeTask || iterationRunning) return;
+    setIterationRunning(true);
+    setIterationError(null);
+    try {
+      updateTaskFromApi((await recoverTask(activeTask.id)).task);
+    } catch (error) {
+      setIterationError(error instanceof Error ? error.message : t("taskStateError"));
+    } finally {
+      setIterationRunning(false);
+    }
+  };
+
   const refreshActiveTask = async () => {
     if (!activeTask?.runId) return;
     const [task, nextIterations, events, repositoryList, snapshot, summary, approvalList] = await Promise.all([
@@ -754,6 +770,7 @@ function App() {
 
             <section className="panel stream-panel">
               <div className="panel-header"><div><div className="section-kicker">TRACE / {activeTask?.id.toUpperCase()}</div><h2>{t("executionStream")}</h2></div><span className="live-badge"><span className="pulse-dot" /> {t("liveEvents")}</span></div>
+              {activeTask?.requiresRecovery ? <div className="recovery-note" role="status"><AlertTriangle size={14} /><span>{t("recovery.title")}</span><button className="small-action" onClick={() => void confirmRecovery()} disabled={iterationRunning}>{t("recovery.action")}</button></div> : null}
               {activeTask ? <div className="iteration-bar"><div className="iteration-status"><strong>{t("iteration")} {activeTask.currentIteration || iterations.length || 0}</strong><span>{activeTask.nextAction ?? activeTask.plan?.objective ?? t("currentCodingLoop")}</span></div><div className="iteration-actions">{activeTask.status === "failed" ? <button className="small-action" onClick={() => void beginRepair()} disabled={iterationRunning}>{t("repair")}</button> : activeTask.status === "paused" ? <button className="small-action" onClick={() => void changeTaskState("resume")} disabled={iterationRunning}>{t("resume")}</button> : (activeTask.status === "review" && !iterations.length || activeTask.lifecycleStatus === "coding" && Boolean(iterations.at(-1)?.rolled_back)) ? planApproval?.status === "approved" ? <button className="small-action" onClick={() => void beginIteration()} disabled={iterationRunning || Boolean(activeTask.repositoryId && !activeTask.taskBranch)} title={activeTask.repositoryId && !activeTask.taskBranch ? t("createBranchBeforeCommit") : undefined}>{t("startIteration")}</button> : <button className="small-action" onClick={() => void requestPlanApproval()} disabled={iterationRunning}>{planApproval ? t("awaitingApproval") : t("requestPlanApproval")}</button> : null}{planApproval?.status === "pending" ? <button className="small-action small-action--muted" onClick={() => void approvePlan()} disabled={iterationRunning}>{t("approvePlan")}</button> : null}{["coding", "testing", "running"].includes(activeTask.status) ? <button className="small-action small-action--muted" onClick={() => void changeTaskState("pause")} disabled={iterationRunning}>{t("pause")}</button> : null}{!["cancelled", "done"].includes(activeTask.status) ? <button className="text-button" onClick={() => void changeTaskState("cancel")} disabled={iterationRunning}>{t("cancel")}</button> : null}</div></div> : null}
               {iterationError ? <div className="inline-error">{iterationError}</div> : null}
               {activeTask?.plan ? <div className="plan-list"><div className="plan-label">{t("plan")} / {activeTask.plan.steps.length} {t("steps")}</div>{activeTask.plan.steps.map((step, index) => <div className="plan-step" key={step.id}><span className={`plan-step-index ${index === 0 ? "plan-step-index--active" : ""}`}>{index + 1}</span><div className="plan-step-copy"><strong>{step.title}</strong><span>{step.description}</span></div><span className={`plan-risk plan-risk--${step.risk}`}>{t(`risk.${step.risk}`)}</span></div>)}</div> : null}

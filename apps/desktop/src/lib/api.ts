@@ -89,6 +89,10 @@ export function cancelTask(taskId: string): Promise<{ task: AgentTask; action: "
   return request<{ task: AgentTask; action: "cancelled" }>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" });
 }
 
+export function recoverTask(taskId: string): Promise<{ task: AgentTask; action: "recovered" }> {
+  return request<{ task: AgentTask; action: "recovered" }>(`/api/v1/tasks/${taskId}/recover`, { method: "POST" });
+}
+
 export function createTaskBranch(taskId: string, name: string): Promise<GitSnapshot> {
   return request<GitSnapshot>(`/api/v1/tasks/${taskId}/branch`, {
     method: "POST",

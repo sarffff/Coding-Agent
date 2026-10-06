@@ -75,6 +75,7 @@ export type AgentTask = {
   branch: string | null;
   task_branch: string | null;
   resume_state: AgentTask["status"] | null;
+  requires_recovery: boolean;
 };
 
 export type TestFailure = {
