@@ -15,6 +15,7 @@ docs/
   architecture.md
   phase-1-todolist.md
   phase-2-todolist.md
+  phase-3-todolist.md
 examples/
   phase-1-demo/   演示仓库模板源文件
 scripts/
@@ -105,4 +106,4 @@ Phase 2 的本地部分（多轮编码、验证循环、审批门禁、任务分
 - Desktop 无自动化测试；侧栏「Agent 技能 / 安全策略 / 设置」尚无行为；无键盘快捷键。
 - 单一工作区根目录、单仓库任务；多仓库、CI 交互、冲突处理与自动合并属于后续阶段。
 
-各阶段勾选与验收口径以 `docs/phase-1-todolist.md`、`docs/phase-2-todolist.md` 为准。
+各阶段勾选与验收口径以 `docs/phase-1-todolist.md`、`docs/phase-2-todolist.md` 为准；Phase 3（CI 交互、自动修复、冲突处理与治理）的范围见 `docs/phase-3-todolist.md`，其第 0 节列出了开工前必须先收口的 Phase 2 遗留项。
