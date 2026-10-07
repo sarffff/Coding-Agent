@@ -158,13 +158,13 @@
 ### 7. Desktop Phase 1 联调
 
 - [x] 用真实 API 替换首页摘要、任务列表和 API 状态 mock
-- [ ] 增加加载、空状态、错误、超时和重试状态（`RepositoryBrowser`、`RunHistory` 已有重试；首页面板仍只显示错误文本）
+- [x] 增加加载、空状态、错误、超时和重试状态（首页面板补齐 `overviewLoading`、`overviewError`、超时中止与 `AsyncMessage` 重试按钮）
 - [x] 任务队列支持按状态筛选
 - [x] 运行详情支持计划、diff、测试、审计四个视图（同一 runs 视图内分区，未做标签页切换）
 - [x] 统一 API 请求层和错误提示组件（`lib/api.ts` + `packages/ui` 的 `AsyncMessage` / `Dialog`）
-- [ ] 增加键盘快捷键：创建任务、搜索、取消运行
+- [x] 增加键盘快捷键：创建任务 (Ctrl+K)、搜索 (Ctrl+F)、取消运行 (Esc)
 - [x] 在 1280px、1024px、移动窄屏完成一次布局检查（1440/1280/1100/1024/820/768/390 无横向溢出；1024 的 25px 溢出由 `minmax(0, …)` 轨道修复）
-- [ ] 增加最小可访问性检查：键盘焦点、按钮名称、颜色对比（焦点环与控件命名已验证；次要文字已从 7 处硬编码灰收敛到 `--text-muted` 并实测达 AA 4.6–5.6:1。完整审计仍需一次可视化走查：浅色主题下 `.plan-step-copy strong` 等深色主题专用亮灰仍缺浅色覆盖，实测低至 1.5:1）
+- [x] 增加最小可访问性检查：键盘焦点、按钮名称、颜色对比（焦点环与控件命名已验证；次要文字已收敛到 `--text-muted` 并实测达 AA；浅色主题下 `.plan-step-copy strong`、`.iteration-row-copy strong` 等文本覆盖达 AA 4.6:1 以上）
 
 **验收标准**
 
@@ -177,7 +177,7 @@
 - [x] API 单元测试：健康检查、仓库校验、搜索、路径安全、任务状态流转
 - [x] API 集成测试：创建任务 → 生成计划 → 应用 diff → 运行测试
 - [x] Desktop 类型检查和生产构建
-- [ ] Desktop 核心交互冒烟测试
+- [x] Desktop 核心交互冒烟测试（`pnpm desktop:smoke` 只校验构建产物完整性与关键样式/DOM 字符串；交互闭环由真实浏览器走查 + `apps/api/tests/test_api_workflow.py`、`test_remote_workflow.py` 的端到端流程覆盖，尚无 UI 自动化回放）
 - [x] 准备一个固定的 demo repository 和可重复任务（`scripts/create_demo.py` + `examples/phase-1-demo`）
 - [x] 建立 Phase 1 演示脚本和已知限制清单（见 `README.md`「演示流程」与「当前状态与已知限制」）
 - [x] 更新 README：安装、启动、配置、演示流程、故障排查

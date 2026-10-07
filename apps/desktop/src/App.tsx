@@ -12,6 +12,8 @@ import {
   Code2,
   Command,
   FileCode2,
+  FolderOpen,
+  FolderSync,
   GitBranch,
   GitPullRequest,
   LayoutDashboard,
@@ -22,6 +24,7 @@ import {
   MoreHorizontal,
   PackageCheck,
   Plus,
+  Rocket,
   Search,
   Send,
   Settings2,
@@ -53,7 +56,13 @@ import {
   requestApproval,
   createCommit,
   createTaskBranch,
+  createPullRequest,
   decideApproval,
+  getPublishState,
+  getRemoteTarget,
+  previewPullRequest,
+  pushTaskBranch,
+  refreshPullRequest,
   startIteration,
   startRepair,
   pauseTask,
@@ -65,6 +74,9 @@ import {
   type GitSnapshot,
   type Approval,
   type PatchPreview,
+  type PublishState,
+  type PullRequestPreview,
+  type RemoteTarget,
   type Repository,
   type TestRunResult,
   type TaskIteration,
@@ -74,8 +86,9 @@ import {
   type WorkspaceSummary,
 } from "./lib/api";
 import { usePreferences, type Language, type ThemeMode } from "./lib/preferences";
+import { desktopBridge, desktopStatus, isDesktopShell, type DesktopStatus } from "./lib/desktop";
 
-import { Dialog } from "@coding-agent/ui";
+import { Dialog, AsyncMessage } from "@coding-agent/ui";
 import { RepositoryBrowser } from "./components/RepositoryBrowser";
 import { RunHistory } from "./components/RunHistory";
 
@@ -101,6 +114,7 @@ type Task = {
 };
 
 type StreamEvent = {
+  id: string;
   time: string;
   title: string;
   detail: string;
@@ -147,6 +161,7 @@ function eventToStreamEvent(event: AuditEvent, t: (key: string) => string, local
   const command = Array.isArray(details.command) ? details.command.join(" ") : undefined;
   const detail = command ? `${event.summary} · ${command}` : event.summary;
   return {
+    id: event.id,
     time: new Date(event.created_at).toLocaleTimeString(locale, { hour12: false }),
     title,
     detail,
@@ -195,6 +210,14 @@ function App() {
   const [commitPreviewResult, setCommitPreviewResult] = useState<CommitPreview | null>(null);
   const [gitRunning, setGitRunning] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
+  const [publishState, setPublishState] = useState<PublishState | null>(null);
+  const [remoteTarget, setRemoteTarget] = useState<RemoteTarget | null>(null);
+  const [pullRequestPreview, setPullRequestPreview] = useState<PullRequestPreview | null>(null);
+  const [pullRequestTarget, setPullRequestTarget] = useState("main");
+  const [publishRunning, setPublishRunning] = useState(false);
+  const [publishError, setPublishError] = useState<string | null>(null);
+  const pushKeyRef = useRef("");
+  const pullRequestKeyRef = useRef("");
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [selectedRepositoryId, setSelectedRepositoryId] = useState("");
   const [sourceLocation, setSourceLocation] = useState<{ path: string; line: number } | null>(null);
@@ -205,8 +228,12 @@ function App() {
   const [patchOperation, setPatchOperation] = useState<PatchFileInput["operation"]>("update");
   const [repositoryDialogOpen, setRepositoryDialogOpen] = useState(false);
   const [repositoryPathInput, setRepositoryPathInput] = useState("");
+  const [desktopRuntime, setDesktopRuntime] = useState<DesktopStatus | null>(desktopStatus);
   const [repositorySaving, setRepositorySaving] = useState(false);
   const [confirmAction, setConfirmAction] = useState<"cancel" | "delete" | null>(null);
+  const [overviewLoading, setOverviewLoading] = useState(false);
+  const [overviewError, setOverviewError] = useState<string | null>(null);
+  const promptInputRef = useRef<HTMLInputElement>(null);
   const taskRef = useRef(activeTaskId);
   useEffect(() => { taskRef.current = activeTaskId; }, [activeTaskId]);
   useEffect(() => { if (!repositories.some(repository => repository.id === selectedRepositoryId)) setSelectedRepositoryId(repositories[0]?.id ?? ""); }, [repositories, selectedRepositoryId]);
@@ -287,6 +314,29 @@ function App() {
   }, [activeTaskId]);
 
   useEffect(() => {
+    if (!desktopBridge) return;
+    return desktopBridge.onStatusChanged(setDesktopRuntime);
+  }, []);
+
+  useEffect(() => {
+    pushKeyRef.current = "";
+    pullRequestKeyRef.current = "";
+    setPullRequestPreview(null);
+    setPublishError(null);
+    if (!activeTaskId) {
+      setPublishState(null);
+      setRemoteTarget(null);
+      return;
+    }
+    const controller = new AbortController();
+    getPublishState(activeTaskId, controller.signal).then(setPublishState).catch(() => setPublishState(null));
+    getRemoteTarget(activeTaskId, controller.signal)
+      .then((payload) => { setRemoteTarget(payload); setPullRequestTarget(payload.default_branch); })
+      .catch(() => setRemoteTarget(null));
+    return () => controller.abort();
+  }, [activeTaskId]);
+
+  useEffect(() => {
     if (!activeTaskId) {
       setIterations([]);
       return;
@@ -296,39 +346,72 @@ function App() {
     return () => controller.abort();
   }, [activeTaskId]);
 
-  useEffect(() => {
+  const loadOverviewData = async () => {
+    setOverviewLoading(true);
+    setOverviewError(null);
     const controller = new AbortController();
-    getWorkspaceSummary(controller.signal).then(setWorkspaceSummary).catch(() => undefined);
-    return () => controller.abort();
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    listTasks(controller.signal)
-      .then((payload) => {
-        if (payload.items.length) {
-          const nextTasks = payload.items.map(taskFromApi);
-          setTasks((current) => [...nextTasks, ...current.filter((task) => !nextTasks.some((item) => item.id === task.id))]);
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const [summary, taskList, repoList] = await Promise.all([
+        getWorkspaceSummary(controller.signal),
+        listTasks(controller.signal),
+        listRepositories(controller.signal),
+      ]);
+      setWorkspaceSummary(summary);
+      if (taskList.items.length) {
+        const nextTasks = taskList.items.map(taskFromApi);
+        setTasks((current) => [...nextTasks, ...current.filter((task) => !nextTasks.some((item) => item.id === task.id))]);
+        if (!taskRef.current) {
           setActiveTaskId(nextTasks[0].id);
         }
-      })
-      .catch(() => undefined);
-    return () => controller.abort();
+      }
+      setRepositories(repoList.items);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        setOverviewError(t("overview.timeout"));
+      } else {
+        setOverviewError(error instanceof Error ? error.message : t("overview.error"));
+      }
+    } finally {
+      clearTimeout(timeout);
+      setOverviewLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadOverviewData();
   }, []);
 
   useEffect(() => {
-    const controller = new AbortController();
-    listRepositories(controller.signal)
-      .then((payload) => setRepositories(payload.items))
-      .catch(() => setRepositories([]));
-    return () => controller.abort();
-  }, []);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        promptInputRef.current?.focus();
+        promptInputRef.current?.select();
+      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+        const target = event.target as HTMLElement | null;
+        if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+        event.preventDefault();
+        setActiveNav("repositories");
+      } else if (event.key === "Escape") {
+        if (repositoryDialogOpen) {
+          setRepositoryDialogOpen(false);
+        } else if (confirmAction) {
+          setConfirmAction(null);
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [repositoryDialogOpen, confirmAction]);
 
   const pageTitle = t(`nav.${activeNav}`);
   const displayedStreamEvents = runEvents.map((event) => eventToStreamEvent(event, t, language));
   const reviewTasks = tasks.filter((task) => task.status === "review");
   const planApproval = approvals.find((item) => item.type === "plan");
   const writeApproval = approvals.find((item) => item.type === "write" && item.scope_hash === commitPreviewResult?.scope_hash);
+  const pushApproval = approvals.find((item) => item.type === "push");
+  const pullRequestApproval = approvals.find((item) => item.type === "pr");
 
   const runTask = async () => {
     const trimmedPrompt = prompt.trim();
@@ -351,6 +434,29 @@ function App() {
 
   const addRepository = () => {
     setRepositoryDialogOpen(true); setRepositoryError(null);
+  };
+
+  const pickRepositoryDirectory = async () => {
+    if (!desktopBridge) return;
+    const picked = await desktopBridge.pickDirectory({ fallbackPath: desktopRuntime?.workspaceRoot });
+    if (picked) {
+      setRepositoryPathInput(picked);
+      setRepositoryError(null);
+    }
+  };
+
+  const changeWorkspaceRoot = async () => {
+    if (!desktopBridge) return;
+    setRepositorySaving(true);
+    setRepositoryError(null);
+    try {
+      const result = await desktopBridge.pickWorkspaceRoot();
+      if (result.canceled) return;
+      setDesktopRuntime((current) => ({ ...(current ?? {}), ...result } as DesktopStatus));
+      if (result.error) setRepositoryError(result.error);
+    } finally {
+      setRepositorySaving(false);
+    }
   };
 
   const saveRepository = async () => {
@@ -512,6 +618,102 @@ function App() {
     }
   };
 
+  const requestPublishApproval = async (type: "push" | "pr") => {
+    if (!activeTask || publishRunning) return;
+    setPublishRunning(true);
+    setPublishError(null);
+    try {
+      const summary = type === "push" ? t("publish.pushApprovalSummary") : t("publish.prApprovalSummary");
+      const approval = await requestApproval(activeTask.id, type, summary);
+      setApprovals((current) => [approval, ...current.filter((item) => item.id !== approval.id)]);
+    } catch (error) {
+      setPublishError(error instanceof Error ? error.message : t("publish.approvalRequestError"));
+    } finally {
+      setPublishRunning(false);
+    }
+  };
+
+  const approvePublish = async (type: "push" | "pr") => {
+    const approval = approvals.find((item) => item.type === type && item.status === "pending");
+    if (!approval || publishRunning) return;
+    setPublishRunning(true);
+    setPublishError(null);
+    try {
+      const decided = await decideApproval(approval.id, "approve");
+      setApprovals((current) => current.map((item) => item.id === decided.id ? decided : item));
+    } catch (error) {
+      setPublishError(error instanceof Error ? error.message : t("publish.approvalDecisionError"));
+    } finally {
+      setPublishRunning(false);
+    }
+  };
+
+  const refreshPublishState = async (taskId: string) => {
+    setPublishState(await getPublishState(taskId));
+  };
+
+  const publishTaskBranch = async () => {
+    if (!activeTask || publishRunning || !publishState?.commits.length) return;
+    setPublishRunning(true);
+    setPublishError(null);
+    if (!pushKeyRef.current) pushKeyRef.current = crypto.randomUUID();
+    try {
+      await pushTaskBranch(activeTask.id, "origin", pushKeyRef.current);
+      pushKeyRef.current = "";
+      await refreshPublishState(activeTask.id);
+      updateTaskFromApi(await getTask(activeTask.id));
+    } catch (error) {
+      setPublishError(error instanceof Error ? error.message : t("publish.pushError"));
+    } finally {
+      setPublishRunning(false);
+    }
+  };
+
+  const previewTaskPullRequest = async () => {
+    if (!activeTask || publishRunning) return;
+    setPublishRunning(true);
+    setPublishError(null);
+    try {
+      setPullRequestPreview(await previewPullRequest(activeTask.id, pullRequestTarget));
+    } catch (error) {
+      setPublishError(error instanceof Error ? error.message : t("publish.previewError"));
+    } finally {
+      setPublishRunning(false);
+    }
+  };
+
+  const createTaskPullRequest = async () => {
+    const preview = pullRequestPreview;
+    if (!activeTask || !preview || publishRunning || !preview.ready) return;
+    setPublishRunning(true);
+    setPublishError(null);
+    if (!pullRequestKeyRef.current) pullRequestKeyRef.current = crypto.randomUUID();
+    try {
+      await createPullRequest(activeTask.id, { title: preview.title, body: preview.body, target_branch: preview.target_branch, draft: true }, pullRequestKeyRef.current);
+      pullRequestKeyRef.current = "";
+      await refreshPublishState(activeTask.id);
+      updateTaskFromApi(await getTask(activeTask.id));
+    } catch (error) {
+      setPublishError(error instanceof Error ? error.message : t("publish.createError"));
+    } finally {
+      setPublishRunning(false);
+    }
+  };
+
+  const reconcileTaskPullRequest = async () => {
+    if (!activeTask || publishRunning) return;
+    setPublishRunning(true);
+    setPublishError(null);
+    try {
+      await refreshPullRequest(activeTask.id);
+      await refreshPublishState(activeTask.id);
+    } catch (error) {
+      setPublishError(error instanceof Error ? error.message : t("publish.refreshError"));
+    } finally {
+      setPublishRunning(false);
+    }
+  };
+
   const updateTaskFromApi = (task: AgentTask) => {
     const nextTask = taskFromApi(task);
     setTasks((current) => [nextTask, ...current.filter((item) => item.id !== nextTask.id)]);
@@ -636,7 +838,19 @@ function App() {
       <Dialog open={repositoryDialogOpen} title={t("addGitRepository")} onClose={() => { if (!repositorySaving) setRepositoryDialogOpen(false); }}>
         <form onSubmit={event => { event.preventDefault(); void saveRepository(); }}>
           <label className="dialog-label" htmlFor="repository-path">{t("repositoryPathPrompt")}</label>
-          <input id="repository-path" autoFocus value={repositoryPathInput} onChange={event => setRepositoryPathInput(event.target.value)} disabled={repositorySaving} />
+          <div className="repository-path-row">
+            <input id="repository-path" autoFocus value={repositoryPathInput} onChange={event => setRepositoryPathInput(event.target.value)} disabled={repositorySaving} />
+            {isDesktopShell ? <button type="button" className="small-action small-action--muted" onClick={() => void pickRepositoryDirectory()} disabled={repositorySaving}><FolderOpen size={13} /> {t("desktop.pickDirectory")}</button> : null}
+          </div>
+          {isDesktopShell ? <div className="desktop-runtime">
+            <div className="desktop-runtime-row"><span>{t("desktop.workspaceRoot")}</span><code>{desktopRuntime?.workspaceRoot || t("common.none")}</code></div>
+            <div className="desktop-runtime-row"><span>{t("desktop.apiEndpoint")}</span><code>{desktopRuntime?.apiBaseUrl || t("common.none")}</code></div>
+            <div className="desktop-runtime-actions">
+              <button type="button" className="text-button" onClick={() => void changeWorkspaceRoot()} disabled={repositorySaving}><FolderSync size={13} /> {t("desktop.changeWorkspace")}</button>
+              <button type="button" className="text-button" onClick={() => void desktopBridge?.openLog()}>{t("desktop.openLog")}</button>
+            </div>
+            <p className="desktop-runtime-hint">{t("desktop.workspaceHint")}</p>
+          </div> : null}
           {repositoryError ? <p className="inline-error" role="alert">{repositoryError}</p> : null}
           <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={repositorySaving} onClick={() => setRepositoryDialogOpen(false)}>{t("cancel")}</button><button className="small-action" disabled={repositorySaving || !repositoryPathInput.trim()}>{repositorySaving ? t("common.loading") : t("add")}</button></div>
         </form>
@@ -747,11 +961,19 @@ function App() {
             <MetricCard label={t("needsReview")} value={String(workspaceSummary?.pending_approvals ?? reviewTasks.length).padStart(2, "0")} delta={t("humanInLoop")} icon={ShieldCheck} tone="rose" />
           </section>
 
+          {overviewError ? (
+            <div className="overview-error-banner">
+              <AsyncMessage tone="error" onRetry={() => void loadOverviewData()} retryLabel={t("common.retry")}>
+                {overviewError}
+              </AsyncMessage>
+            </div>
+          ) : null}
+
           <section className="command-panel">
-            <div className="section-heading"><div><div className="section-kicker"><Sparkles size={13} /> {t("startTask")}</div><h2>{t("whatShouldForgeWorkOn")}</h2></div><span className="shortcut-hint"><Command size={12} /> K</span></div>
+            <div className="section-heading"><div><div className="section-kicker"><Sparkles size={13} /> {t("startTask")}</div><h2>{t("whatShouldForgeWorkOn")}</h2></div><span className="shortcut-hint" title={t("shortcuts.taskPrompt")}><Command size={12} /> K</span></div>
             <div className="prompt-row">
               <div className="prompt-prefix"><span className="prompt-dot" /><span>forge</span><span className="prompt-arrow">›</span></div>
-              <input value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") runTask(); }} placeholder={t("taskPromptPlaceholder")} aria-label={t("taskPromptLabel")} />
+              <input ref={promptInputRef} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") runTask(); }} placeholder={t("taskPromptPlaceholder")} aria-label={t("taskPromptLabel")} />
               <button className="run-button" onClick={() => void runTask()} disabled={!prompt.trim() || isRunning}><span>{isRunning ? t("running") : t("runTask")}</span>{isRunning ? <Activity size={15} className="spin" /> : <Send size={15} />}</button>
             </div>
             <div className="prompt-footer"><span><CircleDot size={12} /> {t("agentInspect")}</span><span className="prompt-footer-right"><LockKeyhole size={12} /> {t("localExecutionDetail")}</span></div>{taskError ? <div className="repo-error task-error">{taskError}</div> : null}
@@ -762,10 +984,16 @@ function App() {
               <div className="panel-header"><div><div className="section-kicker">{t("inFlight")}</div><h2>{t("taskQueue")}</h2></div><button className="text-button" onClick={() => setActiveNav("tasks")}>{t("viewAll")} <ArrowUpRight size={14} /></button></div>
               <div className="task-filter"><label htmlFor="task-filter">{t("task.filter")}</label><select id="task-filter" value={taskFilter} onChange={event => setTaskFilter(event.target.value)}>{["all", "queued", "running", "review", "done", "failed", "paused", "cancelled"].map(status => <option value={status} key={status}>{status === "all" ? t("task.all") : t(status)}</option>)}</select></div>
               <div className="task-list">
-                {(activeNav === "tasks" ? filteredTasks : filteredTasks.slice(0, 4)).map((task) => <TaskRow key={task.id} task={task} active={task.id === activeTaskId} onClick={() => { if (!patchRunning && !gitRunning && !iterationRunning && !testRunning) { setActiveTaskId(task.id); setActiveNav("runs"); } }} />)}
-                {!filteredTasks.length ? <div className="empty-operation queue-empty"><Zap size={17} /><span>{tasks.length ? t("task.noMatch") : t("noTasks")}</span></div> : null}
+                {overviewLoading && !tasks.length ? (
+                  <div className="empty-operation queue-empty"><AsyncMessage tone="loading">{t("common.loading")}</AsyncMessage></div>
+                ) : (
+                  <>
+                    {(activeNav === "tasks" ? filteredTasks : filteredTasks.slice(0, 4)).map((task) => <TaskRow key={task.id} task={task} active={task.id === activeTaskId} onClick={() => { if (!patchRunning && !gitRunning && !iterationRunning && !testRunning) { setActiveTaskId(task.id); setActiveNav("runs"); } }} />)}
+                    {!filteredTasks.length ? <div className="empty-operation queue-empty"><Zap size={17} /><span>{tasks.length ? t("task.noMatch") : t("noTasks")}</span></div> : null}
+                  </>
+                )}
               </div>
-              <button className="add-task-button" onClick={() => document.querySelector<HTMLInputElement>(".prompt-row input")?.focus()}><Plus size={15} /> {t("startAnotherTask")}</button>
+              <button className="add-task-button" onClick={() => promptInputRef.current?.focus()}><Plus size={15} /> {t("startAnotherTask")}</button>
             </section>
 
             <section className="panel stream-panel">
@@ -778,7 +1006,7 @@ function App() {
               <div className="stream-list">
                 {displayedStreamEvents.map((event) => {
                   const Icon = iconForEvent(event.icon);
-                  return <div className={`stream-event stream-event--${event.status}`} key={event.title}><div className="stream-time">{event.time}</div><div className="stream-marker"><Icon size={14} /></div><div className="stream-copy"><strong>{event.title}</strong><span>{event.detail}</span></div>{event.status === "done" ? <Check size={15} className="stream-check" /> : event.status === "active" ? <span className="stream-spinner" /> : <Clock3 size={15} className="stream-wait" />}</div>;
+                  return <div className={`stream-event stream-event--${event.status}`} key={event.id}><div className="stream-time">{event.time}</div><div className="stream-marker"><Icon size={14} /></div><div className="stream-copy"><strong>{event.title}</strong><span>{event.detail}</span></div>{event.status === "done" ? <Check size={15} className="stream-check" /> : event.status === "active" ? <span className="stream-spinner" /> : <Clock3 size={15} className="stream-wait" />}</div>;
                 })}
                 {!displayedStreamEvents.length ? <div className="empty-operation"><Activity size={17} /><span>{t("selectTaskEvents")}</span></div> : null}
               </div>
@@ -832,10 +1060,33 @@ function App() {
             </section>
           </section>
 
+          <section className="operations-grid publish-grid">
+            <section className="panel publish-panel">
+              <div className="panel-header"><div><div className="section-kicker"><Rocket size={13} /> {t("publish.kicker")}</div><h2>{t("publish.title")}</h2></div><span className="patch-safety"><LockKeyhole size={12} /> {t("publish.gated")}</span></div>
+              <div className="publish-target">{publishState?.remote_url ? <div><span>{t("publish.remote")}</span><code>{publishState.remote_url}</code></div> : <div className="publish-muted">{t("publish.noRemote")}</div>}{remoteTarget ? <div><span>{t("publish.defaultBranch")}</span><code>{remoteTarget.host} · {remoteTarget.default_branch}</code></div> : null}</div>
+              <div className="publish-row">
+                <div className="publish-row-copy"><strong>{t("publish.pushTitle")}</strong><span>{publishState?.commits.length ? `${publishState.commits.length} ${t("publish.commits")}` : t("publish.noCommits")}</span></div>
+                {pushApproval?.status === "approved" ? <button className="small-action" onClick={() => void publishTaskBranch()} disabled={!publishState?.commits.length || publishRunning}>{publishRunning ? t("working") : t("publish.push")}</button> : <button className="small-action small-action--muted" onClick={() => void requestPublishApproval("push")} disabled={publishRunning}>{pushApproval ? t("awaitingApproval") : t("publish.requestPushApproval")}</button>}
+                {pushApproval?.status === "pending" ? <button className="small-action" onClick={() => void approvePublish("push")} disabled={publishRunning}>{t("approve")}</button> : null}
+              </div>
+              {publishState?.remote_branches.length ? <div className="publish-list">{publishState.remote_branches.map((branch) => <div className="publish-item" key={branch.id}><GitBranch size={13} /><span>{branch.branch}</span><code>{branch.pushed_sha.slice(0, 10)}</code></div>)}</div> : null}
+              <div className="publish-row">
+                <div className="publish-row-copy"><strong>{t("publish.prTitle")}</strong><span>{publishState?.pull_request ? `#${publishState.pull_request.number} · ${publishState.pull_request.state} → ${publishState.pull_request.target_branch}` : t("publish.prHint")}</span></div>
+                {publishState?.pull_request ? <button className="small-action small-action--muted" onClick={() => void reconcileTaskPullRequest()} disabled={publishRunning}>{t("publish.reconcile")}</button> : <>
+                  <button className="small-action small-action--muted" onClick={() => void previewTaskPullRequest()} disabled={!publishState?.remote_branches.length || publishRunning}>{t("publish.previewPr")}</button>
+                  {pullRequestPreview ? (pullRequestApproval?.status === "approved" ? <button className="small-action" onClick={() => void createTaskPullRequest()} disabled={!pullRequestPreview.ready || publishRunning}>{publishRunning ? t("working") : t("publish.createPr")}</button> : <><button className="small-action small-action--muted" onClick={() => void requestPublishApproval("pr")} disabled={publishRunning}>{pullRequestApproval ? t("awaitingApproval") : t("publish.requestPrApproval")}</button>{pullRequestApproval?.status === "pending" ? <button className="small-action" onClick={() => void approvePublish("pr")} disabled={publishRunning}>{t("approve")}</button> : null}</>) : null}
+                </>}
+              </div>
+              {pullRequestPreview ? <div className="patch-result"><div className="patch-summary"><span>{pullRequestPreview.files.length} {t("files")}</span><span>{pullRequestPreview.source_branch} → {pullRequestPreview.target_branch}</span><span>{pullRequestPreview.ready ? t("ready") : t("publish.notReady")}</span></div><pre className="diff-view">{pullRequestPreview.body}</pre></div> : null}
+              {publishState?.pull_request ? <div className="success-note"><Check size={14} /><a className="publish-link" href={publishState.pull_request.html_url} target="_blank" rel="noreferrer">{t("publish.openPr")}</a><ArrowUpRight size={13} /></div> : null}
+              {publishError ? <div className="inline-error">{publishError}</div> : null}
+            </section>
+          </section>
+
           {activeTask?.runId && activeNav !== "repositories" ? <RunHistory runId={activeTask.runId} revision={iterations.map(item => item.updated_at + String(item.rolled_back)).join()} onRestored={refreshActiveTask} disabled={testRunning || patchRunning || gitRunning || ["cancelled", "done"].includes(activeTask.status)} /> : null}
 
           <section className="lower-grid">
-            <section className="panel repo-panel"><div className="panel-header"><div><div className="section-kicker">{t("codebasePulse")}</div><h2>{t("repositories")}</h2></div><button className="small-action" onClick={() => void addRepository()}><Plus size={13} /> {t("add")}</button></div>{repositories.length ? repositories.map((repository, index) => <RepoRow key={repository.id} repository={repository} tone={["amber", "cyan", "lime"][index % 3]} t={t} />) : <div className="repo-empty"><GitBranch size={18} /><span>{t("noRepositoryConnected")}</span><button className="text-button" onClick={() => void addRepository()}>{t("addRepository")} <ArrowUpRight size={13} /></button></div>}{repositoryError ? <div className="repo-error">{repositoryError}</div> : null}</section>
+            <section className="panel repo-panel"><div className="panel-header"><div><div className="section-kicker">{t("codebasePulse")}</div><h2>{t("repositories")}</h2></div><button className="small-action" onClick={() => void addRepository()}><Plus size={13} /> {t("add")}</button></div>{overviewLoading && !repositories.length ? <div className="repo-empty"><AsyncMessage tone="loading">{t("common.loading")}</AsyncMessage></div> : repositories.length ? repositories.map((repository, index) => <RepoRow key={repository.id} repository={repository} tone={["amber", "cyan", "lime"][index % 3]} t={t} />) : <div className="repo-empty"><GitBranch size={18} /><span>{t("noRepositoryConnected")}</span><button className="text-button" onClick={() => void addRepository()}>{t("addRepository")} <ArrowUpRight size={13} /></button></div>}{repositoryError ? <div className="repo-error">{repositoryError}</div> : null}</section>
             <section className="panel approval-panel"><div className="panel-header"><div><div className="section-kicker">{t("humanInTheLoop")}</div><h2>{t("needsYourCall")}</h2></div><span className="approval-count">{String(reviewTasks.length).padStart(2, "0")}</span></div>{reviewTasks.length ? reviewTasks.slice(0, 3).map((task) => <div className="approval-item" key={task.id}><div className="approval-icon approval-icon--rose"><ShieldCheck size={16} /></div><div className="approval-copy"><strong>{t("reviewTaskPlan")}</strong><span>{task.id} · {task.title}</span></div><button className="small-action" onClick={() => setActiveTaskId(task.id)}>{t("review")}</button></div>) : <div className="empty-operation"><ShieldCheck size={17} /><span>{t("noApprovalTasks")}</span></div>}</section>
           </section>
 

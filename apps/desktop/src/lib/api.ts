@@ -1,7 +1,21 @@
-import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem } from "@coding-agent/types";
-export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem } from "@coding-agent/types";
+import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
+export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+import { desktopBridge } from "./desktop";
+
+/**
+ * The Electron shell owns the API process and picks an ephemeral port, so its
+ * injected base URL always wins over the build-time default.
+ */
+function resolveApiBaseUrl(): string {
+  const injected = desktopBridge?.status.apiBaseUrl;
+  if (injected) return injected;
+  const configured = import.meta.env.VITE_API_BASE_URL as string | undefined;
+  if (configured) return configured;
+  return "http://127.0.0.1:8000";
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 export class ApiRequestError extends Error {
   constructor(public code: string, message: string, public traceId?: string) {
@@ -191,4 +205,40 @@ export function listTestHistory(runId: string, signal?: AbortSignal): Promise<{ 
 
 export function rollbackRun(runId: string, checkpointId: string): Promise<{ restored_files: string[]; restored_checkpoint_ids: string[] }> {
   return request(`/api/v1/runs/${runId}/rollback`, { method: "POST", body: JSON.stringify({ checkpoint_id: checkpointId }) });
+}
+
+export function getPublishState(taskId: string, signal?: AbortSignal): Promise<PublishState> {
+  return request<PublishState>(`/api/v1/tasks/${taskId}/publish-state`, { signal });
+}
+
+export function getRemoteTarget(taskId: string, signal?: AbortSignal): Promise<RemoteTarget> {
+  return request<RemoteTarget>(`/api/v1/tasks/${taskId}/remote-target`, { signal });
+}
+
+export function pushTaskBranch(taskId: string, remote: string, idempotencyKey: string): Promise<RemoteBranch> {
+  return request<RemoteBranch>(`/api/v1/tasks/${taskId}/push`, {
+    method: "POST",
+    headers: { "idempotency-key": idempotencyKey },
+    body: JSON.stringify({ remote }),
+  });
+}
+
+export function previewPullRequest(taskId: string, targetBranch: string, signal?: AbortSignal): Promise<PullRequestPreview> {
+  return request<PullRequestPreview>(`/api/v1/tasks/${taskId}/pull-request/preview?target_branch=${encodeURIComponent(targetBranch)}`, { signal });
+}
+
+export function createPullRequest(
+  taskId: string,
+  payload: { title: string; body: string; target_branch: string; draft: boolean },
+  idempotencyKey: string
+): Promise<PullRequest> {
+  return request<PullRequest>(`/api/v1/tasks/${taskId}/pull-request`, {
+    method: "POST",
+    headers: { "idempotency-key": idempotencyKey },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function refreshPullRequest(taskId: string): Promise<PullRequest> {
+  return request<PullRequest>(`/api/v1/tasks/${taskId}/pull-request/refresh`, { method: "POST" });
 }

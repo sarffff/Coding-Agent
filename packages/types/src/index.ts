@@ -214,6 +214,80 @@ export type RunCheckpoint = {
 
 export type TestHistoryItem = { iteration_id: string; iteration_number: number; result: TestRunResult };
 
+export type PublishCommit = {
+  id: string;
+  task_id: string;
+  run_id: string;
+  branch: string;
+  commit_sha: string;
+  commit_message: string;
+  scope_hash: string;
+  created_at: string;
+};
+
+export type RemoteBranch = {
+  id: string;
+  task_id: string;
+  run_id: string;
+  repository_id: string;
+  branch: string;
+  remote_url: string;
+  pushed_sha: string;
+  created_at: string;
+};
+
+export type PullRequest = {
+  id: string;
+  task_id: string;
+  run_id: string;
+  repository_id: string;
+  provider: string;
+  number: number;
+  title: string;
+  body: string;
+  html_url: string;
+  state: "open" | "closed" | "merged" | "draft";
+  source_branch: string;
+  target_branch: string;
+  draft: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PullRequestPreview = {
+  title: string;
+  body: string;
+  source_branch: string;
+  target_branch: string;
+  draft: boolean;
+  files: string[];
+  risk_level: "low" | "medium" | "high";
+  ready: boolean;
+  validation_passed: boolean;
+  commit_sha: string | null;
+};
+
+export type RemoteTarget = {
+  provider: string;
+  remote_url: string;
+  host: string;
+  owner: string;
+  repo: string;
+  default_branch: string;
+  allowed_hosts: string[];
+  allowed_repositories: string[];
+};
+
+export type PublishState = {
+  task_id: string;
+  branch: string | null;
+  head: string | null;
+  remote_url: string | null;
+  commits: PublishCommit[];
+  remote_branches: RemoteBranch[];
+  pull_request: PullRequest | null;
+};
+
 
 export type TaskStatus = AgentTask["status"];
 export type RepositorySummary = Repository;
