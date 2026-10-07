@@ -6,7 +6,9 @@ from .approval_service import ApprovalService
 from .audit_service import AuditService
 from .config import Settings, get_settings
 from .git_service import GitService
+from .idempotency import IdempotencyService
 from .patch_service import PatchService
+from .remote_service import RemoteService
 from .repository_service import RepositoryService
 from .store import StateStore
 from .task_service import TaskService
@@ -24,6 +26,8 @@ class Services:
     audit_service: AuditService
     git_service: GitService
     approval_service: ApprovalService
+    remote_service: RemoteService
+    idempotency_service: IdempotencyService
 
 
 def build_services(settings: Settings | None = None) -> Services:
@@ -38,6 +42,9 @@ def build_services(settings: Settings | None = None) -> Services:
     store = StateStore(settings.state_dir / "state.db")
     repository_service = RepositoryService(settings, store)
     task_service = TaskService(repository_service, store)
+    audit_service = AuditService(store)
+    git_service = GitService(repository_service, settings)
+    approval_service = ApprovalService(store)
     return Services(
         settings=settings,
         store=store,
@@ -45,7 +52,11 @@ def build_services(settings: Settings | None = None) -> Services:
         task_service=task_service,
         patch_service=PatchService(repository_service, settings, store),
         test_service=TestService(repository_service, settings),
-        audit_service=AuditService(store),
-        git_service=GitService(repository_service, settings),
-        approval_service=ApprovalService(store),
+        audit_service=audit_service,
+        git_service=git_service,
+        approval_service=approval_service,
+        remote_service=RemoteService(
+            repository_service, task_service, git_service, approval_service, audit_service, settings, store
+        ),
+        idempotency_service=IdempotencyService(store, settings.idempotency_ttl_hours),
     )

@@ -107,6 +107,15 @@ class TaskService:
         self._persist(record)
         return record.summary
 
+    def transition(self, task_id: str, target: TaskStatus, next_action: str | None = None) -> TaskSummary:
+        """Move a task to `target` through the same state machine the loop uses."""
+        record = self._record(task_id)
+        self._transition(record, target)
+        if next_action is not None:
+            record.summary.next_action = next_action
+        self._persist(record)
+        return record.summary
+
     def create(self, goal: str, repository_id: str | None = None) -> TaskSummary:
         repository: RepositoryRecord | None = None
         if repository_id:

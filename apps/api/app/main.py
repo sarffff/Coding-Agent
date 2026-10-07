@@ -4,7 +4,7 @@ import time
 import hashlib
 from uuid import uuid4
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -48,11 +48,23 @@ from .models import (
     ApprovalDecisionRequest,
     ApprovalListResponse,
     ApprovalSummary,
+    CommitListResponse,
+    CommitRecord,
+    PullRequestCreateRequest,
+    PullRequestListResponse,
+    PullRequestPreviewResponse,
+    PullRequestRecord,
+    RemoteBranchListResponse,
+    RemoteBranchRecord,
+    RemoteTargetResponse,
+    TaskPublishStateResponse,
+    TaskPushRequest,
     TaskListResponse,
     TaskSummary,
     WorkspaceSummary,
 )
 from .repository_service import RepositoryError
+from .idempotency import run_idempotent
 from .services import build_services
 
 
@@ -65,6 +77,8 @@ test_service = services.test_service
 audit_service = services.audit_service
 git_service = services.git_service
 approval_service = services.approval_service
+remote_service = services.remote_service
+idempotency_service = services.idempotency_service
 
 app = FastAPI(
     title="Coding Agent API",
@@ -115,15 +129,38 @@ def plan_scope_hash(task: TaskSummary) -> str:
     return hashlib.sha256((task.id + "\n" + task.goal + "\n" + (task.plan.objective if task.plan else "")).encode("utf-8")).hexdigest()
 
 
+ERROR_STATUS_BY_CODE = {
+    "GIT_UNAVAILABLE": 503,
+    "GIT_BUSY": 503,
+    "REMOTE_TIMEOUT": 504,
+    "REMOTE_NETWORK_ERROR": 502,
+    "PUSH_REJECTED": 502,
+    "PR_CREATION_FAILED": 502,
+    "REMOTE_ERROR": 502,
+    "PUSHED_COMMIT_UNRESOLVED": 502,
+    "AUTHENTICATION_FAILED": 401,
+    "RATE_LIMITED_OR_FORBIDDEN": 429,
+    "REPOSITORY_NOT_FOUND": 404,
+    "TASK_NOT_FOUND": 404,
+    "RUN_NOT_FOUND": 404,
+    "PATCH_NOT_FOUND": 404,
+    "CHECKPOINT_NOT_FOUND": 404,
+    "PATH_NOT_FOUND": 404,
+    "TREE_PATH_NOT_FOUND": 404,
+    "REMOTE_NOT_FOUND": 404,
+    "PULL_REQUEST_NOT_FOUND": 404,
+    "IDEMPOTENCY_IN_PROGRESS": 409,
+    "IDEMPOTENCY_KEY_REUSED": 409,
+    "BRANCH_NOT_PUSHED": 409,
+    "REMOTE_HEAD_MOVED": 409,
+    "NO_APPROVED_COMMIT": 409,
+    "TASK_BRANCH_NOT_CHECKED_OUT": 409,
+}
+
+
 @app.exception_handler(RepositoryError)
 async def repository_error_handler(request: Request, exc: RepositoryError) -> JSONResponse:
-    if exc.code in {"GIT_UNAVAILABLE", "GIT_BUSY"}:
-        status_code = 503
-    elif exc.code in {"REPOSITORY_NOT_FOUND", "TASK_NOT_FOUND", "RUN_NOT_FOUND", "PATCH_NOT_FOUND", "CHECKPOINT_NOT_FOUND", "PATH_NOT_FOUND", "TREE_PATH_NOT_FOUND"}:
-        status_code = 404
-    else:
-        status_code = 400
-    return error_response(request, status_code, exc.code, exc.message, exc.details)
+    return error_response(request, ERROR_STATUS_BY_CODE.get(exc.code, 400), exc.code, exc.message, exc.details)
 
 
 @app.exception_handler(RequestValidationError)
@@ -377,8 +414,89 @@ async def create_task_commit(task_id: str, payload: CommitCreateRequest) -> GitS
         head = git_service.commit(repository_id, files, message, payload.scope_hash, task.task_branch or "")
         snapshot = git_service.snapshot(repository_id)
         task_service.update_git_snapshot(task_id, snapshot.branch, head, snapshot.changed_files)
+        remote_service.record_commit(task_id, task.run_id, snapshot.branch, head, message, payload.scope_hash)
         audit_service.record("git.commit.create", "succeeded", "Created approved task commit", task_id=task_id, run_id=task.run_id, details={"branch": snapshot.branch, "head": head, "files": prepared.changed_files, "scope_hash": payload.scope_hash})
         return GitSnapshotResponse(branch=snapshot.branch, head=head, changed_files=snapshot.changed_files, clean=snapshot.clean)
+
+
+@app.get("/api/v1/tasks/{task_id}/remote-target", response_model=RemoteTargetResponse)
+async def task_remote_target(task_id: str, remote: str = Query(default="origin", max_length=40)) -> RemoteTargetResponse:
+    repository_id_for_task(task_id)
+    return await remote_service.remote_target(task_id, remote)
+
+
+@app.get("/api/v1/tasks/{task_id}/publish-state", response_model=TaskPublishStateResponse)
+async def task_publish_state(task_id: str) -> TaskPublishStateResponse:
+    task_service.get(task_id)
+    return remote_service.publish_state(task_id)
+
+
+@app.get("/api/v1/tasks/{task_id}/commits", response_model=CommitListResponse)
+async def list_task_commits(task_id: str) -> CommitListResponse:
+    task_service.get(task_id)
+    items = remote_service.list_commits(task_id)
+    return CommitListResponse(items=items, total=len(items))
+
+
+@app.get("/api/v1/tasks/{task_id}/remote-branches", response_model=RemoteBranchListResponse)
+async def list_task_remote_branches(task_id: str) -> RemoteBranchListResponse:
+    task_service.get(task_id)
+    items = remote_service.list_remote_branches(task_id)
+    return RemoteBranchListResponse(items=items, total=len(items))
+
+
+@app.post("/api/v1/tasks/{task_id}/push", response_model=RemoteBranchRecord, status_code=201)
+async def push_task_branch(
+    task_id: str,
+    payload: TaskPushRequest,
+    idempotency_key: str | None = Header(default=None),
+) -> RemoteBranchRecord | JSONResponse:
+    repository_id_for_task(task_id)
+
+    async def action() -> RemoteBranchRecord:
+        return await remote_service.push_branch(task_id, payload.remote)
+
+    return await run_idempotent(idempotency_service, idempotency_key, f"tasks/{task_id}/push", payload, action)
+
+
+@app.get("/api/v1/tasks/{task_id}/pull-request/preview", response_model=PullRequestPreviewResponse)
+async def preview_task_pull_request(
+    task_id: str, target_branch: str = Query(default="main", max_length=100)
+) -> PullRequestPreviewResponse:
+    task_service.get(task_id)
+    return remote_service.preview_pull_request(task_id, target_branch)
+
+
+@app.post("/api/v1/tasks/{task_id}/pull-request", response_model=PullRequestRecord, status_code=201)
+async def create_task_pull_request(
+    task_id: str,
+    payload: PullRequestCreateRequest,
+    idempotency_key: str | None = Header(default=None),
+) -> PullRequestRecord | JSONResponse:
+    repository_id_for_task(task_id)
+
+    async def action() -> PullRequestRecord:
+        return await remote_service.create_pull_request(task_id, payload)
+
+    return await run_idempotent(idempotency_service, idempotency_key, f"tasks/{task_id}/pull-request", payload, action)
+
+
+@app.get("/api/v1/tasks/{task_id}/pull-request", response_model=PullRequestRecord)
+async def get_task_pull_request(task_id: str) -> PullRequestRecord:
+    record = remote_service.get_pull_request(task_id)
+    if record is None:
+        raise RepositoryError("PULL_REQUEST_NOT_FOUND", "No Pull Request has been created for this task.", {"task_id": task_id})
+    return record
+
+
+@app.post("/api/v1/tasks/{task_id}/pull-request/refresh", response_model=PullRequestRecord)
+async def refresh_task_pull_request(task_id: str) -> PullRequestRecord:
+    task_service.assert_recovered(task_id)
+    record = await remote_service.refresh_pull_request(task_id)
+    if record is None:
+        raise RepositoryError("PULL_REQUEST_NOT_FOUND", "No Pull Request has been created for this task.", {"task_id": task_id})
+    audit_service.record("pr.refresh", "succeeded", f"Reconciled Pull Request #{record.number} as {record.state}", task_id=task_id, run_id=record.run_id, details={"pr_number": record.number, "state": record.state})
+    return record
 
 
 def repository_id_for_run(run_id: str, require_recovered: bool = True) -> str:

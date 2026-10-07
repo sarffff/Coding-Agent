@@ -272,6 +272,106 @@ class CommitCreateRequest(BaseModel):
     scope_hash: str = Field(min_length=64, max_length=64)
 
 
+class CommitRecord(BaseModel):
+    id: str = Field(default_factory=lambda: f"commit-{uuid4().hex[:12]}")
+    task_id: str
+    run_id: str
+    branch: str
+    commit_sha: str
+    commit_message: str
+    scope_hash: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CommitListResponse(BaseModel):
+    items: list[CommitRecord]
+    total: int
+
+
+class RemoteBranchRecord(BaseModel):
+    id: str = Field(default_factory=lambda: f"rbranch-{uuid4().hex[:12]}")
+    task_id: str
+    run_id: str
+    repository_id: str
+    branch: str
+    remote_url: str
+    pushed_sha: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RemoteBranchListResponse(BaseModel):
+    items: list[RemoteBranchRecord]
+    total: int
+
+
+class TaskPushRequest(BaseModel):
+    remote: str = Field(default="origin", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+
+
+class RemoteTargetResponse(BaseModel):
+    provider: str
+    remote_url: str
+    host: str
+    owner: str
+    repo: str
+    default_branch: str
+    allowed_hosts: list[str]
+    allowed_repositories: list[str]
+
+
+class PullRequestRecord(BaseModel):
+    id: str = Field(default_factory=lambda: f"pr-{uuid4().hex[:12]}")
+    task_id: str
+    run_id: str
+    repository_id: str
+    provider: str = "github"
+    number: int
+    title: str
+    body: str
+    html_url: str
+    state: Literal["open", "closed", "merged", "draft"] = "open"
+    source_branch: str
+    target_branch: str
+    draft: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class PullRequestListResponse(BaseModel):
+    items: list[PullRequestRecord]
+    total: int
+
+
+class PullRequestCreateRequest(BaseModel):
+    title: str = Field(min_length=3, max_length=200)
+    body: str = Field(min_length=3, max_length=10_000)
+    target_branch: str = "main"
+    draft: bool = True
+
+
+class PullRequestPreviewResponse(BaseModel):
+    title: str
+    body: str
+    source_branch: str
+    target_branch: str
+    draft: bool
+    files: list[str]
+    risk_level: RiskLevel
+    ready: bool
+    validation_passed: bool
+    commit_sha: str | None = None
+
+
+class TaskPublishStateResponse(BaseModel):
+    task_id: str
+    branch: str | None = None
+    head: str | None = None
+    remote_url: str | None = None
+    commits: list[CommitRecord] = Field(default_factory=list)
+    remote_branches: list[RemoteBranchRecord] = Field(default_factory=list)
+    pull_request: PullRequestRecord | None = None
+
+
 ApprovalType = Literal["plan", "write", "push", "pr"]
 ApprovalStatus = Literal["pending", "approved", "rejected", "request_changes", "cancelled", "expired"]
 

@@ -18,6 +18,9 @@ from .process_env import child_env, is_process_startup_failure
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
 
 
+PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "production", "release"})
+
+
 @dataclass(slots=True)
 class GitSnapshot:
     branch: str
@@ -47,7 +50,6 @@ class GitService:
     """Build and publish exactly the reviewed tree, preserving the user's index."""
 
     BRANCH_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,80}$")
-    PROTECTED_BRANCHES = {"main", "master", "develop", "production"}
 
     def __init__(self, repositories: RepositoryService, settings: Settings):
         self.repositories = repositories
@@ -76,7 +78,7 @@ class GitService:
     def create_task_branch(self, repository_id: str, branch: str) -> GitSnapshot:
         repository = self.repositories.get(repository_id)
         with self.lock(repository_id):
-            if not self.BRANCH_RE.fullmatch(branch) or ".." in branch or branch in self.PROTECTED_BRANCHES:
+            if not self.BRANCH_RE.fullmatch(branch) or ".." in branch or branch in PROTECTED_BRANCHES:
                 raise RepositoryError("INVALID_BRANCH_NAME", "Choose a valid, unprotected task branch name.")
             self._run(repository, ["check-ref-format", "--branch", branch])
             snapshot = self.snapshot(repository_id)
@@ -118,7 +120,7 @@ class GitService:
             prepared = self.preview(repository_id, files, message)
             if prepared.scope_hash != scope_hash:
                 raise RepositoryError("COMMIT_PREVIEW_STALE", "The branch, HEAD, files or message changed. Preview and approve the commit again.")
-            if not branch or prepared.branch != branch or branch in self.PROTECTED_BRANCHES:
+            if not branch or prepared.branch != branch or branch in PROTECTED_BRANCHES:
                 raise RepositoryError("TASK_BRANCH_REQUIRED", "Commit only on the branch created for this task.")
             if not prepared.ready:
                 raise RepositoryError("NOTHING_TO_COMMIT", "No task changes remain to commit.")

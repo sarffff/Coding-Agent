@@ -13,10 +13,15 @@ def git_output(directory: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=directory, check=True, capture_output=True, text=True, encoding="utf-8").stdout
 
 
-def test_settings(demo_repository: Path, tmp_path: Path):
+def build_settings(demo_repository: Path, tmp_path: Path, **overrides):
     from app.config import Settings
 
-    return Settings(workspace_root=demo_repository.parent, state_dir=tmp_path / "state", command_timeout_seconds=15)
+    return Settings(
+        workspace_root=demo_repository.parent,
+        state_dir=tmp_path / "state",
+        command_timeout_seconds=15,
+        **overrides,
+    )
 
 
 def mount_services(monkeypatch, settings) -> object:
@@ -25,7 +30,18 @@ def mount_services(monkeypatch, settings) -> object:
     from app.services import build_services
 
     services = build_services(settings)
-    for name in ("settings", "repository_service", "task_service", "patch_service", "test_service", "audit_service", "git_service", "approval_service"):
+    for name in (
+        "settings",
+        "repository_service",
+        "task_service",
+        "patch_service",
+        "test_service",
+        "audit_service",
+        "git_service",
+        "approval_service",
+        "remote_service",
+        "idempotency_service",
+    ):
         monkeypatch.setattr(main, name, getattr(services, name))
     return services
 
@@ -64,7 +80,7 @@ def api_client(demo_repository, tmp_path, monkeypatch):
     from app import main
     from app.config import Settings
 
-    services = mount_services(monkeypatch, test_settings(demo_repository, tmp_path))
+    services = mount_services(monkeypatch, build_settings(demo_repository, tmp_path))
     with TestClient(main.app) as client:
         yield client
     services.store.close()
@@ -87,7 +103,7 @@ def api_stack(demo_repository, tmp_path, monkeypatch):
         def restart(self):
             if self.services is not None:
                 self.services.store.close()
-            self.services = mount_services(monkeypatch, test_settings(demo_repository, tmp_path))
+            self.services = mount_services(monkeypatch, build_settings(demo_repository, tmp_path))
             return TestClient(main.app)
 
         @property

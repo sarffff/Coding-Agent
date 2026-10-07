@@ -8,7 +8,7 @@ from typing import Iterable
 from pydantic import BaseModel
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StateStore:
@@ -40,6 +40,15 @@ class StateStore:
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS idempotency (
+                key TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idempotency_endpoint ON idempotency (endpoint);
             """
         )
         version = self._connection.execute("SELECT value FROM meta WHERE name = 'schema_version'").fetchone()
@@ -48,8 +57,30 @@ class StateStore:
         elif version[0] > SCHEMA_VERSION:
             raise ValueError(f"State file {path} was written by a newer version (schema {version[0]} > {SCHEMA_VERSION}).")
         elif version[0] < SCHEMA_VERSION:
-            raise ValueError(f"State file {path} needs migration (schema {version[0]} < {SCHEMA_VERSION}).")
+            self._migrate(version[0], SCHEMA_VERSION)
         self._connection.commit()
+
+    def _migrate(self, current_version: int, target_version: int) -> None:
+        """Migrate state database between schema versions."""
+        with self._lock, self._connection:
+            if current_version == 1 and target_version >= 2:
+                self._connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS idempotency (
+                        key TEXT PRIMARY KEY,
+                        endpoint TEXT NOT NULL,
+                        request_hash TEXT NOT NULL,
+                        status_code INTEGER NOT NULL,
+                        response_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idempotency_endpoint ON idempotency (endpoint);
+                    """
+                )
+                self._connection.execute("UPDATE meta SET value = ? WHERE name = 'schema_version'", (2,))
+                current_version = 2
+            if current_version != target_version:
+                raise ValueError(f"Migration from schema {current_version} to {target_version} not fully supported.")
 
     def next_key(self, scope: str) -> str:
         with self._lock, self._connection:
@@ -80,6 +111,29 @@ class StateStore:
     def models(self, scope: str, model: type[BaseModel]) -> Iterable[tuple[str, BaseModel]]:
         for key, payload in self.items(scope):
             yield key, model.model_validate_json(payload)
+
+    def get_idempotency(self, key: str) -> tuple[str, str, int, str] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT endpoint, request_hash, status_code, response_json FROM idempotency WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return row if row else None
+
+    def save_idempotency(
+        self, key: str, endpoint: str, request_hash: str, status_code: int, response_json: str, created_at: str
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO idempotency (key, endpoint, request_hash, status_code, response_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO NOTHING",
+                (key, endpoint, request_hash, status_code, response_json, created_at),
+            )
+
+    def prune_idempotency(self, before: str) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute("DELETE FROM idempotency WHERE created_at < ?", (before,))
+            return cursor.rowcount
 
     def close(self) -> None:
         with self._lock:

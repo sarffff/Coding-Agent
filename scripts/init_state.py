@@ -4,10 +4,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "api"))
 
-from app.config import get_settings  # noqa: E402
-from app.store import SCHEMA_VERSION, StateStore  # noqa: E402
+from app.config import get_settings
+from app.store import SCHEMA_VERSION, StateStore
 
-SCOPES = ("repositories", "tasks", "approvals", "audit_events", "checkpoints")
+SCOPES = ("repositories", "tasks", "approvals", "audit_events", "checkpoints", "commits", "remote_branches", "pull_requests")
 
 
 def main() -> None:

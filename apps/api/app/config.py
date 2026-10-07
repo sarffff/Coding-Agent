@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     max_search_results: int = 200
     git_timeout_seconds: int = 10
     command_timeout_seconds: int = 30
+    github_token: str | None = None
+    allowed_remote_hosts: list[str] = ["github.com"]
+    allowed_repositories: list[str] = []
+    remote_provider: str = "github"
+    remote_timeout_seconds: int = 30
+    idempotency_ttl_hours: int = 24
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
