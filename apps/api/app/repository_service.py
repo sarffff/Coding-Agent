@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import ast
+import re
 import hashlib
 import os
 import subprocess
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from .config import Settings
+from .store import StateStore
 from .models import (
     RepositorySummary,
+    RepositoryContext,
+    FileContentResponse,
+    SymbolInfo,
     RepositoryValidateResponse,
     SearchMatch,
     SearchRequest,
@@ -18,20 +25,9 @@ from .models import (
 )
 
 
-IGNORED_DIRECTORIES = {
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    "vendor",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-    ".venv",
-    "__pycache__",
-    ".pytest_cache",
-}
+from .file_policy import IGNORED_DIRECTORIES, is_protected_path
+from .process_env import child_env, is_process_startup_failure
+
 
 LANGUAGE_BY_EXTENSION = {
     ".py": "Python",
@@ -57,8 +53,7 @@ class RepositoryError(Exception):
         self.details = details or {}
 
 
-@dataclass(slots=True)
-class RepositoryRecord:
+class RepositoryRecord(BaseModel):
     id: str
     name: str
     path: Path
@@ -66,9 +61,21 @@ class RepositoryRecord:
 
 
 class RepositoryService:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, store: StateStore | None = None):
         self.settings = settings
+        self.store = store
         self._repositories: dict[str, RepositoryRecord] = {}
+        self._keys: dict[str, str] = {}
+        if store:
+            for key, record in store.models("repositories", RepositoryRecord):
+                self._repositories[record.id] = record
+                self._keys[record.id] = key
+
+    def _persist(self, record: RepositoryRecord) -> None:
+        if not self.store:
+            return
+        key = self._keys.setdefault(record.id, self.store.next_key("repositories"))
+        self.store.put("repositories", key, record, record.registered_at.isoformat())
 
     def _workspace_root(self) -> Path:
         return self.settings.workspace_root.expanduser().resolve()
@@ -96,6 +103,7 @@ class RepositoryService:
                 encoding="utf-8",
                 errors="replace",
                 timeout=self.settings.git_timeout_seconds,
+                env=child_env(),
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -103,9 +111,11 @@ class RepositoryService:
         except subprocess.TimeoutExpired as exc:
             raise RepositoryError("GIT_TIMEOUT", "Git command timed out.") from exc
 
+        if is_process_startup_failure(result.returncode):
+            raise RepositoryError("GIT_UNAVAILABLE", "The API process could not start Git. Restart the API from a normal shell.", {"command": ["git", *args], "exit_code": result.returncode})
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
-            raise RepositoryError("GIT_COMMAND_FAILED", detail or "Git command failed.")
+            raise RepositoryError("GIT_COMMAND_FAILED", detail or "Git command failed.", {"command": ["git", *args], "exit_code": result.returncode})
         return result.stdout.strip()
 
     def _git_root(self, path: Path) -> Path:
@@ -143,6 +153,7 @@ class RepositoryService:
             registered_at=datetime.now(timezone.utc),
         )
         self._repositories[repository_id] = record
+        self._persist(record)
         return self.summary(record)
 
     def list(self) -> list[RepositorySummary]:
@@ -184,7 +195,7 @@ class RepositoryService:
         for current, directories, files in os.walk(base_path):
             current_path = Path(current)
             depth = len(current_path.relative_to(base_path).parts)
-            directories[:] = sorted(directory for directory in directories if directory not in IGNORED_DIRECTORIES)
+            directories[:] = sorted(directory for directory in directories if directory.lower() not in IGNORED_DIRECTORIES and not (Path(current) / directory).is_symlink())
             if depth >= max_depth:
                 directories[:] = []
             for directory in directories:
@@ -220,7 +231,7 @@ class RepositoryService:
         matches: list[SearchMatch] = []
         truncated = False
         for current, directories, files in os.walk(record.path):
-            directories[:] = sorted(directory for directory in directories if directory not in IGNORED_DIRECTORIES)
+            directories[:] = sorted(directory for directory in directories if directory.lower() not in IGNORED_DIRECTORIES and not (Path(current) / directory).is_symlink())
             for filename in sorted(files):
                 file_path = Path(current) / filename
                 if self._skip_file(file_path) or (extensions and file_path.suffix.lower() not in extensions):
@@ -241,12 +252,75 @@ class RepositoryService:
                     if column < 0:
                         continue
                     matches.append(SearchMatch(path=relative, line=line_number, column=column + 1, text=line.strip()[:500]))
-                    if len(matches) >= request.max_results:
-                        return matches, True
+                    if len(matches) > min(request.max_results, self.settings.max_search_results):
+                        return matches[:min(request.max_results, self.settings.max_search_results)], True
         return matches, truncated
 
+    def read_file(self, repository_id: str, relative_path: str) -> FileContentResponse:
+        record = self.get(repository_id)
+        target = self._safe_repo_path(record, relative_path)
+        if not target.is_file():
+            raise RepositoryError("FILE_NOT_FOUND", "The requested code file does not exist.")
+        if self._skip_file(target):
+            raise RepositoryError("FILE_NOT_READABLE", "This file is protected or exceeds the size limit.")
+        content = target.read_bytes()
+        if b"\0" in content:
+            raise RepositoryError("BINARY_FILE_NOT_ALLOWED", "Binary files cannot be displayed as source code.")
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RepositoryError("FILE_ENCODING_UNSUPPORTED", "Only UTF-8 source files are supported.") from exc
+        return FileContentResponse(
+            repository_id=repository_id, path=target.relative_to(record.path).as_posix(),
+            content=text, content_hash=hashlib.sha256(content).hexdigest(), size=len(content),
+            language=LANGUAGE_BY_EXTENSION.get(target.suffix.lower()),
+            line_count=len(text.splitlines()), symbols=self._symbols(target.suffix.lower(), text),
+        )
+
+    def context(self, repository_id: str) -> RepositoryContext:
+        record = self.get(repository_id)
+        entries, truncated = self.tree(repository_id, max_depth=6)
+        files = [entry.path for entry in entries if entry.kind == "file"]
+        entry_names = {"main.py", "app.py", "__main__.py", "main.tsx", "main.ts", "main.js", "index.ts", "index.tsx", "index.js", "server.ts", "server.js"}
+        config_names = {"pyproject.toml", "requirements.txt", "package.json", "pnpm-workspace.yaml", "tsconfig.json", "vite.config.ts", "pytest.ini", "ruff.toml", "eslint.config.js", "vitest.config.ts"}
+        test_paths = sorted({str(Path(name).parent).replace("\\", "/") for name in files if Path(name).name.startswith("test_") or any(token in name for token in (".test.", ".spec.", "/tests/", "/__tests__/"))})
+        return RepositoryContext(
+            repository_id=repository_id, languages=self._language_counts(record.path),
+            package_manager=self._package_manager(record.path),
+            entry_files=[name for name in files if Path(name).name in entry_names][:30],
+            test_directories=test_paths[:30], config_files=[name for name in files if Path(name).name in config_names][:30],
+            file_count=len(files), truncated=truncated,
+        )
+
+    @staticmethod
+    def _symbols(extension: str, content: str) -> list[SymbolInfo]:
+        symbols: list[SymbolInfo] = []
+        if extension == ".py":
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                return []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    symbols.append(SymbolInfo(name=node.name, kind="class" if isinstance(node, ast.ClassDef) else "function", line=node.lineno))
+        elif extension in {".ts", ".tsx", ".js", ".jsx"}:
+            pattern = re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?(function|class|interface|type|const|let|var)\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
+            for match in pattern.finditer(content):
+                kind = "variable" if match.group(1) in {"const", "let", "var"} else match.group(1)
+                symbols.append(SymbolInfo(name=match.group(2), kind=kind, line=content.count("\n", 0, match.start()) + 1 + match.group(0).count("\n")))
+        return sorted(symbols, key=lambda symbol: symbol.line)[:200]
+
     def _safe_repo_path(self, record: RepositoryRecord, relative_path: str) -> Path:
-        requested = (record.path / relative_path).resolve()
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts or (relative_path and is_protected_path(relative)):
+            raise RepositoryError("PROTECTED_PATH", "This path is outside the readable code area.")
+        candidate = record.path / relative
+        for part in [candidate, *candidate.parents]:
+            if part == record.path:
+                break
+            if part.is_symlink():
+                raise RepositoryError("SYMLINK_NOT_ALLOWED", "Symlink paths cannot be read or edited.")
+        requested = candidate.resolve()
         try:
             requested.relative_to(record.path)
         except ValueError as exc:
@@ -259,7 +333,7 @@ class RepositoryService:
                 return True
         except OSError:
             return True
-        return any(part in IGNORED_DIRECTORIES for part in path.parts)
+        return is_protected_path(path.name)
 
     @staticmethod
     def _normalize_extension(extension: str) -> str:
@@ -268,8 +342,10 @@ class RepositoryService:
     def _language_counts(self, repo_path: Path) -> dict[str, int]:
         counts: dict[str, int] = {}
         for current, directories, files in os.walk(repo_path):
-            directories[:] = [directory for directory in directories if directory not in IGNORED_DIRECTORIES]
+            directories[:] = [directory for directory in directories if directory.lower() not in IGNORED_DIRECTORIES and not (Path(current) / directory).is_symlink()]
             for filename in files:
+                if self._skip_file(Path(current) / filename):
+                    continue
                 language = LANGUAGE_BY_EXTENSION.get(Path(filename).suffix.lower())
                 if language:
                     counts[language] = counts.get(language, 0) + 1

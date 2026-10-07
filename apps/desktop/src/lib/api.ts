@@ -1,175 +1,21 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
+export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
 
-export type ApiHealth = {
-  status: "ok";
-  service: string;
-  timestamp: string;
-};
+import { desktopBridge } from "./desktop";
 
-export type WorkspaceSummary = {
-  repositories: number;
-  active_tasks: number;
-  pending_approvals: number;
-  sandbox_status: "ready" | "degraded";
-};
+/**
+ * The Electron shell owns the API process and picks an ephemeral port, so its
+ * injected base URL always wins over the build-time default.
+ */
+function resolveApiBaseUrl(): string {
+  const injected = desktopBridge?.status.apiBaseUrl;
+  if (injected) return injected;
+  const configured = import.meta.env.VITE_API_BASE_URL as string | undefined;
+  if (configured) return configured;
+  return "http://127.0.0.1:8000";
+}
 
-export type Repository = {
-  id: string;
-  name: string;
-  path: string;
-  branch: string;
-  head: string | null;
-  last_commit: string | null;
-  changed_files: number;
-  languages: Record<string, number>;
-  package_manager: string | null;
-  registered_at: string;
-};
-
-export type RepositoryValidation = {
-  valid: boolean;
-  path: string;
-  git_root: string | null;
-  reason: string | null;
-};
-
-export type TreeEntry = {
-  path: string;
-  name: string;
-  kind: "file" | "directory";
-  size: number | null;
-  language: string | null;
-};
-
-export type SearchMatch = {
-  path: string;
-  line: number;
-  column: number;
-  text: string;
-};
-
-export type TaskPlanStep = {
-  id: string;
-  title: string;
-  description: string;
-  files: string[];
-  risk: "low" | "medium" | "high";
-  verification: string[];
-};
-
-export type AgentTask = {
-  id: string;
-  run_id: string;
-  goal: string;
-  repository_id: string | null;
-  status: "queued" | "planning" | "coding" | "testing" | "repairing" | "running" | "review" | "awaiting_approval" | "ready_for_pr" | "pr_created" | "completed" | "done" | "failed" | "cancelled" | "paused";
-  plan: {
-    objective: string;
-    repository_summary: string;
-    steps: TaskPlanStep[];
-  } | null;
-  error: string | null;
-  created_at: string;
-  updated_at: string;
-  current_iteration: number;
-  retry_count: number;
-  next_action: string | null;
-};
-
-export type TestFailure = {
-  path: string | null;
-  line: number | null;
-  test_name: string | null;
-  message: string;
-};
-
-export type TaskIteration = {
-  id: string;
-  task_id: string;
-  run_id: string;
-  number: number;
-  goal: string;
-  status: "coding" | "testing" | "passed" | "failed" | "cancelled";
-  changed_files: string[];
-  patch_id: string | null;
-  checkpoint_id: string | null;
-  test_result: TestRunResult | null;
-  failure_summary: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
-export type TestRunResult = {
-  run_id: string;
-  kind: "auto" | "pytest" | "frontend";
-  command: string[];
-  status: "passed" | "failed" | "timed_out" | "not_found" | "blocked";
-  exit_code: number | null;
-  duration_ms: number;
-  stdout: string;
-  stderr: string;
-  output_truncated: boolean;
-  failed_tests: TestFailure[];
-};
-
-export type PatchFileInput = {
-  path: string;
-  content?: string;
-  operation?: "create" | "update" | "delete";
-  expected_hash?: string;
-};
-
-export type PatchPreview = {
-  patch_id: string;
-  repository_id: string;
-  files: string[];
-  diff: string;
-  additions: number;
-  deletions: number;
-  bytes_changed: number;
-  requires_delete_confirmation: boolean;
-};
-
-export type GitSnapshot = {
-  branch: string;
-  head: string;
-  changed_files: string[];
-  clean: boolean;
-};
-
-export type CommitPreview = GitSnapshot & {
-  diff: string;
-  commit_message: string;
-  scope_hash: string;
-  ready: boolean;
-};
-
-export type Approval = {
-  id: string;
-  task_id: string;
-  run_id: string;
-  type: "plan" | "write" | "push" | "pr";
-  status: "pending" | "approved" | "rejected" | "request_changes" | "cancelled" | "expired";
-  summary: string;
-  scope_hash: string;
-  reason: string | null;
-  requested_at: string;
-  expires_at: string;
-  decided_at: string | null;
-  decided_by: string | null;
-};
-
-export type AuditEvent = {
-  id: string;
-  action: string;
-  status: "started" | "succeeded" | "failed";
-  run_id: string | null;
-  task_id: string | null;
-  trace_id: string | null;
-  summary: string;
-  details: Record<string, unknown>;
-  created_at: string;
-};
+const API_BASE_URL = resolveApiBaseUrl();
 
 export class ApiRequestError extends Error {
   constructor(public code: string, message: string, public traceId?: string) {
@@ -217,7 +63,7 @@ export function registerRepository(path: string, name?: string): Promise<Reposit
 }
 
 export function getRepositoryTree(repositoryId: string, signal?: AbortSignal): Promise<{ items: TreeEntry[]; truncated: boolean }> {
-  return request<{ items: TreeEntry[]; truncated: boolean }>(`/api/v1/repositories/${repositoryId}/tree`, { signal });
+  return request<{ items: TreeEntry[]; truncated: boolean }>(`/api/v1/repositories/${repositoryId}/tree?max_depth=6`, { signal });
 }
 
 export function createTask(goal: string, repositoryId?: string): Promise<AgentTask> {
@@ -257,10 +103,14 @@ export function cancelTask(taskId: string): Promise<{ task: AgentTask; action: "
   return request<{ task: AgentTask; action: "cancelled" }>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" });
 }
 
-export function createTaskBranch(taskId: string, name: string, allowDirty = false): Promise<GitSnapshot> {
+export function recoverTask(taskId: string): Promise<{ task: AgentTask; action: "recovered" }> {
+  return request<{ task: AgentTask; action: "recovered" }>(`/api/v1/tasks/${taskId}/recover`, { method: "POST" });
+}
+
+export function createTaskBranch(taskId: string, name: string): Promise<GitSnapshot> {
   return request<GitSnapshot>(`/api/v1/tasks/${taskId}/branch`, {
     method: "POST",
-    body: JSON.stringify({ name, allow_dirty: allowDirty }),
+    body: JSON.stringify({ name }),
   });
 }
 
@@ -275,10 +125,10 @@ export function previewCommit(taskId: string, message: string): Promise<CommitPr
   });
 }
 
-export function createCommit(taskId: string, message: string): Promise<GitSnapshot> {
+export function createCommit(taskId: string, message: string, scopeHash: string): Promise<GitSnapshot> {
   return request<GitSnapshot>(`/api/v1/tasks/${taskId}/commits`, {
     method: "POST",
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, scope_hash: scopeHash }),
   });
 }
 
@@ -312,10 +162,10 @@ export function listRunEvents(runId: string, signal?: AbortSignal): Promise<{ it
   return request<{ items: AuditEvent[]; total: number }>(`/api/v1/runs/${runId}/events`, { signal });
 }
 
-export function runTests(runId: string, kind: "auto" | "pytest" | "frontend" = "auto"): Promise<TestRunResult> {
+export function runTests(runId: string, kind: TestKind = "auto", target?: string): Promise<TestRunResult> {
   return request<TestRunResult>(`/api/v1/runs/${runId}/tests`, {
     method: "POST",
-    body: JSON.stringify({ kind }),
+    body: JSON.stringify({ kind, target: target || undefined }),
   });
 }
 
@@ -331,4 +181,64 @@ export function applyPatch(runId: string, patchId: string, confirm = false): Pro
     method: "POST",
     body: JSON.stringify({ patch_id: patchId, confirm }),
   });
+}
+
+export function getRepositoryContext(repositoryId: string, signal?: AbortSignal): Promise<RepositoryContext> {
+  return request<RepositoryContext>(`/api/v1/repositories/${repositoryId}/context`, { signal });
+}
+
+export function readSourceFile(repositoryId: string, path: string, signal?: AbortSignal): Promise<SourceFile> {
+  return request<SourceFile>(`/api/v1/repositories/${repositoryId}/files?path=${encodeURIComponent(path)}`, { signal });
+}
+
+export function searchRepository(repositoryId: string, query: string, glob?: string, signal?: AbortSignal): Promise<{ matches: SearchMatch[]; truncated: boolean }> {
+  return request(`/api/v1/repositories/${repositoryId}/search`, { method: "POST", body: JSON.stringify({ query, glob: glob || undefined, max_results: 50 }), signal });
+}
+
+export function listCheckpoints(runId: string, signal?: AbortSignal): Promise<{ items: RunCheckpoint[]; total: number }> {
+  return request(`/api/v1/runs/${runId}/checkpoints`, { signal });
+}
+
+export function listTestHistory(runId: string, signal?: AbortSignal): Promise<{ items: TestHistoryItem[]; total: number }> {
+  return request(`/api/v1/runs/${runId}/tests`, { signal });
+}
+
+export function rollbackRun(runId: string, checkpointId: string): Promise<{ restored_files: string[]; restored_checkpoint_ids: string[] }> {
+  return request(`/api/v1/runs/${runId}/rollback`, { method: "POST", body: JSON.stringify({ checkpoint_id: checkpointId }) });
+}
+
+export function getPublishState(taskId: string, signal?: AbortSignal): Promise<PublishState> {
+  return request<PublishState>(`/api/v1/tasks/${taskId}/publish-state`, { signal });
+}
+
+export function getRemoteTarget(taskId: string, signal?: AbortSignal): Promise<RemoteTarget> {
+  return request<RemoteTarget>(`/api/v1/tasks/${taskId}/remote-target`, { signal });
+}
+
+export function pushTaskBranch(taskId: string, remote: string, idempotencyKey: string): Promise<RemoteBranch> {
+  return request<RemoteBranch>(`/api/v1/tasks/${taskId}/push`, {
+    method: "POST",
+    headers: { "idempotency-key": idempotencyKey },
+    body: JSON.stringify({ remote }),
+  });
+}
+
+export function previewPullRequest(taskId: string, targetBranch: string, signal?: AbortSignal): Promise<PullRequestPreview> {
+  return request<PullRequestPreview>(`/api/v1/tasks/${taskId}/pull-request/preview?target_branch=${encodeURIComponent(targetBranch)}`, { signal });
+}
+
+export function createPullRequest(
+  taskId: string,
+  payload: { title: string; body: string; target_branch: string; draft: boolean },
+  idempotencyKey: string
+): Promise<PullRequest> {
+  return request<PullRequest>(`/api/v1/tasks/${taskId}/pull-request`, {
+    method: "POST",
+    headers: { "idempotency-key": idempotencyKey },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function refreshPullRequest(taskId: string): Promise<PullRequest> {
+  return request<PullRequest>(`/api/v1/tasks/${taskId}/pull-request/refresh`, { method: "POST" });
 }

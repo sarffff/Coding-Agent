@@ -1,9 +1,24 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en-US">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#111313" />
+    <script>
+      (() => {
+        const language = localStorage.getItem('forge.language');
+        document.documentElement.lang = language === 'zh-CN' || language === 'en-US'
+          ? language
+          : (navigator.language || '').toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US';
+        const theme = localStorage.getItem('forge.theme');
+        const validTheme = theme === 'light' || theme === 'dark' || theme === 'system' ? theme : 'system';
+        const resolvedTheme = validTheme === 'system'
+          ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+          : validTheme;
+        document.documentElement.dataset.theme = resolvedTheme;
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolvedTheme === 'dark' ? '#111313' : '#eef1ed');
+      })();
+    </script>
     <title>Forge / Coding Agent</title>
   </head>
   <body>

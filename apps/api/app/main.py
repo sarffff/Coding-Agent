@@ -4,12 +4,12 @@ import time
 import hashlib
 from uuid import uuid4
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
-from .config import get_settings
 from .models import (
     ApiError,
     AuditEventListResponse,
@@ -30,6 +30,8 @@ from .models import (
     SearchRequest,
     SearchResponse,
     TreeResponse,
+    RepositoryContext,
+    FileContentResponse,
     TaskCreateRequest,
     IterationCreateRequest,
     RepairCreateRequest,
@@ -46,27 +48,37 @@ from .models import (
     ApprovalDecisionRequest,
     ApprovalListResponse,
     ApprovalSummary,
+    CommitListResponse,
+    CommitRecord,
+    PullRequestCreateRequest,
+    PullRequestListResponse,
+    PullRequestPreviewResponse,
+    PullRequestRecord,
+    RemoteBranchListResponse,
+    RemoteBranchRecord,
+    RemoteTargetResponse,
+    TaskPublishStateResponse,
+    TaskPushRequest,
     TaskListResponse,
     TaskSummary,
     WorkspaceSummary,
 )
-from .repository_service import RepositoryError, RepositoryService
-from .task_service import TaskService
-from .patch_service import PatchService
-from .test_service import TestService
-from .audit_service import AuditService
-from .git_service import GitService
-from .approval_service import ApprovalService
+from .repository_service import RepositoryError
+from .idempotency import run_idempotent
+from .services import build_services
 
 
-settings = get_settings()
-repository_service = RepositoryService(settings)
-task_service = TaskService(repository_service)
-patch_service = PatchService(repository_service, settings)
-test_service = TestService(repository_service, settings)
-audit_service = AuditService()
-git_service = GitService(repository_service, settings)
-approval_service = ApprovalService()
+services = build_services()
+settings = services.settings
+repository_service = services.repository_service
+task_service = services.task_service
+patch_service = services.patch_service
+test_service = services.test_service
+audit_service = services.audit_service
+git_service = services.git_service
+approval_service = services.approval_service
+remote_service = services.remote_service
+idempotency_service = services.idempotency_service
 
 app = FastAPI(
     title="Coding Agent API",
@@ -117,10 +129,38 @@ def plan_scope_hash(task: TaskSummary) -> str:
     return hashlib.sha256((task.id + "\n" + task.goal + "\n" + (task.plan.objective if task.plan else "")).encode("utf-8")).hexdigest()
 
 
+ERROR_STATUS_BY_CODE = {
+    "GIT_UNAVAILABLE": 503,
+    "GIT_BUSY": 503,
+    "REMOTE_TIMEOUT": 504,
+    "REMOTE_NETWORK_ERROR": 502,
+    "PUSH_REJECTED": 502,
+    "PR_CREATION_FAILED": 502,
+    "REMOTE_ERROR": 502,
+    "PUSHED_COMMIT_UNRESOLVED": 502,
+    "AUTHENTICATION_FAILED": 401,
+    "RATE_LIMITED_OR_FORBIDDEN": 429,
+    "REPOSITORY_NOT_FOUND": 404,
+    "TASK_NOT_FOUND": 404,
+    "RUN_NOT_FOUND": 404,
+    "PATCH_NOT_FOUND": 404,
+    "CHECKPOINT_NOT_FOUND": 404,
+    "PATH_NOT_FOUND": 404,
+    "TREE_PATH_NOT_FOUND": 404,
+    "REMOTE_NOT_FOUND": 404,
+    "PULL_REQUEST_NOT_FOUND": 404,
+    "IDEMPOTENCY_IN_PROGRESS": 409,
+    "IDEMPOTENCY_KEY_REUSED": 409,
+    "BRANCH_NOT_PUSHED": 409,
+    "REMOTE_HEAD_MOVED": 409,
+    "NO_APPROVED_COMMIT": 409,
+    "TASK_BRANCH_NOT_CHECKED_OUT": 409,
+}
+
+
 @app.exception_handler(RepositoryError)
 async def repository_error_handler(request: Request, exc: RepositoryError) -> JSONResponse:
-    status_code = 404 if exc.code in {"REPOSITORY_NOT_FOUND", "TASK_NOT_FOUND", "RUN_NOT_FOUND", "PATCH_NOT_FOUND", "CHECKPOINT_NOT_FOUND", "PATH_NOT_FOUND", "TREE_PATH_NOT_FOUND"} else 400
-    return error_response(request, status_code, exc.code, exc.message, exc.details)
+    return error_response(request, ERROR_STATUS_BY_CODE.get(exc.code, 400), exc.code, exc.message, exc.details)
 
 
 @app.exception_handler(RequestValidationError)
@@ -184,6 +224,18 @@ async def repository_tree(
     return TreeResponse(repository_id=repository_id, base_path=base_path, items=items, truncated=truncated)
 
 
+@app.get("/api/v1/repositories/{repository_id}/files", response_model=FileContentResponse)
+async def read_repository_file(repository_id: str, path: str = Query(min_length=1, max_length=4096)) -> FileContentResponse:
+    result = repository_service.read_file(repository_id, path)
+    audit_service.record("repository.read", "succeeded", "Read source file", details={"repository_id": repository_id, "path": result.path})
+    return result
+
+
+@app.get("/api/v1/repositories/{repository_id}/context", response_model=RepositoryContext)
+async def repository_context(repository_id: str) -> RepositoryContext:
+    return repository_service.context(repository_id)
+
+
 @app.post("/api/v1/repositories/{repository_id}/search", response_model=SearchResponse)
 async def search_repository(repository_id: str, payload: SearchRequest) -> SearchResponse:
     matches, truncated = repository_service.search(repository_id, payload)
@@ -193,6 +245,9 @@ async def search_repository(repository_id: str, payload: SearchRequest) -> Searc
 @app.post("/api/v1/tasks", response_model=TaskSummary, status_code=201)
 async def create_task(payload: TaskCreateRequest) -> TaskSummary:
     task = task_service.create(payload.goal, payload.repository_id)
+    if payload.repository_id:
+        snapshot = git_service.snapshot(payload.repository_id)
+        task_service.update_git_snapshot(task.id, snapshot.branch, snapshot.head, snapshot.changed_files)
     audit_service.record("task.create", "succeeded", "Created task", task_id=task.id, run_id=task.run_id, details={"repository_id": task.repository_id})
     return task
 
@@ -210,8 +265,9 @@ async def get_task(task_id: str) -> TaskSummary:
 
 @app.post("/api/v1/tasks/{task_id}/iterations", response_model=TaskIteration, status_code=201)
 async def start_iteration(task_id: str, payload: IterationCreateRequest):
+    task_service.assert_recovered(task_id)
     task = task_service.get(task_id)
-    if task.status == "awaiting_approval" and not approval_service.has_approved(task_id, "plan"):
+    if task.status == "awaiting_approval" and not approval_service.has_approved(task_id, "plan", plan_scope_hash(task)):
         raise RepositoryError("APPROVAL_REQUIRED", "Plan approval is required before the first coding iteration.", {"type": "plan"})
     iteration = task_service.start_iteration(task_id, payload.goal)
     task = task_service.get(task_id)
@@ -233,6 +289,7 @@ async def list_task_checkpoints(task_id: str) -> TaskCheckpointListResponse:
 
 @app.post("/api/v1/tasks/{task_id}/repairs", response_model=TaskIteration, status_code=201)
 async def start_repair(task_id: str, payload: RepairCreateRequest):
+    task_service.assert_recovered(task_id)
     iteration = task_service.start_repair(task_id, payload.feedback)
     task = task_service.get(task_id)
     audit_service.record("iteration.repair", "succeeded", f"Started repair iteration {iteration.number}", task_id=task_id, run_id=task.run_id, details={"iteration_id": iteration.id, "number": iteration.number})
@@ -242,12 +299,15 @@ async def start_repair(task_id: str, payload: RepairCreateRequest):
 @app.post("/api/v1/tasks/{task_id}/pause", response_model=TaskActionResponse)
 async def pause_task(task_id: str) -> TaskActionResponse:
     task = task_service.pause(task_id)
+    test_service.cancel(task.run_id)
     audit_service.record("task.pause", "succeeded", "Paused task", task_id=task_id, run_id=task.run_id)
     return TaskActionResponse(task=task, action="paused")
 
 
 @app.post("/api/v1/tasks/{task_id}/resume", response_model=TaskActionResponse)
 async def resume_task(task_id: str) -> TaskActionResponse:
+    if test_service.is_running(task_service.get(task_id).run_id):
+        raise RepositoryError("TEST_STOPPING", "Wait for the validation process to stop before resuming.")
     task = task_service.resume(task_id)
     audit_service.record("task.resume", "succeeded", "Resumed task", task_id=task_id, run_id=task.run_id)
     return TaskActionResponse(task=task, action="resumed")
@@ -256,8 +316,16 @@ async def resume_task(task_id: str) -> TaskActionResponse:
 @app.post("/api/v1/tasks/{task_id}/cancel", response_model=TaskActionResponse)
 async def cancel_task(task_id: str) -> TaskActionResponse:
     task = task_service.cancel(task_id)
+    test_service.cancel(task.run_id)
     audit_service.record("task.cancel", "succeeded", "Cancelled task", task_id=task_id, run_id=task.run_id)
     return TaskActionResponse(task=task, action="cancelled")
+
+
+@app.post("/api/v1/tasks/{task_id}/recover", response_model=TaskActionResponse)
+async def recover_task(task_id: str) -> TaskActionResponse:
+    task = task_service.recover(task_id)
+    audit_service.record("task.recover", "succeeded", "Confirmed task recovery after restart", task_id=task.id, run_id=task.run_id)
+    return TaskActionResponse(task=task, action="recovered")
 
 
 @app.get("/api/v1/tasks/{task_id}/approvals", response_model=ApprovalListResponse)
@@ -284,8 +352,10 @@ async def decide_approval(approval_id: str, payload: ApprovalDecisionRequest) ->
     return approval
 
 
-def repository_id_for_task(task_id: str) -> str:
+def repository_id_for_task(task_id: str, require_recovered: bool = True) -> str:
     task = task_service.get(task_id)
+    if require_recovered:
+        task_service.assert_recovered(task_id)
     if not task.repository_id:
         raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Task must be connected to a repository before Git operations.")
     return task.repository_id
@@ -294,8 +364,12 @@ def repository_id_for_task(task_id: str) -> str:
 @app.post("/api/v1/tasks/{task_id}/branch", response_model=GitSnapshotResponse)
 async def create_task_branch(task_id: str, payload: BranchCreateRequest) -> GitSnapshotResponse:
     repository_id = repository_id_for_task(task_id)
-    snapshot = git_service.create_task_branch(repository_id, payload.name, payload.allow_dirty)
+    task = task_service.get(task_id)
+    if task.current_iteration or task.task_branch:
+        raise RepositoryError("TASK_BRANCH_ALREADY_STARTED", "Create one task branch before starting the first iteration.")
+    snapshot = git_service.create_task_branch(repository_id, payload.name)
     task = task_service.update_git_snapshot(task_id, snapshot.branch, snapshot.head, snapshot.changed_files)
+    task.task_branch = snapshot.branch
     audit_service.record("git.branch.create", "succeeded", f"Created task branch {snapshot.branch}", task_id=task_id, run_id=task.run_id, details={"branch": snapshot.branch, "head": snapshot.head})
     return GitSnapshotResponse(branch=snapshot.branch, head=snapshot.head, changed_files=snapshot.changed_files, clean=snapshot.clean)
 
@@ -311,32 +385,124 @@ async def task_git_snapshot(task_id: str) -> GitSnapshotResponse:
 @app.post("/api/v1/tasks/{task_id}/commits/preview", response_model=CommitPreviewResponse)
 async def preview_task_commit(task_id: str, payload: CommitPreviewRequest) -> CommitPreviewResponse:
     repository_id = repository_id_for_task(task_id)
-    snapshot = git_service.snapshot(repository_id)
-    diff = git_service.diff(repository_id)
-    task = task_service.update_git_snapshot(task_id, snapshot.branch, snapshot.head, snapshot.changed_files)
-    audit_service.record("git.commit.preview", "succeeded", "Prepared commit preview", task_id=task_id, run_id=task.run_id, details={"branch": snapshot.branch, "changed_files": snapshot.changed_files})
-    return CommitPreviewResponse(branch=snapshot.branch, head=snapshot.head, diff=diff, changed_files=snapshot.changed_files, commit_message=payload.message.strip(), scope_hash=hashlib.sha256(diff.encode("utf-8")).hexdigest(), ready=bool(diff and not snapshot.clean))
+    task = task_service.get(task_id)
+    prepared = git_service.preview(repository_id, task_service.changed_files(task_id), f"{task.id}: {payload.message.strip()}")
+    audit_service.record("git.commit.preview", "succeeded", "Prepared task-scoped commit preview", task_id=task_id, run_id=task.run_id, details={"branch": prepared.branch, "changed_files": prepared.changed_files, "scope_hash": prepared.scope_hash})
+    return CommitPreviewResponse(branch=prepared.branch, head=prepared.head, diff=prepared.diff, changed_files=prepared.changed_files, excluded_files=prepared.excluded_files, commit_message=payload.message.strip(), scope_hash=prepared.scope_hash, ready=prepared.ready)
 
 
 @app.post("/api/v1/tasks/{task_id}/commits", response_model=GitSnapshotResponse)
 async def create_task_commit(task_id: str, payload: CommitCreateRequest) -> GitSnapshotResponse:
     repository_id = repository_id_for_task(task_id)
     task = task_service.get(task_id)
-    if task.status not in {"ready_for_pr", "awaiting_approval"}:
-        raise RepositoryError("COMMIT_NOT_READY", "A task commit requires completed tests and reviewable changes.", {"status": task.status})
-    diff = git_service.diff(repository_id)
-    scope_hash = hashlib.sha256(diff.encode("utf-8")).hexdigest()
-    if not approval_service.has_approved(task_id, "write", scope_hash):
-        raise RepositoryError("APPROVAL_REQUIRED", "A write approval is required before creating a task commit.", {"type": "write"})
-    head = git_service.commit(repository_id, f"{task.id}: {payload.message.strip()}")
-    snapshot = git_service.snapshot(repository_id)
-    task_service.update_git_snapshot(task_id, snapshot.branch, head, snapshot.changed_files)
-    audit_service.record("git.commit.create", "succeeded", "Created task commit", task_id=task_id, run_id=task.run_id, details={"branch": snapshot.branch, "head": head})
-    return GitSnapshotResponse(branch=snapshot.branch, head=head, changed_files=snapshot.changed_files, clean=snapshot.clean)
+    with git_service.lock(repository_id):
+        iterations = task_service.list_iterations(task_id)
+        if task.status != "ready_for_pr" or not iterations or not iterations[-1].test_result or iterations[-1].test_result.status != "passed":
+            raise RepositoryError("COMMIT_NOT_READY", "A task commit requires passing tests for the latest iteration.", {"status": task.status})
+        files = task_service.changed_files(task_id)
+        message = f"{task.id}: {payload.message.strip()}"
+        prepared = git_service.preview(repository_id, files, message)
+        if prepared.scope_hash != payload.scope_hash:
+            raise RepositoryError("COMMIT_PREVIEW_STALE", "Changes or commit message no longer match the preview. Preview and approve again.")
+        verified_tests = [result for result in iterations[-1].test_runs if result.kind != "static" and result.status == "passed" and result.validation_hash == prepared.validation_hash]
+        if not verified_tests:
+            raise RepositoryError("TEST_RESULTS_STALE", "Run project or selected tests for the current task files before committing.")
+        if prepared.validation_hash != iterations[-1].test_result.validation_hash:
+            raise RepositoryError("TEST_RESULTS_STALE", "Task files or HEAD changed since validation. Run tests again.")
+        if not approval_service.has_approved(task_id, "write", payload.scope_hash):
+            raise RepositoryError("APPROVAL_REQUIRED", "A current write approval is required for this exact commit.", {"type": "write"})
+        head = git_service.commit(repository_id, files, message, payload.scope_hash, task.task_branch or "")
+        snapshot = git_service.snapshot(repository_id)
+        task_service.update_git_snapshot(task_id, snapshot.branch, head, snapshot.changed_files)
+        remote_service.record_commit(task_id, task.run_id, snapshot.branch, head, message, payload.scope_hash)
+        audit_service.record("git.commit.create", "succeeded", "Created approved task commit", task_id=task_id, run_id=task.run_id, details={"branch": snapshot.branch, "head": head, "files": prepared.changed_files, "scope_hash": payload.scope_hash})
+        return GitSnapshotResponse(branch=snapshot.branch, head=head, changed_files=snapshot.changed_files, clean=snapshot.clean)
 
 
-def repository_id_for_run(run_id: str) -> str:
+@app.get("/api/v1/tasks/{task_id}/remote-target", response_model=RemoteTargetResponse)
+async def task_remote_target(task_id: str, remote: str = Query(default="origin", max_length=40)) -> RemoteTargetResponse:
+    repository_id_for_task(task_id)
+    return await remote_service.remote_target(task_id, remote)
+
+
+@app.get("/api/v1/tasks/{task_id}/publish-state", response_model=TaskPublishStateResponse)
+async def task_publish_state(task_id: str) -> TaskPublishStateResponse:
+    task_service.get(task_id)
+    return remote_service.publish_state(task_id)
+
+
+@app.get("/api/v1/tasks/{task_id}/commits", response_model=CommitListResponse)
+async def list_task_commits(task_id: str) -> CommitListResponse:
+    task_service.get(task_id)
+    items = remote_service.list_commits(task_id)
+    return CommitListResponse(items=items, total=len(items))
+
+
+@app.get("/api/v1/tasks/{task_id}/remote-branches", response_model=RemoteBranchListResponse)
+async def list_task_remote_branches(task_id: str) -> RemoteBranchListResponse:
+    task_service.get(task_id)
+    items = remote_service.list_remote_branches(task_id)
+    return RemoteBranchListResponse(items=items, total=len(items))
+
+
+@app.post("/api/v1/tasks/{task_id}/push", response_model=RemoteBranchRecord, status_code=201)
+async def push_task_branch(
+    task_id: str,
+    payload: TaskPushRequest,
+    idempotency_key: str | None = Header(default=None),
+) -> RemoteBranchRecord | JSONResponse:
+    repository_id_for_task(task_id)
+
+    async def action() -> RemoteBranchRecord:
+        return await remote_service.push_branch(task_id, payload.remote)
+
+    return await run_idempotent(idempotency_service, idempotency_key, f"tasks/{task_id}/push", payload, action)
+
+
+@app.get("/api/v1/tasks/{task_id}/pull-request/preview", response_model=PullRequestPreviewResponse)
+async def preview_task_pull_request(
+    task_id: str, target_branch: str = Query(default="main", max_length=100)
+) -> PullRequestPreviewResponse:
+    task_service.get(task_id)
+    return remote_service.preview_pull_request(task_id, target_branch)
+
+
+@app.post("/api/v1/tasks/{task_id}/pull-request", response_model=PullRequestRecord, status_code=201)
+async def create_task_pull_request(
+    task_id: str,
+    payload: PullRequestCreateRequest,
+    idempotency_key: str | None = Header(default=None),
+) -> PullRequestRecord | JSONResponse:
+    repository_id_for_task(task_id)
+
+    async def action() -> PullRequestRecord:
+        return await remote_service.create_pull_request(task_id, payload)
+
+    return await run_idempotent(idempotency_service, idempotency_key, f"tasks/{task_id}/pull-request", payload, action)
+
+
+@app.get("/api/v1/tasks/{task_id}/pull-request", response_model=PullRequestRecord)
+async def get_task_pull_request(task_id: str) -> PullRequestRecord:
+    record = remote_service.get_pull_request(task_id)
+    if record is None:
+        raise RepositoryError("PULL_REQUEST_NOT_FOUND", "No Pull Request has been created for this task.", {"task_id": task_id})
+    return record
+
+
+@app.post("/api/v1/tasks/{task_id}/pull-request/refresh", response_model=PullRequestRecord)
+async def refresh_task_pull_request(task_id: str) -> PullRequestRecord:
+    task_service.assert_recovered(task_id)
+    record = await remote_service.refresh_pull_request(task_id)
+    if record is None:
+        raise RepositoryError("PULL_REQUEST_NOT_FOUND", "No Pull Request has been created for this task.", {"task_id": task_id})
+    audit_service.record("pr.refresh", "succeeded", f"Reconciled Pull Request #{record.number} as {record.state}", task_id=task_id, run_id=record.run_id, details={"pr_number": record.number, "state": record.state})
+    return record
+
+
+def repository_id_for_run(run_id: str, require_recovered: bool = True) -> str:
     task = task_service.get_by_run(run_id)
+    if require_recovered:
+        task_service.assert_recovered(task.id)
     if not task.repository_id:
         raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Task must be connected to a repository before editing files.")
     return task.repository_id
@@ -345,7 +511,7 @@ def repository_id_for_run(run_id: str) -> str:
 @app.post("/api/v1/runs/{run_id}/patches/preview", response_model=PatchPreviewResponse)
 async def preview_patch(run_id: str, payload: PatchPreviewRequest) -> PatchPreviewResponse:
     repository_id = repository_id_for_run(run_id)
-    preview = patch_service.preview(repository_id, payload.files, payload.confirm_delete)
+    preview = patch_service.preview(repository_id, payload.files, payload.confirm_delete, run_id=run_id)
     audit_service.record("patch.preview", "succeeded", f"Prepared patch for {len(preview.files)} file(s)", run_id=run_id, details={"patch_id": preview.patch_id, "files": preview.files})
     return preview
 
@@ -354,7 +520,9 @@ async def preview_patch(run_id: str, payload: PatchPreviewRequest) -> PatchPrevi
 async def apply_patch(run_id: str, payload: PatchApplyRequest) -> PatchApplyResponse:
     repository_id = repository_id_for_run(run_id)
     task_service.assert_patch_allowed(run_id)
-    if patch_service.patch_repository_id(payload.patch_id) != repository_id:
+    if not payload.confirm:
+        raise RepositoryError("PATCH_CONFIRMATION_REQUIRED", "Confirm the reviewed patch before applying it.")
+    if patch_service.patch_repository_id(payload.patch_id) != repository_id or patch_service.patch_run_id(payload.patch_id) != run_id:
         raise RepositoryError("PATCH_NOT_FOUND", "Patch preview was not found for this run.")
     result = patch_service.apply(payload.patch_id, payload.confirm)
     task = task_service.get_by_run(run_id)
@@ -365,22 +533,58 @@ async def apply_patch(run_id: str, payload: PatchApplyRequest) -> PatchApplyResp
 
 @app.post("/api/v1/runs/{run_id}/rollback", response_model=RollbackResponse)
 async def rollback_run(run_id: str, payload: RollbackRequest) -> RollbackResponse:
-    repository_id = repository_id_for_run(run_id)
-    if patch_service.checkpoint_repository_id(payload.checkpoint_id) != repository_id:
+    repository_id = repository_id_for_run(run_id, require_recovered=False)
+    if test_service.is_running(run_id):
+        raise RepositoryError("TEST_ALREADY_RUNNING", "Stop validation before restoring files.")
+    if task_service.get_by_run(run_id).status in {"cancelled", "completed", "done", "pr_created"}:
+        raise RepositoryError("INVALID_TASK_STATE", "A closed task cannot restore files.")
+    if patch_service.checkpoint_repository_id(payload.checkpoint_id) != repository_id or patch_service.checkpoint_run_id(payload.checkpoint_id) != run_id:
         raise RepositoryError("CHECKPOINT_NOT_FOUND", "Checkpoint was not found for this run.")
     result = patch_service.rollback(payload.checkpoint_id)
+    task_service.record_rollback(run_id, result.restored_checkpoint_ids)
     audit_service.record("checkpoint.rollback", "succeeded", f"Restored {len(result.restored_files)} file(s)", run_id=run_id, details={"checkpoint_id": payload.checkpoint_id})
     return result
+
+
+@app.get("/api/v1/runs/{run_id}/checkpoints")
+async def list_run_checkpoints(run_id: str):
+    task = task_service.get_by_run(run_id)
+    ids = [iteration.checkpoint_id for iteration in task_service.list_iterations(task.id) if iteration.checkpoint_id]
+    items = patch_service.list_checkpoints(ids)
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/api/v1/runs/{run_id}/tests")
+async def list_run_tests(run_id: str):
+    task = task_service.get_by_run(run_id)
+    items = [{"iteration_id": iteration.id, "iteration_number": iteration.number, "result": result} for iteration in task_service.list_iterations(task.id) for result in iteration.test_runs]
+    return {"items": items, "total": len(items)}
 
 
 @app.post("/api/v1/runs/{run_id}/tests", response_model=TestRunResponse)
 async def run_tests(run_id: str, payload: TestRunRequest) -> TestRunResponse:
     repository_id = repository_id_for_run(run_id)
-    task_service.begin_test_run(run_id)
-    result = test_service.run(run_id, repository_id, payload.kind, payload.timeout_seconds)
     task = task_service.get_by_run(run_id)
+    files = task_service.changed_files(task.id)
+    before = git_service.preview(repository_id, files, "").validation_hash
+    test_service.reserve(run_id)
+    try:
+        task_service.begin_test_run(run_id)
+    except Exception:
+        test_service.release(run_id)
+        raise
+    result = await run_in_threadpool(test_service.run, run_id, repository_id, payload.kind, payload.timeout_seconds, payload.target)
+    try:
+        after = git_service.preview(repository_id, files, "").validation_hash
+    except RepositoryError:
+        after = None
+    if before == after:
+        result.validation_hash = before
+    elif result.status == "passed":
+        result.status = "failed"
+        result.stderr += "\nTask files changed during testing. Run validation again."
     task_service.record_test_result(run_id, result)
-    audit_service.record("tests.run", "succeeded" if result.status == "passed" else "failed", f"Test run {result.status}", task_id=task.id, run_id=run_id, details={"kind": result.kind, "command": result.command, "exit_code": result.exit_code, "failed_tests": [failure.model_dump() for failure in result.failed_tests]})
+    audit_service.record("tests.run", "succeeded" if result.status == "passed" else "failed", f"Test run {result.status}", task_id=task.id, run_id=run_id, details={"test_id": result.id, "kind": result.kind, "command": result.command, "exit_code": result.exit_code, "failed_tests": [failure.model_dump() for failure in result.failed_tests]})
     return result
 
 

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from pydantic import BaseModel
 
 from .config import Settings
 from .models import (
@@ -17,7 +20,16 @@ from .models import (
     PatchPreviewResponse,
     RollbackResponse,
 )
-from .repository_service import IGNORED_DIRECTORIES, RepositoryError, RepositoryRecord, RepositoryService
+from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
+from .store import StateStore
+
+
+class PersistedCheckpoint(BaseModel):
+    """Checkpoint metadata; file contents live next to it under the state directory."""
+
+    summary: CheckpointSummary
+    applied_hashes: dict[str, str] = {}
+    missing: list[str] = []
 
 
 @dataclass(slots=True)
@@ -31,6 +43,7 @@ class PendingPatch:
     bytes_changed: int
     requires_delete_confirmation: bool
     original_hashes: dict[str, str]
+    run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -38,14 +51,62 @@ class Checkpoint:
     summary: CheckpointSummary
     backup_dir: Path
     snapshots: dict[str, bytes | None]
+    applied_hashes: dict[str, str] = field(default_factory=dict)
 
 
 class PatchService:
-    def __init__(self, repositories: RepositoryService, settings: Settings):
+    def __init__(self, repositories: RepositoryService, settings: Settings, store: StateStore | None = None):
         self.repositories = repositories
         self.settings = settings
+        self.store = store
+        self.checkpoint_dir = (settings.state_dir / "checkpoints").resolve()
         self._patches: dict[str, PendingPatch] = {}
         self._checkpoints: dict[str, Checkpoint] = {}
+        self._keys: dict[str, str] = {}
+        if store:
+            for key, persisted in store.models("checkpoints", PersistedCheckpoint):
+                backup_dir = self.checkpoint_dir / persisted.summary.id
+                if not backup_dir.is_dir():
+                    continue
+                snapshots: dict[str, bytes | None] = {}
+                for name in persisted.summary.files:
+                    if name in persisted.missing:
+                        snapshots[name] = None
+                    else:
+                        snapshot = self._backup_path(backup_dir, name)
+                        snapshots[name] = snapshot.read_bytes() if snapshot.is_file() else b""
+                checkpoint = Checkpoint(
+                    summary=persisted.summary,
+                    backup_dir=backup_dir,
+                    snapshots=snapshots,
+                    applied_hashes=persisted.applied_hashes,
+                )
+                self._checkpoints[persisted.summary.id] = checkpoint
+                self._keys[persisted.summary.id] = key
+
+    def _persist(self, checkpoint: Checkpoint) -> None:
+        if not self.store:
+            return
+        key = self._keys.setdefault(checkpoint.summary.id, self.store.next_key("checkpoints"))
+        self.store.put(
+            "checkpoints",
+            key,
+            PersistedCheckpoint(
+                summary=checkpoint.summary,
+                applied_hashes=checkpoint.applied_hashes,
+                missing=[name for name, content in checkpoint.snapshots.items() if content is None],
+            ),
+            checkpoint.summary.created_at.isoformat(),
+        )
+
+    def _backup_path(self, backup_dir: Path, relative_path: str) -> Path:
+        target = (backup_dir / relative_path).resolve()
+        if not target.is_relative_to(backup_dir):
+            raise RepositoryError("INVALID_CHECKPOINT_PATH", "A checkpoint file escapes its backup directory.")
+        return target
+
+    def list_checkpoints(self, checkpoint_ids: list[str]) -> list[CheckpointSummary]:
+        return [self._checkpoints[item].summary for item in checkpoint_ids if item in self._checkpoints]
 
     def patch_repository_id(self, patch_id: str) -> str:
         patch = self._patches.get(patch_id)
@@ -53,13 +114,21 @@ class PatchService:
             raise RepositoryError("PATCH_NOT_FOUND", "Patch preview was not found or has expired.")
         return patch.repository_id
 
+    def patch_run_id(self, patch_id: str) -> str | None:
+        self.patch_repository_id(patch_id)
+        return self._patches[patch_id].run_id
+
+    def checkpoint_run_id(self, checkpoint_id: str) -> str | None:
+        self.checkpoint_repository_id(checkpoint_id)
+        return self._checkpoints[checkpoint_id].summary.run_id
+
     def checkpoint_repository_id(self, checkpoint_id: str) -> str:
         checkpoint = self._checkpoints.get(checkpoint_id)
         if checkpoint is None:
             raise RepositoryError("CHECKPOINT_NOT_FOUND", "Checkpoint was not found.")
         return checkpoint.summary.repository_id
 
-    def preview(self, repository_id: str, files: list[PatchFile], confirm_delete: bool = False) -> PatchPreviewResponse:
+    def preview(self, repository_id: str, files: list[PatchFile], confirm_delete: bool = False, run_id: str | None = None) -> PatchPreviewResponse:
         repository = self.repositories.get(repository_id)
         prepared: list[PatchFile] = []
         diff_parts: list[str] = []
@@ -69,6 +138,8 @@ class PatchService:
         requires_delete_confirmation = False
         original_hashes: dict[str, str] = {}
 
+        if len({item.path for item in files}) != len(files):
+            raise RepositoryError("DUPLICATE_PATCH_PATH", "A patch may modify each file only once.")
         for patch_file in files:
             target = self._safe_target(repository, patch_file.path)
             current = self._read_text(target) if target.exists() else None
@@ -112,6 +183,7 @@ class PatchService:
             bytes_changed=bytes_changed,
             requires_delete_confirmation=requires_delete_confirmation,
             original_hashes=original_hashes,
+            run_id=run_id,
         )
         self._patches[patch_id] = pending
         return PatchPreviewResponse(
@@ -137,6 +209,9 @@ class PatchService:
             if self._content_hash(current) != original_hash:
                 raise RepositoryError("PATCH_CONFLICT", f"File changed after preview: {relative_path}")
         checkpoint = self._create_checkpoint(repository, patch.files)
+        checkpoint.summary.run_id = patch.run_id
+        checkpoint.applied_hashes = {item.path: self._content_hash(None if item.operation == "delete" else item.content) for item in patch.files}
+        self._persist(checkpoint)
         try:
             for patch_file in patch.files:
                 target = self._safe_target(repository, patch_file.path)
@@ -158,19 +233,51 @@ class PatchService:
         checkpoint = self._checkpoints.get(checkpoint_id)
         if checkpoint is None:
             raise RepositoryError("CHECKPOINT_NOT_FOUND", "Checkpoint was not found.")
-        self._restore_checkpoint(checkpoint)
-        return RollbackResponse(checkpoint=checkpoint.summary, restored_files=checkpoint.summary.files)
+        if checkpoint.summary.restored:
+            raise RepositoryError("CHECKPOINT_ALREADY_RESTORED", "This checkpoint has already been restored.")
+        ordered = list(self._checkpoints.values())
+        start = next(index for index, item in enumerate(ordered) if item is checkpoint)
+        chain = [item for item in reversed(ordered[start:]) if not item.summary.restored and (item is checkpoint or (checkpoint.summary.run_id and item.summary.run_id == checkpoint.summary.run_id))]
+        repository = self.repositories.get(checkpoint.summary.repository_id)
+        simulated: dict[str, bytes | None] = {}
+        original: dict[str, bytes | None] = {}
+        for item in chain:
+            for name, saved in item.snapshots.items():
+                target = self._safe_target(repository, name)
+                if name not in simulated:
+                    simulated[name] = target.read_bytes() if target.exists() else None
+                    original[name] = simulated[name]
+                current = simulated[name]
+                if self._content_hash(current.decode("utf-8") if current is not None else None) != item.applied_hashes[name]:
+                    raise RepositoryError("ROLLBACK_CONFLICT", "A file changed outside this task. Preserve the external edits before rolling back.", {"path": name})
+                simulated[name] = saved
+        try:
+            for item in chain:
+                self._restore_checkpoint(item)
+        except OSError as exc:
+            for name, content in original.items():
+                target = self._safe_target(repository, name)
+                if content is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    self._atomic_write(target, content)
+            raise RepositoryError("ROLLBACK_FAILED", "Rollback failed; original file contents were restored.") from exc
+        for item in chain:
+            item.summary.restored = True
+            self._persist(item)
+        return RollbackResponse(checkpoint=checkpoint.summary, restored_files=sorted(original), restored_checkpoint_ids=[item.summary.id for item in chain])
 
     def _create_checkpoint(self, repository: RepositoryRecord, files: list[PatchFile]) -> Checkpoint:
         checkpoint_id = f"checkpoint-{uuid4().hex[:12]}"
-        backup_dir = Path(tempfile.mkdtemp(prefix=f"forge-{checkpoint_id}-"))
+        backup_dir = self.checkpoint_dir / checkpoint_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
         snapshots: dict[str, bytes | None] = {}
         for patch_file in files:
             target = self._safe_target(repository, patch_file.path)
             content = target.read_bytes() if target.exists() else None
             snapshots[patch_file.path] = content
             if content is not None:
-                backup = backup_dir / patch_file.path
+                backup = self._backup_path(backup_dir, patch_file.path)
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 backup.write_bytes(content)
         summary = CheckpointSummary(
@@ -181,6 +288,7 @@ class PatchService:
         )
         checkpoint = Checkpoint(summary=summary, backup_dir=backup_dir, snapshots=snapshots)
         self._checkpoints[checkpoint_id] = checkpoint
+        self._persist(checkpoint)
         return checkpoint
 
     def _restore_checkpoint(self, checkpoint: Checkpoint) -> None:
@@ -194,18 +302,9 @@ class PatchService:
                 self._atomic_write(target, content)
 
     def _safe_target(self, repository: RepositoryRecord, relative_path: str) -> Path:
-        if not relative_path or Path(relative_path).is_absolute():
-            raise RepositoryError("INVALID_PATCH_PATH", "Patch paths must be relative to the repository.")
-        target = (repository.path / relative_path).resolve(strict=False)
-        try:
-            target.relative_to(repository.path)
-        except ValueError as exc:
-            raise RepositoryError("PATH_OUTSIDE_REPOSITORY", "Patch path is outside the registered repository.") from exc
-        if any(part in IGNORED_DIRECTORIES or part == ".git" for part in Path(relative_path).parts):
-            raise RepositoryError("PROTECTED_PATH", "Protected directories cannot be modified.")
-        if target.is_symlink():
-            raise RepositoryError("SYMLINK_NOT_ALLOWED", "Symlink targets cannot be modified.")
-        return target
+        if not relative_path:
+            raise RepositoryError("INVALID_PATCH_PATH", "Patch paths must identify a repository file.")
+        return self.repositories._safe_repo_path(repository, relative_path)
 
     def _validate_operation(self, patch_file: PatchFile, current: str | None, target: Path) -> None:
         if patch_file.operation == "create" and current is not None:
@@ -232,7 +331,7 @@ class PatchService:
 
     @staticmethod
     def _content_hash(content: str | None) -> str:
-        return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+        return hashlib.sha256(content.encode("utf-8") if content is not None else b"\xffmissing").hexdigest()
 
     @staticmethod
     def _atomic_write(path: Path, content: str | bytes) -> None:
