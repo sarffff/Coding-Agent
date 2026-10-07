@@ -30,10 +30,22 @@ function log(prefix, message, color = colors.reset) {
     console.log(`${color}[${timestamp}] [${prefix}]${colors.reset} ${message}`);
 }
 
+const fs = require("fs");
+
 const BACKEND_DIR = __dirname;
 
-// Windows 上优先使用 python，避免从 app 目录启动导致相对包导入失败。
-const PYTHON_CMD = os.platform() === "win32" ? "python" : "python3";
+function resolvePython() {
+    const venvPython = os.platform() === "win32"
+        ? path.join(__dirname, ".venv", "Scripts", "python.exe")
+        : path.join(__dirname, ".venv", "bin", "python");
+    if (fs.existsSync(venvPython)) {
+        return venvPython;
+    }
+    return os.platform() === "win32" ? "python" : "python3";
+}
+
+// 优先使用当前工作区 .venv 中的 Python
+const PYTHON_CMD = resolvePython();
 
 // 启动后端服务
 function startBackend() {

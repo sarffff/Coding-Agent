@@ -6,11 +6,15 @@
     "dev": "pnpm --filter @coding-agent/desktop dev",
     "build": "pnpm --filter @coding-agent/desktop build",
     "preview": "pnpm --filter @coding-agent/desktop preview",
-    "api:dev": "python -m uvicorn app.main:app --reload --reload-dir apps/api/app --app-dir apps/api",
-    "api:test": "python -m pytest apps/api/tests -q",
-    "api:init": "python scripts/init_state.py",
+    "api:dev": "node scripts/py.js -m uvicorn app.main:app --reload --reload-dir apps/api/app --app-dir apps/api",
+    "api:test": "node scripts/py.js -m pytest apps/api/tests -q",
+    "api:init": "node scripts/py.js scripts/init_state.py",
     "start": "node run.js",
+    "desktop:electron": "node scripts/electron.js",
+    "desktop:electron:dev": "node scripts/electron.js dev",
+    "desktop:electron:smoke": "node scripts/electron.js smoke",
     "check": "pnpm --filter @coding-agent/desktop typecheck",
-    "demo:init": "python scripts/create_demo.py"
+    "desktop:smoke": "node scripts/desktop_smoke.js",
+    "demo:init": "node scripts/py.js scripts/create_demo.py"
   }
 }
