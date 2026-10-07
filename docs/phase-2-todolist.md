@@ -40,23 +40,23 @@
 ## 进入条件
 
 - [x] Phase 1 的 API、Desktop 和共享类型已可启动
-- [ ] Phase 1 未完成项中与本阶段直接相关的项目已补齐：文件修改后状态刷新、测试日志关联、错误/加载状态、API 单元测试（前三项已完成，首页面板的错误/重试状态仍不完整）
+- [x] Phase 1 未完成项中与本阶段直接相关的项目已补齐：文件修改后状态刷新、测试日志关联、错误/加载状态、API 单元测试（首页面板已有 loading/error/timeout/retry，快捷键与冒烟检查已落地；`pnpm api:test` 为 42 passed / 1 skipped）
 - [x] 已选择首个远程 Provider（GitHub 或 GitLab），并明确 API 版本与最小权限 — 选定 GitHub REST，fine-grained PAT 单仓库授权，详见 `docs/phase-3-todolist.md` 进入条件
-- [ ] 已准备仅用于开发和测试的远程仓库、账号和凭据注入方式
-- [ ] 已确定 PR 创建前必须经过人工审批，默认不自动合并
-- [ ] 已定义测试仓库、固定任务目标和预期 PR 结果
+- [ ] 已准备仅用于开发和测试的远程仓库、账号和凭据注入方式（注入方式已落地：`FORGE_GITHUB_TOKEN` + `FORGE_ALLOWED_REMOTE_HOSTS`/`FORGE_ALLOWED_REPOSITORIES`；真实演示仓库仍待准备，离线演示与契约测试走 `FORGE_REMOTE_PROVIDER=fake`）
+- [x] 已确定 PR 创建前必须经过人工审批，默认不自动合并（`pr` 审批 + `draft=true` 默认，且没有合并端点）
+- [x] 已定义测试仓库、固定任务目标和预期 PR 结果（`apps/api/tests/test_remote_workflow.py`：干净夹具仓库 + “Make value() return 2” + 期望产出 `#1` draft PR，指向 `main`）
 
 ## Todo 清单
 
 ### 0. 领域模型与状态机
 
 - [x] 扩展任务模型：编码轮次、当前步骤、失败原因、重试次数和最终结果
-- [ ] 定义 `Run`、`Iteration`、`Commit`、`RemoteBranch`、`PullRequest`、`Approval` 数据模型（`Iteration`、`Approval` 与 `run_id` 已建模，提交/远程分支/PR 属于远程段）
+- [x] 定义 `Run`、`Iteration`、`Commit`、`RemoteBranch`、`PullRequest`、`Approval` 数据模型（`CommitRecord`、`RemoteBranchRecord`、`PullRequestRecord` 与其余模型同一 sqlite 存储）
 - [x] 定义任务状态：`queued`、`planning`、`coding`、`testing`、`repairing`、`awaiting_approval`、`ready_for_pr`、`pr_created`、`completed`、`failed`、`cancelled`
 - [x] 定义每个状态允许的下一状态和非法状态转换错误
 - [x] 为每一轮编码保存输入目标、检索上下文、变更文件、Patch、测试结果和审计事件
-- [ ] 为任务、运行、提交和 PR 建立稳定关联 ID（任务/运行/审批/检查点已互链，提交与 PR 未建模）
-- [ ] 增加幂等键，避免重复创建分支、提交和 PR
+- [x] 为任务、运行、提交和 PR 建立稳定关联 ID（`CommitRecord`/`RemoteBranchRecord`/`PullRequestRecord` 同时携带 `task_id` 与 `run_id`，可反向查询）
+- [x] 增加幂等键，避免重复创建分支、提交和 PR（`Idempotency-Key` 覆盖有外部副作用的推送与 PR 创建；分支与提交仍由 `scope_hash` + 预览确认流程防重）
 - [x] 设计任务恢复点：恢复前状态、恢复后动作和恢复所需上下文
 
 **验收标准**
@@ -108,14 +108,14 @@
 - [ ] 新增任务分支命名规则：任务 ID、短标题和基础分支来源（当前由用户输入名称，服务端只做格式与受保护分支校验）
 - [x] 在任务开始前读取并记录当前分支、HEAD 和工作区状态
 - [x] 创建任务分支前检查未提交变更，避免覆盖用户工作
-- [ ] 增加受控 Git 操作器：创建分支、切换分支、查看 diff、暂存、提交、推送（本地操作已完成，推送属于远程段）
+- [ ] 增加受控 Git 操作器：创建分支、切换分支、查看 diff、暂存、提交、推送（本地操作与受控推送已完成；切换分支与显式暂存仍由用户自行操作，API 只读状态并做范围校验）
 - [x] 所有 Git 命令使用参数数组执行，禁止拼接 shell 命令
 - [x] 生成结构化提交信息，包含任务 ID 和变更摘要
 - [x] 提交前重新执行必要测试并确认工作区 diff 未超出任务范围
-- [ ] 推送前要求人工确认，默认只允许推送任务分支
-- [ ] 禁止强制推送、删除远程分支和修改受保护分支（受保护分支已拦截，推送类操作尚未实现）
-- [ ] 处理远程分支已存在、认证失败、网络失败和推送被拒绝
-- [ ] 记录提交 SHA、分支名、远程地址摘要和推送结果，不记录凭据（SHA 与分支已记，远程字段待推送实现）
+- [x] 推送前要求人工确认，默认只允许推送任务分支（`push` 审批 + 只发布 `task_branch`，remote 名称受格式约束）
+- [x] 禁止强制推送、删除远程分支和修改受保护分支（命令固定为 `refs/heads/<b>:refs/heads/<b>`，无 `--force`；受保护分支名单由 `git_service.PROTECTED_BRANCHES` 单点提供）
+- [x] 处理远程分支已存在、认证失败、网络失败和推送被拒绝（非快进由 git 拒绝且不强推；`AUTHENTICATION_FAILED` 401、`RATE_LIMITED_OR_FORBIDDEN` 429、`REMOTE_NETWORK_ERROR`/`PUSH_REJECTED` 502、`REMOTE_TIMEOUT` 504，stderr 中的令牌替换为 `***`）
+- [x] 记录提交 SHA、分支名、远程地址摘要和推送结果，不记录凭据（`CommitRecord`、`RemoteBranchRecord` 持久化，审计详情只含 SHA/分支/URL）
 
 **验收标准**
 
@@ -125,17 +125,17 @@
 
 ### 4. Remote Provider 与 PR/MR 管理
 
-- [ ] 定义 `RemoteProvider` 接口：仓库识别、分支、提交、PR 创建、PR 查询
-- [ ] 实现首个 Provider（GitHub 或 GitLab）并隔离平台字段
-- [ ] 从远程 URL 解析 owner、项目名和平台类型，拒绝未知或不支持地址
-- [ ] 通过环境变量或安全凭据注入访问令牌，不将令牌写入日志、数据库或审计详情
-- [ ] 在创建 PR 前检查远程仓库、基础分支和任务分支仍然存在
-- [ ] 生成 PR 标题、正文、变更摘要、测试结果、风险等级和回滚说明
-- [ ] 支持创建 Draft PR；默认不直接创建可合并状态的 PR
-- [ ] 保存 PR 编号、URL、状态、源分支、目标分支和远程更新时间
-- [ ] 支持查询 PR 当前状态并处理已关闭、已合并、已删除分支等情况
-- [ ] 处理限流、认证失败、权限不足、网络超时和重复 PR
-- [ ] 为后续 Review 评论和 CI 状态预留 Provider 扩展接口，但本阶段不实现自动处理
+- [x] 定义 `RemoteProvider` 接口：仓库识别、分支、提交、PR 创建、PR 查询（`remote_provider.RemoteProvider`，五个抽象方法）
+- [x] 实现首个 Provider（GitHub 或 GitLab）并隔离平台字段（`GitHubRemoteProvider` 负责 api.github.com / GHES `/api/v3` 差异；平台字段不外泄到领域模型；另有 `FakeRemoteProvider` 供离线演示与契约测试）
+- [x] 从远程 URL 解析 owner、项目名和平台类型，拒绝未知或不支持地址（接受 SSH 与 HTTP(S) 形式，`DISALLOWED_REMOTE_HOST` / `DISALLOWED_REPOSITORY` / `INVALID_REMOTE_URL`）
+- [x] 通过环境变量或安全凭据注入访问令牌，不将令牌写入日志、数据库或审计详情（`FORGE_GITHUB_TOKEN` 只进 `Authorization` 头；推送 stderr 中的令牌替换为 `***`；`git push` 仍使用操作者自己的凭据助手，令牌不拼进 URL）
+- [x] 在创建 PR 前检查远程仓库、基础分支和任务分支仍然存在（`validate_repository` + 两次 `check_branch_exists`，缺失时 `REMOTE_SOURCE_BRANCH_MISSING` / `REMOTE_TARGET_BRANCH_MISSING`）
+- [x] 生成 PR 标题、正文、变更摘要、测试结果、风险等级和回滚说明（`GET /tasks/{id}/pull-request/preview`：任务目标、任务文件清单、验证结论与轮次、分支/提交 SHA 与回滚端点；风险等级按改动文件数分档）
+- [x] 支持创建 Draft PR；默认不直接创建可合并状态的 PR（`draft` 默认为 `true`）
+- [x] 保存 PR 编号、URL、状态、源分支、目标分支和远程更新时间（`PullRequestRecord` 写穿 sqlite，`updated_at` 由对账更新）
+- [x] 支持查询 PR 当前状态并处理已关闭、已合并、已删除分支等情况（`POST /tasks/{id}/pull-request/refresh` 回读远端，远端不存在时记为 `closed`）
+- [x] 处理限流、认证失败、权限不足、网络超时和重复 PR（429/401/403/504/502 映射；GitHub 422「已存在」回查复用既有 PR；`Idempotency-Key` 阻止重试产生第二个 PR）
+- [ ] 为后续 Review 评论和 CI 状态预留 Provider 扩展接口，但本阶段不实现自动处理（Provider 可新增方法而不影响领域模型，但评论与 CI 字段尚未建模）
 
 **验收标准**
 
@@ -150,10 +150,10 @@
 - [x] 提供 `approve`、`reject`、`request_changes`、`cancel` 四种决策
 - [ ] 拒绝审批时要求填写原因，并将任务转为可恢复状态（原因字段可选，未强制）
 - [ ] `request_changes` 后允许用户补充要求并创建下一轮编码
-- [ ] PR 创建前强制检查审批状态、最新 diff 和最新测试结果
+- [x] PR 创建前强制检查审批状态、最新 diff 和最新测试结果（`pr` 审批 + 该分支存在推送记录 + 远端源/目标分支仍在；diff 与测试新鲜度由提交门禁（`scope_hash`/`validation_hash`）与 `REMOTE_HEAD_MOVED` 检查传递保证）
 - [x] 审批过期或任务内容变化后自动失效旧审批
 - [x] 所有审批动作写入不可变审计事件
-- [x] 高风险动作默认只展示，不允许通过 Phase 2 自动执行（`push`/`pr` 类型无对应执行端点，因此不可能被自动执行）
+- [x] 高风险动作默认只展示，不允许通过 Phase 2 自动执行（`push`/`pr` 端点已存在，但没有审批就必定拒绝；不存在跳过审批的旁路参数）
 
 **验收标准**
 
@@ -163,15 +163,15 @@
 
 ### 6. API 与持久化
 
-- [ ] 新增任务轮次、提交、分支、审批和 PR 的查询接口（轮次、检查点、测试历史、Git 快照与审批历史已可查询；提交与 PR 尚无读取端点）
+- [x] 新增任务轮次、提交、分支、审批和 PR 的查询接口（轮次、检查点、测试历史、Git 快照、审批历史，以及 `GET /tasks/{id}/commits`、`/remote-branches`、`/pull-request`、`/publish-state`、`/remote-target`）
 - [x] 新增编码循环启动、继续、暂停、取消和恢复接口
 - [x] 新增测试重跑和失败定位接口
-- [ ] 新增分支创建、提交预览、提交、推送和 PR 创建接口（本地三项已完成，推送与 PR 属于远程段）
+- [x] 新增分支创建、提交预览、提交、推送和 PR 创建接口（`POST /tasks/{id}/branch`、`/commits/preview`、`/commits`、`/push`、`/pull-request`、`/pull-request/refresh`）
 - [x] 新增审批请求、审批决策和审批历史接口
-- [ ] 所有写接口支持幂等键和 trace ID（`x-trace-id` 已贯通请求与响应；幂等键未实现）
-- [x] 将任务、运行、事件、检查点和 PR 元数据从内存存储迁移到持久化存储（sqlite3 写穿；PR 元数据待远程段实现后并入同一存储）
-- [x] 设计数据库迁移和本地开发初始化命令（`pnpm api:init`；schema 版本不匹配时拒绝启动而非静默改写）
-- [ ] 为日志、测试输出和 Patch 设置保留期限及大小限制（输出与 diff 大小已截断；保留期限未实现）
+- [x] 所有写接口支持幂等键和 trace ID（`x-trace-id` 贯通请求与响应；有外部副作用的 `push` 与 `pull-request` 支持 `Idempotency-Key` 回放，本地写接口由 `scope_hash`/预览-确认流程承担一次性语义）
+- [x] 将任务、运行、事件、检查点和 PR 元数据从内存存储迁移到持久化存储（sqlite3 写穿，提交/远程分支/PR 与审批、审计同一存储同一状态目录）
+- [x] 设计数据库迁移和本地开发初始化命令（`pnpm api:init`；schema 1→2 增量迁移新增 `idempotency` 表，版本过新时拒绝启动而非静默改写）
+- [ ] 为日志、测试输出和 Patch 设置保留期限及大小限制（输出与 diff 大小已截断，幂等记录按 `FORGE_IDEMPOTENCY_TTL_HOURS` 清理；审计与测试输出保留期限未实现）
 - [x] 在服务重启后恢复未完成任务为“需恢复”或“需人工确认”，禁止静默续跑
 
 **验收标准**
@@ -182,17 +182,17 @@
 
 ### 7. Desktop Phase 2 工作台
 
-- [ ] 任务详情增加“计划、编码轮次、Diff、测试、提交、PR、审计”视图（除 PR 外均已在 runs 视图内呈现，未做标签页切换）
+- [x] 任务详情增加“计划、编码轮次、Diff、测试、提交、PR、审计”视图（PR 与推送状态在 runs 视图的「受控发布」面板内；仍是分区呈现，未做标签页切换）
 - [ ] 任务队列支持按状态、仓库、分支和更新时间筛选（当前仅状态）
 - [ ] 显示当前编码轮次、自动重试次数、剩余预算和下一步动作（剩余预算依赖预算熔断，尚未实现）
 - [ ] 增加失败测试定位面板，支持点击文件路径和行号（失败位置以文本展示，不可点击跳转）
 - [x] 增加“重新运行测试”和“生成修复轮次”入口
-- [ ] 增加分支、提交预览和推送确认界面
-- [ ] 增加 PR 草稿预览、创建确认和 PR 状态展示
+- [x] 增加分支、提交预览和推送确认界面（推送需 `push` 审批，面板直接请求并批准）
+- [x] 增加 PR 草稿预览、创建确认和 PR 状态展示（预览标题/正文/文件/就绪标记，需 `pr` 审批；创建后展示编号、状态与可打开的 PR 链接，并提供「对远端核对」）
 - [ ] 增加审批中心：待审批、已批准、已拒绝、需修改和已过期
 - [ ] 审批弹窗展示变更文件、风险、测试结果、检查点和回滚入口
 - [x] 增加暂停、取消、恢复任务入口及二次确认
-- [ ] 统一展示远程认证、网络、限流、测试和 Patch 错误
+- [x] 统一展示远程认证、网络、限流、测试和 Patch 错误（`ApiRequestError` 携带 `code`/`message`，各面板以 `inline-error` 区域展示；尚未按错误类别做差异化操作建议）
 - [ ] 为长任务增加加载、轮询、断线重连、超时和重试反馈（加载/轮询/局部重试已有，断线重连与请求超时未有）
 - [x] 保持 1280px、1024px 和移动窄屏布局可用
 - [ ] 增加键盘焦点、按钮名称、状态提示和颜色对比检查（焦点与命名已验证；次要文字已收敛到 token 并达 AA，剩余深色主题专用亮灰需一次带视觉确认的调色走查）
@@ -206,9 +206,9 @@
 ### 8. 审计、观测与安全治理
 
 - [ ] 为每个编码轮次记录开始、结束、工具调用、输入摘要、输出摘要、耗时和结果
-- [ ] 为 Git、远程 API、测试和审批记录统一审计事件格式（Git/测试/审批已统一，远程 API 尚无调用）
-- [ ] 审计事件支持按任务、运行、轮次、提交和 PR 查询
-- [ ] 记录远程 API 请求耗时、状态码和重试次数，但不记录请求令牌和完整响应敏感字段
+- [x] 为 Git、远程 API、测试和审批记录统一审计事件格式（`commit.record`、`branch.push`、`pr.create`、`pr.refresh` 与 Git/测试/审批事件同用 `action`/`status`/`summary`/`details`）
+- [ ] 审计事件支持按任务、运行、轮次、提交和 PR 查询（当前端点按 `run_id` 查询；提交与 PR 记录可按 `task_id` 查询）
+- [ ] 记录远程 API 请求耗时、状态码和重试次数，但不记录请求令牌和完整响应敏感字段（令牌已隔离，耗时/状态码/重试次数未记录）
 - [ ] 为任务设置工具调用次数、测试时长、Patch 大小和远程请求预算
 - [ ] 预算耗尽时停止自动动作并进入人工审批
 - [x] 增加敏感文件识别和 PR 前检查，阻止密钥、令牌和证书进入提交
