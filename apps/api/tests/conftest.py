@@ -17,6 +17,7 @@ def build_settings(demo_repository: Path, tmp_path: Path, **overrides):
     from app.config import Settings
 
     return Settings(
+        _env_file=None,
         workspace_root=demo_repository.parent,
         state_dir=tmp_path / "state",
         command_timeout_seconds=15,
@@ -40,6 +41,7 @@ def mount_services(monkeypatch, settings) -> object:
         "git_service",
         "approval_service",
         "remote_service",
+        "agent_service",
         "idempotency_service",
     ):
         monkeypatch.setattr(main, name, getattr(services, name))

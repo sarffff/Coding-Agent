@@ -209,7 +209,7 @@ function registerIpc() {
   ipcMain.handle("forge:pick-directory", async (_event, options) => {
     const fallback = typeof options?.fallbackPath === "string" ? options.fallbackPath : statusPayload().workspaceRoot;
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: "选择 Git 仓库目录",
+      title: "打开文件夹",
       defaultPath: fs.existsSync(fallback) ? fallback : app.getPath("home"),
       properties: ["openDirectory", "createDirectory"],
     });

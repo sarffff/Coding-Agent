@@ -290,3 +290,166 @@ def test_github_provider_url_policy_and_allowlist():
     with pytest.raises(RepositoryError) as other_repository:
         scoped.validate_remote_url("https://github.com/forge-demo/production.git")
     assert other_repository.value.code == "DISALLOWED_REPOSITORY"
+
+
+def test_remote_calls_are_observed_without_token_or_body(remote_api, remote_repository):
+    client = remote_api.client
+    task = passing_task(client, remote_repository)
+    task_url = f"/api/v1/tasks/{task['id']}"
+    commit_passing_task(client, task)
+
+    client.get(task_url + "/remote-target")  # one validate call
+    approve(client, task, "push")
+    post(client, task_url + "/push", {"remote": "origin"})
+    approve(client, task, "pr")
+    post(client, task_url + "/pull-request", {"title": "[Forge] Fix value", "body": "Return 2.", "target_branch": "main"})
+    post(client, task_url + "/pull-request/refresh")
+
+    calls = client.get(task_url + "/remote-calls").json()
+    assert calls["total"] == 7  # target + push + PR repository/two branches/create + refresh
+    budget = client.get(task_url + "/budget").json()
+    assert budget["remote_calls"] == calls["total"]
+    by_op = {}
+    for item in calls["items"]:
+        by_op.setdefault(item["operation"], item)
+        assert item["duration_ms"] >= 0 and item["attempts"] >= 1
+        # Only the status line is observed: no token, headers or response body leak into the record.
+        assert set(item) == {"id", "task_id", "run_id", "operation", "status_code", "duration_ms", "attempts", "outcome", "error_code", "created_at"}
+    assert by_op["validate"]["status_code"] == 200 and by_op["validate"]["outcome"] == "ok"
+    assert by_op["push"]["status_code"] is None and by_op["push"]["outcome"] == "ok"  # git push is not an HTTP call
+    assert by_op["create_pr"]["status_code"] == 201 and by_op["create_pr"]["outcome"] == "ok"
+    assert by_op["refresh_pr"]["status_code"] == 200 and by_op["refresh_pr"]["outcome"] == "ok"
+
+    # The desktop panel reads observability off publish-state, and records survive a restart.
+    assert len(client.get(task_url + "/publish-state").json()["remote_calls"]) == calls["total"]
+    restarted = remote_api.mount()
+    assert restarted.get(task_url + "/remote-calls").json()["total"] == calls["total"]
+
+
+def test_remote_call_records_a_failed_provider_call(remote_api, monkeypatch):
+    client = remote_api.client
+    task = passing_task(client, remote_api.repository)
+    task_url = f"/api/v1/tasks/{task['id']}"
+    commit_passing_task(client, task)
+    approve(client, task, "push")
+    post(client, task_url + "/push", {"remote": "origin"})
+    approve(client, task, "pr")
+    post(client, task_url + "/pull-request", {"title": "[Forge] Fix value", "body": "Return 2.", "target_branch": "main"})
+
+    async def timeout(*args, **kwargs):
+        raise RepositoryError("REMOTE_TIMEOUT", "simulated remote timeout")
+
+    monkeypatch.setattr(remote_api.provider, "get_pull_request", timeout)
+    assert client.post(task_url + "/pull-request/refresh").status_code == 504
+
+    failed = [item for item in client.get(task_url + "/remote-calls").json()["items"] if item["operation"] == "refresh_pr"][-1]
+    assert failed["outcome"] == "error"
+    assert failed["error_code"] == "REMOTE_TIMEOUT"
+    assert failed["status_code"] is None
+
+    budget = client.get(task_url + "/budget").json()
+    assert budget["remote_calls"] == len(client.get(task_url + "/remote-calls").json()["items"])
+    assert budget["consecutive_failures"] == 1
+
+
+@pytest.mark.parametrize("succeeds", [True, False])
+def test_remote_budget_counts_attempts_and_blocks_the_provider_at_the_limit(remote_api, monkeypatch, succeeds):
+    client = remote_api.client
+    repository = post(client, "/api/v1/repositories", {"path": str(remote_api.repository)})
+    task = post(client, "/api/v1/tasks", {"goal": "Inspect remote", "repository_id": repository["id"]})
+    remote_api.services.task_service.get(task["id"]).budget.max_remote_calls = 1
+    original = remote_api.provider.validate_repository
+    attempts = []
+
+    async def validate(remote_url):
+        attempts.append(remote_url)
+        if not succeeds:
+            raise RepositoryError("REMOTE_TIMEOUT", "simulated remote timeout")
+        return await original(remote_url)
+
+    monkeypatch.setattr(remote_api.provider, "validate_repository", validate)
+    task_url = f"/api/v1/tasks/{task['id']}"
+    first = client.get(task_url + "/remote-target")
+    assert first.status_code == (200 if succeeds else 504)
+    blocked = client.get(task_url + "/remote-target")
+    assert blocked.status_code == 409
+    assert blocked.json()["code"] == "TASK_BUDGET_EXHAUSTED"
+    assert attempts == [REMOTE_URL]
+    budget = client.get(task_url + "/budget").json()
+    assert budget["remote_calls"] == 1
+    assert budget["consecutive_failures"] == (0 if succeeds else 1)
+    assert client.get(task_url + "/remote-calls").json()["total"] == 1
+
+
+def test_pr_preflight_calls_cannot_bypass_the_remaining_budget(remote_api):
+    client = remote_api.client
+    task = passing_task(client, remote_api.repository)
+    task_url = f"/api/v1/tasks/{task['id']}"
+    commit_passing_task(client, task)
+    approve(client, task, "push")
+    post(client, task_url + "/push", {"remote": "origin"})
+    approve(client, task, "pr")
+    remote_api.services.task_service.get(task["id"]).budget.max_remote_calls = 4
+
+    response = client.post(task_url + "/pull-request", json={
+        "title": "[Forge] Fix value", "body": "Return 2.", "target_branch": "main",
+    })
+    assert response.status_code == 409
+    assert response.json()["code"] == "TASK_BUDGET_EXHAUSTED"
+    assert remote_api.provider.pull_requests == {}
+    calls = client.get(task_url + "/remote-calls").json()["items"]
+    assert [call["operation"] for call in calls] == ["push", "validate", "validate", "validate"]
+    assert client.get(task_url + "/budget").json()["remote_calls"] == 4
+
+
+def test_remote_target_never_uses_the_parent_git_repository_of_a_local_folder(remote_api, monkeypatch):
+    from app import remote_service
+
+    folder = remote_api.repository / "local-folder"
+    folder.mkdir()
+    (folder / "notes.txt").write_text("Local scope only.\n", encoding="utf-8")
+    client = remote_api.client
+    repository = post(client, "/api/v1/repositories", {"path": str(folder)})
+    assert repository["has_git"] is False
+    task = post(client, "/api/v1/tasks", {"goal": "Edit local notes", "repository_id": repository["id"]})
+
+    def unexpected_git(*args, **kwargs):
+        raise AssertionError("A local folder must not read its parent's Git remote.")
+
+    monkeypatch.setattr(remote_service.subprocess, "run", unexpected_git)
+    task_url = f"/api/v1/tasks/{task['id']}"
+    response = client.get(task_url + "/remote-target")
+    assert response.status_code == 400
+    assert response.json()["code"] == "GIT_NOT_AVAILABLE"
+    assert client.get(task_url + "/budget").json()["remote_calls"] == 0
+    assert client.get(task_url + "/remote-calls").json()["total"] == 0
+    assert client.get(task_url + "/publish-state").json()["remote_url"] is None
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_refreshed_pr_terminal_state_updates_agent_without_assuming_closed_means_merged(remote_api, merged):
+    client = remote_api.client
+    task = passing_task(client, remote_api.repository)
+    task_url = f"/api/v1/tasks/{task['id']}"
+    commit_passing_task(client, task)
+    assert client.get(task_url + "/agent").json()["action"] == "review_push"
+    approve(client, task, "push")
+    post(client, task_url + "/push", {"remote": "origin"})
+    assert client.get(task_url + "/agent").json()["action"] == "review_pr"
+    approve(client, task, "pr")
+    created = post(client, task_url + "/pull-request", {
+        "title": "[Forge] Fix value", "body": "Return 2 so the local test passes.", "target_branch": "main",
+    })
+    assert client.get(task_url + "/agent").json()["action"] == "await_pr"
+    remote = asyncio.run(remote_api.provider.get_pull_request(REMOTE_URL, created["number"]))
+    remote.state = "closed"
+    remote.merged = merged
+    # A closed Draft PR retains draft=True; terminal state must take precedence.
+    assert remote.draft is True
+    for _ in range(2):
+        refreshed = post(client, task_url + "/pull-request/refresh")
+        assert refreshed["state"] == ("merged" if merged else "closed")
+        state = client.get(task_url + "/agent").json()
+        assert state["action"] == ("completed" if merged else "manual_review")
+        assert state["task"]["status"] == ("completed" if merged else "pr_created")
+        assert state["can_advance"] is False

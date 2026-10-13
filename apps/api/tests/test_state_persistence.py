@@ -35,6 +35,9 @@ def test_checkpoint_files_can_be_restored_after_restart(api_stack, demo_reposito
     restarted = api_stack.restart()
     checkpoints = restarted.get(f"/api/v1/runs/{task['run_id']}/checkpoints").json()["items"]
     assert [item["id"] for item in checkpoints] == [applied["checkpoint"]["id"]]
+    assert checkpoints[0]["diff"] == applied["checkpoint"]["diff"]
+    assert "-    return 1" in checkpoints[0]["diff"]
+    assert "+    return 2" in checkpoints[0]["diff"]
     result = post(restarted, f"/api/v1/runs/{task['run_id']}/rollback", {"checkpoint_id": applied["checkpoint"]["id"]})
     assert result["restored_files"] == ["app.py"]
     assert "return 1" in (demo_repository / "app.py").read_text(encoding="utf-8")

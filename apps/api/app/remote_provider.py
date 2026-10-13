@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import subprocess
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -16,6 +17,18 @@ from .repository_service import RepositoryError
 
 
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+
+# Per-call sink for remote-call observability. RemoteService sets a fresh list
+# around each operation; providers append the HTTP status of every request they
+# make. A ContextVar (not an instance attribute) keeps concurrent async
+# operations on the shared provider from interleaving into one buffer.
+_CAPTURE: ContextVar[list[int | None] | None] = ContextVar("_remote_call_capture", default=None)
+
+
+def capture_status(status_code: int | None) -> None:
+    sink = _CAPTURE.get()
+    if sink is not None:
+        sink.append(status_code)
 
 
 def protected_branch_error(branch: str) -> RepositoryError:
@@ -40,6 +53,7 @@ class PullRequestData:
     source_branch: str
     target_branch: str
     draft: bool
+    merged: bool = False
 
 
 class RemoteProvider(ABC):
@@ -47,6 +61,10 @@ class RemoteProvider(ABC):
 
     def __init__(self, settings: Settings):
         self.settings = settings
+
+    def _emit(self, status_code: int | None) -> None:
+        """Record one HTTP status into the active observability sink, if any."""
+        capture_status(status_code)
 
     def parse_remote_url(self, remote_url: str) -> tuple[str, str, str]:
         """Parse (host, owner, repo) from an HTTP(S) or SSH Git URL."""
@@ -153,7 +171,9 @@ class GitHubRemoteProvider(RemoteProvider):
             try:
                 resp = await client.get(url, headers=self._headers())
             except httpx.RequestError as exc:
+                self._emit(None)
                 raise RepositoryError("REMOTE_NETWORK_ERROR", f"Failed to reach GitHub: {exc}") from exc
+            self._emit(resp.status_code)
 
             if resp.status_code == 401:
                 raise RepositoryError("AUTHENTICATION_FAILED", "GitHub token is invalid or missing.")
@@ -174,7 +194,9 @@ class GitHubRemoteProvider(RemoteProvider):
             try:
                 resp = await client.get(url, headers=self._headers())
             except httpx.RequestError as exc:
+                self._emit(None)
                 raise RepositoryError("REMOTE_NETWORK_ERROR", f"Failed to reach {host}: {exc}") from exc
+            self._emit(resp.status_code)
             return resp.status_code == 200
 
     async def push_task_branch(self, repo_path: Path, remote_url: str, branch: str, remote: str = "origin") -> str:
@@ -244,7 +266,9 @@ class GitHubRemoteProvider(RemoteProvider):
             try:
                 resp = await client.post(url, headers=self._headers(), json=payload)
             except httpx.RequestError as exc:
+                self._emit(None)
                 raise RepositoryError("REMOTE_NETWORK_ERROR", f"Failed to reach GitHub: {exc}") from exc
+            self._emit(resp.status_code)
 
             if resp.status_code == 422:
                 # PR may already exist for this branch; query and reconcile
@@ -277,6 +301,7 @@ class GitHubRemoteProvider(RemoteProvider):
         url = f"{self._api_base(host)}/repos/{owner}/{repo}/pulls"
         params = {"head": f"{owner}:{branch}", "state": "all"}
         resp = await client.get(url, headers=self._headers(), params=params)
+        self._emit(resp.status_code)
         if resp.status_code == 200:
             items = resp.json()
             if items:
@@ -300,7 +325,9 @@ class GitHubRemoteProvider(RemoteProvider):
             try:
                 resp = await client.get(url, headers=self._headers())
             except httpx.RequestError as exc:
+                self._emit(None)
                 raise RepositoryError("REMOTE_NETWORK_ERROR", f"Failed to reach {host}: {exc}") from exc
+            self._emit(resp.status_code)
             if resp.status_code == 404:
                 return None
             if resp.status_code >= 400:
@@ -315,6 +342,7 @@ class GitHubRemoteProvider(RemoteProvider):
                 source_branch=data["head"]["ref"],
                 target_branch=data["base"]["ref"],
                 draft=data.get("draft", False),
+                merged=data.get("merged", False),
             )
 
 
@@ -354,10 +382,13 @@ class FakeRemoteProvider(RemoteProvider):
         if slug not in self.repositories:
             host, owner, repo = self.validate_remote_url(remote_url)
             self.register_repo(host, owner, repo)
+        self._emit(200)
         return self.repositories[slug]
 
     async def check_branch_exists(self, remote_url: str, branch: str) -> bool:
-        return branch in self.branches.get(self.repo_slug(remote_url), {})
+        exists = branch in self.branches.get(self.repo_slug(remote_url), {})
+        self._emit(200 if exists else 404)
+        return exists
 
     async def push_task_branch(self, repo_path: Path, remote_url: str, branch: str, remote: str = "origin") -> str:
         if branch in PROTECTED_BRANCHES:
@@ -394,6 +425,7 @@ class FakeRemoteProvider(RemoteProvider):
         # Check existing PR for same branch
         for existing in prs:
             if existing.source_branch == source_branch and existing.state != "closed":
+                self._emit(200)
                 return existing
 
         number = len(prs) + 1
@@ -408,6 +440,7 @@ class FakeRemoteProvider(RemoteProvider):
             draft=draft,
         )
         prs.append(pr)
+        self._emit(201)
         return pr
 
     async def get_pull_request(self, remote_url: str, number: int) -> PullRequestData | None:
@@ -415,5 +448,7 @@ class FakeRemoteProvider(RemoteProvider):
         slug = f"{host}/{owner}/{repo}".lower()
         for pr in self.pull_requests.get(slug, []):
             if pr.number == number:
+                self._emit(200)
                 return pr
+        self._emit(404)
         return None

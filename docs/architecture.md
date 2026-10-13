@@ -7,7 +7,7 @@ apps/desktop (React + Vite + TypeScript)
   src/lib/api.ts ── VITE_API_BASE_URL / window.forge.status.apiBaseUrl ──► apps/api (FastAPI)
   src/lib/desktop.ts ── window.forge 桥（目录选择、工作区根目录、后端状态订阅）
   src/lib/preferences.tsx ── 语言 / 主题
-  src/components/ ── RepositoryBrowser（浏览与编辑）、RunHistory（测试历史与回滚）
+  src/components/ ── RepositoryBrowser（浏览与编辑）、RunHistory（测试历史与回滚）、AgentPanel（下一步、单步推进与预算/熔断仪表盘）、ApprovalPanel（审批中心：过滤、拒绝理由、要求修改续推）
   src/App.tsx ── runs 视图内的「受控发布」面板：推送审批 → 推送 → Draft PR 预览/创建/对账
   electron/  ── 桌面壳：main(窗口/协议/IPC) + backend(uvicorn 生命周期) + config + preload
   packages/types ─► 共享领域类型   packages/ui ─► Dialog / AsyncMessage
@@ -19,22 +19,25 @@ apps/api/app/
   config.py               FORGE_* 运行限制、工作区根目录与状态目录
   repository_service.py   仓库注册、路径归属校验、文件树、搜索、读文件、符号、仓库摘要
   file_policy.py          敏感与忽略路径的单一判定来源（搜索 / 补丁 / 提交共用）
+  agent_service.py        本地下一步决策、审批请求、迭代/修复推进、共享测试编排、模型补丁起草
   task_service.py         任务状态机、编码轮次、检查点记录、暂停/恢复/取消
   patch_service.py        diff 预览、乐观哈希校验、检查点快照、应用与回滚
+  model_provider.py       ModelProvider 抽象 + Anthropic / OpenAI(兼容) REST（httpx 直连、共享错误映射，无新依赖）+ 内存 fake Provider；补丁起草 JSON 契约与解析
   test_service.py         命令探测、白名单执行、超时与取消、输出截断、失败定位
   git_service.py          任务分支、提交预览（临时索引）、plumbing 提交与发布
   remote_provider.py      RemoteProvider 抽象 + GitHub REST + 内存 fake Provider
-  remote_service.py       提交记录、任务分支推送、Draft PR 创建与远端状态对账
-  idempotency.py          Idempotency-Key 回放与 TTL 清理（远程写接口）
+  remote_service.py       提交记录、任务分支推送、Draft PR 创建与远端状态对账、远程调用观测（耗时/HTTP 状态码/尝试次数，不含令牌与响应体）
+  idempotency.py          Idempotency-Key 回放与 TTL 清理（Agent 推进、远程写接口）
   approval_service.py     审批请求、决策、过期与作用域失效
   audit_service.py        不可变审计事件（按 run 查询）
 ```
 
 ## Safety invariants
 
-- 所有文件访问必须解析到 `FORGE_WORKSPACE_ROOT` 内的仓库目录，拒绝绝对路径、`..` 逃逸与符号链接逃逸。
+- 打开的文件夹必须位于 `FORGE_WORKSPACE_ROOT` 内，登记时保留所选目录，不自动扩大到父 Git 根。目录内访问拒绝绝对路径、`..` 逃逸与符号链接逃逸。只有所选目录本身是已有初始提交的 Git 根时才启用 Git 功能，其余目录仍可本地修改、验证和回滚。
 - `file_policy.is_protected_path` 在搜索、补丁和提交三处一致拦截 `.env*`、私钥、凭据文件与依赖/构建目录。
 - 写操作必须先预览：补丁要求显式 `confirm`，删除要求 `confirm_delete`，应用前创建文件快照检查点。
+- 模型起草的补丁与手敲补丁走同一条 `patch_service.preview` 门禁（受保护路径、二进制、超限、乐观哈希一致拦截）。模型补丁的 `expected_hash` 由服务端绑定读取上下文时的内容，忽略模型提供的哈希；未读取完整内容的已有文件不能更新或删除，等待期间有外部修改则返回冲突。保守模式每轮停在人工预览/应用；标准与自治模式由循环应用并记录检查点。停止取消等待中的模型调用，并在应用前再次检查停止标记。模型 API key 只进请求头，不写库/审计/错误体。
 - 首次编码轮次需要 `plan` 审批；创建提交需要绑定同一 `scope_hash` 的 `write` 审批。
 - 审批与提交绑定的是确切内容：`scope_hash` 覆盖 repository/branch/HEAD/tree/message，`validation_hash` 覆盖任务文件集合与 HEAD；文件或消息一变，旧审批与旧测试结果立即失效。
 - 提交只包含任务文件：预览用临时索引计算 `write-tree`，发布用 `commit-tree` + `update-ref`，因此 hook 无法替换已审阅的树，用户的其它暂存内容也不被覆盖。
@@ -54,16 +57,28 @@ apps/api/app/
 
 ## Persistence
 
-`app/services.py:build_services()` 用同一个 `StateStore`（`app/store.py`，标准库 sqlite3，无额外依赖）装配全部服务：仓库、任务（含轮次与任务检查点）、审批、审计事件、文件检查点元数据，以及提交、远程分支与 PR 记录写入 `FORGE_STATE_DIR/state.db`（默认 `.forge/state`），检查点的文件内容写在 `state.db` 同级的 `checkpoints/<id>/` 下。schema 版本记录在 `meta` 表，旧库通过 `_migrate()` 增量升级（当前 1→2 增加 `idempotency` 表），比当前版本更新的库直接拒绝打开。
+`app/services.py:build_services()` 用同一个 `StateStore`（`app/store.py`，标准库 sqlite3，无额外依赖）装配全部服务：仓库、任务（含轮次与任务检查点）、审批、审计事件、文件检查点元数据，以及提交、远程分支、PR 与远程调用观测记录写入 `FORGE_STATE_DIR/state.db`（默认 `.forge/state`），检查点的文件内容写在 `state.db` 同级的 `checkpoints/<id>/` 下。schema 版本记录在 `meta` 表，旧库通过 `_migrate()` 增量升级（当前 1→2 增加 `idempotency` 表），比当前版本更新的库直接拒绝打开。
 
 重启等于再调用一次 `build_services()`：记录按插入顺序回灌，处于执行中状态的任务被标记 `requires_recovery`，此后除回滚、取消、查询与 `POST /api/v1/tasks/{id}/recover` 之外的写端点一律返回 `RECOVERY_CONFIRMATION_REQUIRED`，不会静默续跑。补丁预览（`patch_id`）是进程内对象，不持久化：重启后需要重新预览，这是有意为之——未经审阅的 diff 不应该跨进程存活。
 
-`Idempotency-Key` 只用于有外部副作用的写端点（`POST /tasks/{id}/push`、`POST /tasks/{id}/pull-request`）：首次响应体连同状态码入库，同键同请求体直接回放首次结果，同键不同请求体或同键并发在途分别返回 `IDEMPOTENCY_KEY_REUSED` 与 `IDEMPOTENCY_IN_PROGRESS`；记录按 `FORGE_IDEMPOTENCY_TTL_HOURS` 滚动清理。
+`Idempotency-Key` 用于 `POST /tasks/{id}/agent/advance`、`POST /tasks/{id}/push` 和 `POST /tasks/{id}/pull-request`：首次响应体连同状态码入库，同键同请求体直接回放首次结果，同键不同请求体或同键并发在途分别返回 `IDEMPOTENCY_KEY_REUSED` 与 `IDEMPOTENCY_IN_PROGRESS`；记录按 `FORGE_IDEMPOTENCY_TTL_HOURS` 滚动清理。
+
+## Local Agent
+
+Agent 不维护第二套任务状态：查询时读取 `TaskService`、审批、当前验证进程、任务预算和发布记录，返回可解释的下一动作。单步接口推进审批请求、编码/修复轮次或测试；后台循环按 conservative/standard/autonomous 模式决定人工边界。保守模式每轮补丁由现有运行面板人工预览和应用。普通文件夹跳过 Git 分支/提交/发布，在本地验证通过后停在审阅状态。每个检查点持久化当次补丁 diff，运行历史可查看差异并回滚；旧记录缺失 diff 时默认为空。本地结果审阅后的新目标创建同目录、同模式的新任务，保留旧任务与检查点。
+
+每个任务带一份 `TaskBudget`（最大轮次、总耗时、远程调用次数、连续失败阈值，阈值来自 `FORGE_TASK_MAX_*`）。任一维度触顶即在 `exhausted_reason` 上锁存，`assert_budget_available` 对后续预算相关写操作返回 `TASK_BUDGET_EXHAUSTED`，Agent 下一动作转为 `manual_review` 并停步，直到人工复核或取消；AgentPanel 把四个维度与熔断原因做成仪表盘。
+
+`AgentService.run_tests()` 是手动测试接口与 Agent 的共享编排路径，保留验证前后文件哈希、命令白名单、超时取消、失败定位和审计。Git 目录沿用 HEAD/tree 验证哈希；普通文件夹对受保护路径检查后的任务文件内容及删除状态计算哈希，无需 Git 索引。子进程在线程池执行，API 可以同时处理暂停/取消。静态检查不能替代项目测试，环境错误不会自动建立修复轮次。
+
+PR 刷新会识别明确的合并结果并完成任务；关闭但未确认合并的 PR 留待人工复核。
+
+后台循环是单进程内的 asyncio task，没有新增持久化队列。任务/审批/测试/审计继续写入既有存储，进程重启后仍须恢复确认。起草优先读取显式路径、最近失败文件与已改文件，再用有限搜索及入口/测试文件补齐上下文；文件保留完整内容并受数量/字节上限约束。模型起草、Cowork 对话和每次 GitHub Provider 调用共用调用预算；成功远程调用不重置失败计数，只有通过测试清零。
 
 ## Phase status
 
 - Phase 1：单仓库理解 → 计划 → 低风险修改 → 测试 → 审计 → 回滚，已完成。
-- Phase 2：多轮编码、验证循环、审批门禁、任务分支、提交、推送、GitHub Provider 与 Draft PR、幂等键与持久化已完成；审批中心的拒绝/要求修改流程、预算熔断与记录保留期限未完成。
+- Phase 2：本地编码、普通文件夹流程、审批中心、预算、持久化与恢复已有实现；Git 推送/PR 代码与离线测试已接通，真实模型与 GitHub 验收仍需完成。
 - Phase 3（CI 交互、自动修复、冲突处理、治理）：范围见 `docs/phase-3-todolist.md`。
 
 验收口径以 `docs/phase-1-todolist.md` 与 `docs/phase-2-todolist.md` 的勾选为准。

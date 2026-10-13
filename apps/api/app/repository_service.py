@@ -58,6 +58,7 @@ class RepositoryRecord(BaseModel):
     name: str
     path: Path
     registered_at: datetime
+    has_git: bool = True
 
 
 class RepositoryService:
@@ -88,7 +89,7 @@ class RepositoryService:
         except ValueError as exc:
             raise RepositoryError(
                 "PATH_OUTSIDE_WORKSPACE",
-                "Repository path must be inside the configured workspace root.",
+                "Folder path must be inside the configured workspace root.",
                 {"workspace_root": str(root)},
             ) from exc
         return path
@@ -118,39 +119,45 @@ class RepositoryService:
             raise RepositoryError("GIT_COMMAND_FAILED", detail or "Git command failed.", {"command": ["git", *args], "exit_code": result.returncode})
         return result.stdout.strip()
 
-    def _git_root(self, path: Path) -> Path:
+    def _maybe_git_root(self, path: Path) -> Path | None:
+        """Enable Git only for the selected root with an initial commit.
+
+        Subfolders and unborn repositories remain local folders: opening a folder must
+        never expand the editable area to a parent repository.
+        """
         if not path.exists():
-            raise RepositoryError("PATH_NOT_FOUND", "The repository path does not exist.")
+            raise RepositoryError("PATH_NOT_FOUND", "The folder path does not exist.")
         if not path.is_dir():
-            raise RepositoryError("PATH_NOT_DIRECTORY", "The repository path must be a directory.")
-        raw_root = self._run_git(path, "rev-parse", "--show-toplevel")
-        git_root = Path(raw_root).expanduser().resolve()
+            raise RepositoryError("PATH_NOT_DIRECTORY", "The path must be a directory.")
         try:
-            git_root.relative_to(self._workspace_root())
-        except ValueError as exc:
-            raise RepositoryError(
-                "GIT_ROOT_OUTSIDE_WORKSPACE",
-                "The resolved Git root is outside the configured workspace root.",
-            ) from exc
+            raw_root = self._run_git(path, "rev-parse", "--show-toplevel")
+            git_root = Path(raw_root).expanduser().resolve()
+            if git_root != path:
+                return None
+            self._run_git(path, "rev-parse", "--verify", "HEAD")
+        except RepositoryError:
+            return None
         return git_root
 
     def validate(self, raw_path: str) -> RepositoryValidateResponse:
         try:
             path = self._resolve_allowed_path(raw_path)
-            git_root = self._git_root(path)
-            return RepositoryValidateResponse(valid=True, path=str(path), git_root=str(git_root))
+            git_root = self._maybe_git_root(path)
+            return RepositoryValidateResponse(valid=True, path=str(path), git_root=str(git_root) if git_root else None)
         except RepositoryError as exc:
             return RepositoryValidateResponse(valid=False, path=str(Path(raw_path).expanduser()), reason=exc.message)
 
     def register(self, raw_path: str, name: str | None = None) -> RepositorySummary:
         path = self._resolve_allowed_path(raw_path)
-        git_root = self._git_root(path)
-        repository_id = hashlib.sha256(os.fspath(git_root).encode("utf-8")).hexdigest()[:12]
+        git_root = self._maybe_git_root(path)
+        root = path
+        repository_id = hashlib.sha256(os.fspath(root).encode("utf-8")).hexdigest()[:12]
         record = RepositoryRecord(
             id=repository_id,
-            name=name or git_root.name,
-            path=git_root,
+            name=name or root.name,
+            path=root,
             registered_at=datetime.now(timezone.utc),
+            has_git=git_root is not None,
         )
         self._repositories[repository_id] = record
         self._persist(record)
@@ -166,16 +173,19 @@ class RepositoryService:
         return record
 
     def summary(self, record: RepositoryRecord) -> RepositorySummary:
-        branch = self._run_git(record.path, "branch", "--show-current") or "(detached HEAD)"
-        head = self._run_git(record.path, "rev-parse", "--short", "HEAD") or None
-        last_commit = self._run_git(record.path, "log", "-1", "--pretty=%s") or None
-        status = self._run_git(record.path, "status", "--porcelain=v1")
-        changed_files = len([line for line in status.splitlines() if line.strip()])
+        branch, head, last_commit, changed_files = "", None, None, 0
+        if record.has_git:
+            branch = self._run_git(record.path, "branch", "--show-current") or "(detached HEAD)"
+            head = self._run_git(record.path, "rev-parse", "--short", "HEAD") or None
+            last_commit = self._run_git(record.path, "log", "-1", "--pretty=%s") or None
+            status = self._run_git(record.path, "status", "--porcelain=v1")
+            changed_files = len([line for line in status.splitlines() if line.strip()])
         return RepositorySummary(
             id=record.id,
             name=record.name,
             path=str(record.path),
             branch=branch,
+            has_git=record.has_git,
             head=head,
             last_commit=last_commit,
             changed_files=changed_files,

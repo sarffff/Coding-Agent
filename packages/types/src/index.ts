@@ -16,6 +16,7 @@ export type Repository = {
   name: string;
   path: string;
   branch: string;
+  has_git: boolean;
   head: string | null;
   last_commit: string | null;
   changed_files: number;
@@ -55,6 +56,22 @@ export type TaskPlanStep = {
   verification: string[];
 };
 
+export type TaskBudget = {
+  max_iterations: number;
+  max_wall_time_seconds: number;
+  max_remote_calls: number;
+  max_consecutive_failures: number;
+  iterations: number;
+  elapsed_seconds: number;
+  remote_calls: number;
+  consecutive_failures: number;
+  started_at: string | null;
+  exhausted_reason: "iterations" | "wall_time" | "remote_calls" | "consecutive_failures" | null;
+};
+
+export type AgentMode = "conservative" | "standard" | "autonomous";
+export type TaskTrack = "cowork" | "code";
+
 export type AgentTask = {
   id: string;
   run_id: string;
@@ -76,6 +93,44 @@ export type AgentTask = {
   task_branch: string | null;
   resume_state: AgentTask["status"] | null;
   requires_recovery: boolean;
+  budget: TaskBudget;
+  mode: AgentMode;
+  track: TaskTrack;
+};
+
+export type AgentAdvanceAction = "request_plan_approval" | "start_iteration" | "start_repair" | "run_tests";
+
+export type AgentAction = AgentAdvanceAction | "recover" | "await_plan_approval" | "connect_repository" | "create_branch" | "review_patch" | "wait_for_tests" | "review_commit" | "review_push" | "review_pr" | "await_pr" | "completed" | "paused" | "cancelled" | "manual_review";
+
+export type AgentState = {
+  task: AgentTask;
+  action: AgentAction;
+  can_advance: boolean;
+  requires_approval: boolean;
+  approval_type: Approval["type"] | null;
+  message: string;
+  iteration: TaskIteration | null;
+  pending_approval: Approval | null;
+  last_test: TestRunResult | null;
+  loop_running: boolean;
+};
+
+export type AgentLoopRequest = {
+  feedback?: string;
+  mode?: AgentMode;
+};
+
+export type AgentAdvanceRequest = {
+  action?: "auto" | AgentAdvanceAction;
+  goal?: string;
+  feedback?: string;
+  kind?: TestKind;
+  timeout_seconds?: number;
+  target?: string;
+};
+
+export type AgentAdvanceResponse = AgentState & {
+  performed_action: "noop" | AgentAdvanceAction;
 };
 
 export type TestFailure = {
@@ -118,6 +173,7 @@ export type TestRunResult = {
   stdout: string;
   stderr: string;
   output_truncated: boolean;
+  output_pruned: boolean;
   failed_tests: TestFailure[];
 };
 
@@ -138,6 +194,8 @@ export type PatchPreview = {
   bytes_changed: number;
   requires_delete_confirmation: boolean;
 };
+
+export type DraftPatch = PatchPreview & { rationale: string };
 
 export type GitSnapshot = {
   branch: string;
@@ -167,6 +225,7 @@ export type Approval = {
   expires_at: string;
   decided_at: string | null;
   decided_by: string | null;
+  continued_at: string | null;
 };
 
 export type AuditEvent = {
@@ -208,6 +267,7 @@ export type RunCheckpoint = {
   repository_id: string;
   run_id: string;
   files: string[];
+  diff: string;
   created_at: string;
   restored: boolean;
 };
@@ -233,6 +293,19 @@ export type RemoteBranch = {
   branch: string;
   remote_url: string;
   pushed_sha: string;
+  created_at: string;
+};
+
+export type RemoteCall = {
+  id: string;
+  task_id: string;
+  run_id: string;
+  operation: "validate" | "push" | "create_pr" | "refresh_pr";
+  status_code: number | null;
+  duration_ms: number;
+  attempts: number;
+  outcome: "ok" | "error";
+  error_code: string | null;
   created_at: string;
 };
 
@@ -286,6 +359,7 @@ export type PublishState = {
   commits: PublishCommit[];
   remote_branches: RemoteBranch[];
   pull_request: PullRequest | null;
+  remote_calls: RemoteCall[];
 };
 
 

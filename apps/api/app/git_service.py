@@ -59,6 +59,18 @@ class GitService:
     def lock(self, repository_id: str) -> RLock:
         return self._locks.setdefault(repository_id, RLock())
 
+    def validation_hash(self, repository_id: str, files: list[str]) -> str:
+        repository = self.repositories.get(repository_id)
+        if repository.has_git:
+            return self.preview(repository_id, files, "").validation_hash
+        # Local folders use the same bounded task-file scope without requiring an index or HEAD.
+        with self.lock(repository_id):
+            contents = {"repository_id": repository_id}
+            for name in self._safe_files(repository, files):
+                path = repository.path / name
+                contents["file:" + name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "missing"
+            return self._hash(contents)
+
     def snapshot(self, repository_id: str) -> GitSnapshot:
         repository = self.repositories.get(repository_id)
         branch = self._run(repository, ["branch", "--show-current"]).strip()
@@ -207,6 +219,8 @@ class GitService:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _run(self, repository: RepositoryRecord, args: list[str], *, env: dict[str, str] | None = None, input_text: str | None = None) -> str:
+        if not repository.has_git:
+            raise RepositoryError("GIT_NOT_AVAILABLE", "Git operations require opening a Git root with an initial commit. Local editing, tests and rollback remain available.")
         environment = child_env({"GIT_LITERAL_PATHSPECS": "1", **(env or {})})
         try:
             result = subprocess.run(
