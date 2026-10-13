@@ -3,10 +3,8 @@ import {
   Activity,
   AlertTriangle,
   ArrowUpRight,
-  Bot,
   Box,
   Check,
-  ChevronDown,
   CircleDot,
   Clock3,
   Code2,
@@ -18,6 +16,7 @@ import {
   GitPullRequest,
   LayoutDashboard,
   Languages,
+  ListChecks,
   LockKeyhole,
   Menu,
   Monitor,
@@ -39,6 +38,7 @@ import {
 import {
   applyPatch,
   createTask,
+  sendCoworkChat,
   getApiHealth,
   getTask,
   getTaskGitSnapshot,
@@ -48,6 +48,10 @@ import {
   listRepositories,
   listRunEvents,
   listTasks,
+  draftPatch,
+  startAgentLoop,
+  stopAgentLoop,
+  getAgentState,
   previewPatch,
   previewCommit,
   registerRepository,
@@ -69,6 +73,11 @@ import {
   cancelTask,
   recoverTask,
   type AgentTask,
+  type AgentMode,
+  type TaskTrack,
+  type TaskBudget,
+  type AgentAdvanceAction,
+  type AgentAction,
   type AuditEvent,
   type CommitPreview,
   type GitSnapshot,
@@ -91,8 +100,11 @@ import { desktopBridge, desktopStatus, isDesktopShell, type DesktopStatus } from
 import { Dialog, AsyncMessage } from "@coding-agent/ui";
 import { RepositoryBrowser } from "./components/RepositoryBrowser";
 import { RunHistory } from "./components/RunHistory";
+import { AgentPanel } from "./components/AgentPanel";
+import { ApprovalPanel } from "./components/ApprovalPanel";
+import { ChatPanel } from "./components/ChatPanel";
 
-type NavKey = "overview" | "tasks" | "repositories" | "runs" | "approvals";
+type NavKey = "chat" | "overview" | "tasks" | "repositories" | "runs" | "approvals";
 
 type Task = {
   id: string;
@@ -104,6 +116,7 @@ type Task = {
   retryCount: number;
   nextAction: string | null;
   requiresRecovery: boolean;
+  updatedAt: string;
   title: string;
   repo: string;
   branch: string;
@@ -111,6 +124,8 @@ type Task = {
   time: string;
   accent: string;
   plan?: AgentTask["plan"];
+  mode: AgentMode;
+  track: TaskTrack;
 };
 
 type StreamEvent = {
@@ -135,6 +150,7 @@ function taskFromApi(task: AgentTask): Task {
     retryCount: task.retry_count,
     nextAction: task.next_action,
     requiresRecovery: task.requires_recovery,
+    updatedAt: task.updated_at,
     title: task.goal,
     repo: task.plan?.repository_summary ?? "workspace",
     branch: task.branch ?? task.run_id,
@@ -142,15 +158,16 @@ function taskFromApi(task: AgentTask): Task {
     time: "now",
     accent: task.status === "failed" ? "rose" : "amber",
     plan: task.plan,
+    mode: task.mode,
+    track: task.track,
   };
 }
 
-const navItems: Array<{ key: NavKey; icon: typeof LayoutDashboard; count?: number }> = [
+const navItems: Array<{ key: NavKey; icon: typeof LayoutDashboard }> = [
   { key: "overview", icon: LayoutDashboard },
-  { key: "tasks", icon: Zap, count: 4 },
-  { key: "repositories", icon: GitBranch },
+  { key: "repositories", icon: FolderOpen },
   { key: "runs", icon: TerminalSquare },
-  { key: "approvals", icon: ShieldCheck, count: 2 },
+  { key: "approvals", icon: ShieldCheck },
 ];
 
 function eventToStreamEvent(event: AuditEvent, t: (key: string) => string, locale: Language): StreamEvent {
@@ -179,11 +196,22 @@ const iconForEvent = (icon: StreamEvent["icon"]) => {
 
 function App() {
   const { language, theme, setLanguage, setTheme, t } = usePreferences();
-  const [activeNav, setActiveNav] = useState<NavKey>("overview");
+  const [activeNav, setActiveNav] = useState<NavKey>("chat");
   const [tasks, setTasks] = useState(initialTasks);
   const [activeTaskId, setActiveTaskId] = useState("");
   const [prompt, setPrompt] = useState("");
   const [isRunning, setIsRunning] = useState(false);
+  const [loopRunning, setLoopRunning] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [chatMode, setChatMode] = useState<AgentMode>("standard");
+  const [chatPending, setChatPending] = useState<Approval | null>(null);
+  const [chatBudget, setChatBudget] = useState<TaskBudget | null>(null);
+  const [chatComposingNew, setChatComposingNew] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const chatSendingRef = useRef(false);
+  const [chatAction, setChatAction] = useState<AgentAction | null>(null);
+  const [railTab, setRailTab] = useState<"cowork" | "code">("cowork");
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [apiStatus, setApiStatus] = useState<"checking" | "connected" | "offline">("checking");
   const [repositories, setRepositories] = useState<Repository[]>([]);
@@ -200,10 +228,12 @@ function App() {
   const [patchPreviewResult, setPatchPreviewResult] = useState<PatchPreview | null>(null);
   const [patchRunning, setPatchRunning] = useState(false);
   const [patchApplied, setPatchApplied] = useState<string | null>(null);
+  const [patchRationale, setPatchRationale] = useState<string | null>(null);
   const [patchError, setPatchError] = useState<string | null>(null);
   const [iterations, setIterations] = useState<TaskIteration[]>([]);
   const [iterationRunning, setIterationRunning] = useState(false);
   const [iterationError, setIterationError] = useState<string | null>(null);
+  const [agentBusyAction, setAgentBusyAction] = useState<AgentAdvanceAction | null>(null);
   const [gitSnapshot, setGitSnapshot] = useState<GitSnapshot | null>(null);
   const [branchName, setBranchName] = useState("");
   const [commitMessage, setCommitMessage] = useState("");
@@ -219,6 +249,8 @@ function App() {
   const pushKeyRef = useRef("");
   const pullRequestKeyRef = useRef("");
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [approvalCount, setApprovalCount] = useState(0);
+  const [approvalRunning, setApprovalRunning] = useState(false);
   const [selectedRepositoryId, setSelectedRepositoryId] = useState("");
   const [sourceLocation, setSourceLocation] = useState<{ path: string; line: number } | null>(null);
   const [taskFilter, setTaskFilter] = useState("all");
@@ -230,18 +262,35 @@ function App() {
   const [repositoryPathInput, setRepositoryPathInput] = useState("");
   const [desktopRuntime, setDesktopRuntime] = useState<DesktopStatus | null>(desktopStatus);
   const [repositorySaving, setRepositorySaving] = useState(false);
+  const repositoryOpeningRef = useRef(false);
   const [confirmAction, setConfirmAction] = useState<"cancel" | "delete" | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [overviewError, setOverviewError] = useState<string | null>(null);
   const promptInputRef = useRef<HTMLInputElement>(null);
   const taskRef = useRef(activeTaskId);
   useEffect(() => { taskRef.current = activeTaskId; }, [activeTaskId]);
-  useEffect(() => { if (!repositories.some(repository => repository.id === selectedRepositoryId)) setSelectedRepositoryId(repositories[0]?.id ?? ""); }, [repositories, selectedRepositoryId]);
+  useEffect(() => { if (selectedRepositoryId && !repositories.some(repository => repository.id === selectedRepositoryId)) setSelectedRepositoryId(""); }, [repositories, selectedRepositoryId]);
 
   const activeTask = useMemo(
-    () => tasks.find((task) => task.id === activeTaskId) ?? tasks[0],
+    () => tasks.find((task) => task.id === activeTaskId),
     [activeTaskId, tasks],
   );
+  const activeRepository = repositories.find(repository => repository.id === activeTask?.repositoryId);
+  const activeTaskHasGit = activeRepository?.has_git === true;
+
+  // Two stores: Cowork (chat, flat by recency) and Code (coding, grouped by folder).
+  const coworkTasks = useMemo(() => tasks.filter((task) => task.track === "cowork"), [tasks]);
+  const railGroups = useMemo(() => {
+    const groups = new Map(repositories.map(repository => [repository.id, { id: repository.id, name: repository.name, path: repository.path, rows: [] as Task[] }]));
+    for (const task of tasks) {
+      if (task.track !== "code") continue;
+      const key = task.repositoryId ?? task.repo;
+      const group = groups.get(key) ?? { id: key, name: task.repo, path: "", rows: [] as Task[] };
+      group.rows.push(task);
+      groups.set(key, group);
+    }
+    return [...groups.values()];
+  }, [repositories, tasks]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -294,14 +343,14 @@ function App() {
   }, [activeTaskId]);
 
   useEffect(() => {
-    if (!activeTaskId || !activeTask?.repositoryId) {
+    if (!activeTaskId || !activeTaskHasGit) {
       setGitSnapshot(null);
       return;
     }
     const controller = new AbortController();
     getTaskGitSnapshot(activeTaskId, controller.signal).then(setGitSnapshot).catch(() => setGitSnapshot(null));
     return () => controller.abort();
-  }, [activeTaskId, activeTask?.repositoryId]);
+  }, [activeTaskId, activeTaskHasGit]);
 
   useEffect(() => {
     if (!activeTaskId) {
@@ -323,7 +372,7 @@ function App() {
     pullRequestKeyRef.current = "";
     setPullRequestPreview(null);
     setPublishError(null);
-    if (!activeTaskId) {
+    if (!activeTaskId || !activeTaskHasGit) {
       setPublishState(null);
       setRemoteTarget(null);
       return;
@@ -334,7 +383,7 @@ function App() {
       .then((payload) => { setRemoteTarget(payload); setPullRequestTarget(payload.default_branch); })
       .catch(() => setRemoteTarget(null));
     return () => controller.abort();
-  }, [activeTaskId]);
+  }, [activeTaskId, activeTaskHasGit]);
 
   useEffect(() => {
     if (!activeTaskId) {
@@ -345,6 +394,43 @@ function App() {
     listIterations(activeTaskId, controller.signal).then((payload) => { setIterations(payload.items); setTestResult(payload.items.at(-1)?.test_result ?? null); }).catch(() => setIterations([]));
     return () => controller.abort();
   }, [activeTaskId]);
+
+  // Chat view poll: the autonomous loop runs server-side, so refresh the agent state, task
+  // and event stream on an interval while a CODE chat is open (Cowork chat is synchronous, see below).
+  useEffect(() => {
+    if (activeNav !== "chat" || chatComposingNew || activeTask?.track === "cowork" || !activeTask?.runId) {
+      setLoopRunning(false);
+      return;
+    }
+    const runId = activeTask.runId;
+    const taskId = activeTask.id;
+    let disposed = false;
+    const tick = async () => {
+      try {
+        const [state, events] = await Promise.all([getAgentState(taskId), listRunEvents(runId)]);
+        if (disposed) return;
+        setLoopRunning(state.loop_running);
+        setRunEvents(events.items);
+        setChatPending(state.pending_approval ?? null);
+        setChatBudget(state.task.budget ?? null);
+        setChatAction(state.action);
+        updateTaskFromApi(state.task);
+      } catch {
+        /* transient poll failure — the next tick retries */
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 2500);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [activeNav, activeTask?.runId, activeTask?.id, activeTask?.track, chatComposingNew]);
+
+  // Cowork is a plain chat: no loop. Just load its transcript (chat.* events) when it is opened.
+  useEffect(() => {
+    if (activeNav !== "chat" || chatComposingNew || activeTask?.track !== "cowork" || !activeTask?.runId) return;
+    let disposed = false;
+    listRunEvents(activeTask.runId).then((payload) => { if (!disposed) setRunEvents(payload.items); }).catch(() => { /* retry on next open */ });
+    return () => { disposed = true; };
+  }, [activeNav, chatComposingNew, activeTask?.track, activeTask?.runId, activeTask?.id]);
 
   const loadOverviewData = async () => {
     setOverviewLoading(true);
@@ -363,6 +449,8 @@ function App() {
         setTasks((current) => [...nextTasks, ...current.filter((task) => !nextTasks.some((item) => item.id === task.id))]);
         if (!taskRef.current) {
           setActiveTaskId(nextTasks[0].id);
+          setSelectedRepositoryId(nextTasks[0].repositoryId ?? "");
+          setRailTab(nextTasks[0].track);
         }
       }
       setRepositories(repoList.items);
@@ -415,12 +503,13 @@ function App() {
 
   const runTask = async () => {
     const trimmedPrompt = prompt.trim();
-    if (!trimmedPrompt || isRunning) return;
+    if (!trimmedPrompt || isRunning || agentBusyAction) return;
     setTaskError(null);
     setIsRunning(true);
     setPrompt("");
     try {
-      const task = await createTask(trimmedPrompt, selectedRepositoryId || repositories[0]?.id);
+      if (!selectedRepositoryId) throw new Error(t("chat.needRepository"));
+      const task = await createTask(trimmedPrompt, selectedRepositoryId);
       const newTask = taskFromApi(task);
       setTasks((current) => [newTask, ...current.filter((item) => item.id !== newTask.id)]);
       setActiveTaskId(newTask.id);
@@ -432,18 +521,157 @@ function App() {
     }
   };
 
-  const addRepository = () => {
-    setRepositoryDialogOpen(true); setRepositoryError(null);
-  };
+  const sendChatMessage = async (message: string): Promise<boolean> => {
+    const trimmed = message.trim();
+    if (!trimmed || loopRunning || chatSendingRef.current) return false;
+    chatSendingRef.current = true;
+    setChatSending(true);
+    setChatError(null);
+    const track: TaskTrack = chatComposingNew ? railTab : (activeTask?.track ?? railTab);
 
-  const pickRepositoryDirectory = async () => {
-    if (!desktopBridge) return;
-    const picked = await desktopBridge.pickDirectory({ fallbackPath: desktopRuntime?.workspaceRoot });
-    if (picked) {
-      setRepositoryPathInput(picked);
-      setRepositoryError(null);
+    try {
+      if (track === "cowork") {
+        // Cowork: a plain synchronous chat. Create the conversation on the first message, then post turns.
+        let taskId = chatComposingNew ? "" : (activeTask?.id ?? "");
+        let runId = chatComposingNew ? "" : (activeTask?.runId ?? "");
+        if (!taskId) {
+          const created = await createTask(trimmed, selectedRepositoryId || undefined, undefined, "cowork");
+          const newTask = taskFromApi(created);
+          setTasks((current) => [newTask, ...current.filter((item) => item.id !== newTask.id)]);
+          setActiveTaskId(newTask.id);
+          setChatComposingNew(false);
+          taskId = newTask.id;
+          runId = created.run_id;
+        }
+        await sendCoworkChat(taskId, trimmed);
+        if (runId) setRunEvents((await listRunEvents(runId)).items);
+        return true;
+      }
+
+      // Code works in ordinary folders too; only Git publishing requires a repository.
+      const runId = chatComposingNew ? undefined : activeTask?.runId;
+      const completedLocalTask = !chatComposingNew && activeTask?.lifecycleStatus === "ready_for_pr" && activeRepository?.has_git === false;
+      if (!runId || completedLocalTask || ["done", "cancelled"].includes(activeTask?.status ?? "")) {
+        const repositoryId = completedLocalTask ? activeTask?.repositoryId : selectedRepositoryId;
+        const mode = completedLocalTask && activeTask ? activeTask.mode : chatMode;
+        if (!repositoryId) throw new Error(t("chat.needRepository"));
+        const created = await createTask(trimmed, repositoryId, mode, "code");
+        const newTask = taskFromApi(created);
+        setTasks((current) => [newTask, ...current.filter((item) => item.id !== newTask.id)]);
+        setActiveTaskId(newTask.id);
+        setChatComposingNew(false);
+        setChatPending(null);
+        await startAgentLoop(created.run_id, { mode });
+      } else {
+        await startAgentLoop(runId, { feedback: trimmed });
+      }
+      setLoopRunning(true);
+      setChatAction(null);
+      return true;
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : t("chat.error"));
+      return false;
+    } finally {
+      chatSendingRef.current = false;
+      setChatSending(false);
     }
   };
+
+  const stopChatLoop = async () => {
+    if (!activeTask?.runId) return;
+    try {
+      const state = await stopAgentLoop(activeTask.runId);
+      setLoopRunning(state.loop_running);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : t("chat.error"));
+    }
+  };
+
+  // Inline approval: decide the pending push/pr/plan/write right in chat, then resume the loop on approve.
+  const decideChatApproval = async (approvalId: string, decision: "approve" | "reject", reason?: string) => {
+    if (chatSendingRef.current) return;
+    chatSendingRef.current = true;
+    setChatSending(true);
+    setChatError(null);
+    try {
+      await decideApproval(approvalId, decision, reason);
+      setChatPending(null);
+      if (decision === "approve" && activeTask?.runId) {
+        await startAgentLoop(activeTask.runId, {});  // resume with the task's existing posture
+        setLoopRunning(true);
+      }
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : t("chat.error"));
+    } finally {
+      chatSendingRef.current = false;
+      setChatSending(false);
+    }
+  };
+
+  const startNewChatSession = () => {
+    setActiveNav("chat");
+    setChatComposingNew(true);
+    setActiveTaskId("");
+    setRunEvents([]);
+    setChatPending(null);
+    setChatBudget(null);
+    setChatAction(null);
+    setChatError(null);
+    setLoopRunning(false);
+  };
+
+  const selectChatSession = (taskId: string) => {
+    setActiveNav("chat");
+    setChatComposingNew(false);
+    setChatPending(null);
+    setChatAction(null);
+    setChatError(null);
+    setActiveTaskId(taskId);
+    const selectedTask = tasks.find(task => task.id === taskId);
+    setSelectedRepositoryId(selectedTask?.repositoryId ?? "");
+    if (selectedTask) setRailTab(selectedTask.track);
+  };
+
+  const openRegisteredFolder = (repositoryId: string) => {
+    setSelectedRepositoryId(repositoryId);
+    setSourceLocation(null);
+    setRailTab("code");
+    startNewChatSession();
+    setSidebarOpen(false);
+    setRepositoryDialogOpen(false);
+    setRepositoryError(null);
+  };
+
+  const openLocalFolder = async (path?: string) => {
+    if (repositoryOpeningRef.current) return;
+    if (!path && !desktopBridge) {
+      setRepositoryError(null);
+      setRepositoryDialogOpen(true);
+      return;
+    }
+    repositoryOpeningRef.current = true;
+    setRepositorySaving(true);
+    setRepositoryError(null);
+    try {
+      const picked = path || await desktopBridge!.pickDirectory({ fallbackPath: desktopRuntime?.workspaceRoot });
+      if (!picked) return;
+      setRepositoryPathInput(picked);
+      const repository = await registerRepository(picked);
+      setRepositories(current => [repository, ...current.filter(item => item.id !== repository.id)]);
+      openRegisteredFolder(repository.id);
+      setRepositoryPathInput("");
+      void getWorkspaceSummary().then(setWorkspaceSummary).catch(() => {});
+    } catch (error) {
+      setRepositoryError(error instanceof Error ? error.message : t("repositoryError"));
+      setRepositoryDialogOpen(true);
+    } finally {
+      repositoryOpeningRef.current = false;
+      setRepositorySaving(false);
+    }
+  };
+
+  const addRepository = () => { void openLocalFolder(); };
+  const saveRepository = () => { if (repositoryPathInput.trim()) void openLocalFolder(repositoryPathInput.trim()); };
 
   const changeWorkspaceRoot = async () => {
     if (!desktopBridge) return;
@@ -454,25 +682,15 @@ function App() {
       if (result.canceled) return;
       setDesktopRuntime((current) => ({ ...(current ?? {}), ...result } as DesktopStatus));
       if (result.error) setRepositoryError(result.error);
+    } catch (error) {
+      setRepositoryError(error instanceof Error ? error.message : t("repositoryError"));
     } finally {
       setRepositorySaving(false);
     }
   };
 
-  const saveRepository = async () => {
-    if (!repositoryPathInput.trim() || repositorySaving) return;
-    setRepositorySaving(true); setRepositoryError(null);
-    try {
-      const repository = await registerRepository(repositoryPathInput.trim());
-      setRepositories(current => [repository, ...current.filter(item => item.id !== repository.id)]);
-      setSelectedRepositoryId(repository.id); setRepositoryDialogOpen(false); setRepositoryPathInput("");
-      setWorkspaceSummary(await getWorkspaceSummary());
-    } catch (error) { setRepositoryError(error instanceof Error ? error.message : t("repositoryError")); }
-    finally { setRepositorySaving(false); }
-  };
-
   const executeTests = async () => {
-    if (!activeTask?.runId || testRunning) return;
+    if (!activeTask?.runId || testRunning || agentBusyAction) return;
     setTestRunning(true);
     setTestError(null);
     try {
@@ -499,6 +717,7 @@ function App() {
     setPatchRunning(true);
     setPatchError(null);
     setPatchApplied(null);
+    setPatchRationale(null);
     try {
       const preview = await previewPatch(activeTask.runId, [{ path: patchPath.trim(), content: patchOperation === "delete" ? undefined : patchContent, operation: patchOperation, expected_hash: patchExpectedHash }]);
       setPatchPreviewResult(preview);
@@ -506,6 +725,24 @@ function App() {
       setRunEvents(events.items);
     } catch (error) {
       setPatchError(error instanceof Error ? error.message : t("patchPreviewError"));
+    } finally {
+      setPatchRunning(false);
+    }
+  };
+
+  const draftActivePatch = async () => {
+    if (!activeTask?.runId || patchRunning) return;
+    setPatchRunning(true);
+    setPatchError(null);
+    setPatchApplied(null);
+    try {
+      const preview = await draftPatch(activeTask.runId, { context_paths: patchPath.trim() ? [patchPath.trim()] : [] });
+      setPatchPreviewResult(preview);
+      setPatchRationale(preview.rationale);
+      const events = await listRunEvents(activeTask.runId);
+      setRunEvents(events.items);
+    } catch (error) {
+      setPatchError(error instanceof Error ? error.message : t("patch.draftError"));
     } finally {
       setPatchRunning(false);
     }
@@ -707,6 +944,7 @@ function App() {
     try {
       await refreshPullRequest(activeTask.id);
       await refreshPublishState(activeTask.id);
+      updateTaskFromApi(await getTask(activeTask.id));
     } catch (error) {
       setPublishError(error instanceof Error ? error.message : t("publish.refreshError"));
     } finally {
@@ -720,7 +958,7 @@ function App() {
   };
 
   const beginIteration = async () => {
-    if (!activeTask || iterationRunning) return;
+    if (!activeTask || iterationRunning || agentBusyAction) return;
     setIterationRunning(true);
     setIterationError(null);
     try {
@@ -736,7 +974,7 @@ function App() {
   };
 
   const requestPlanApproval = async () => {
-    if (!activeTask || iterationRunning) return;
+    if (!activeTask || iterationRunning || agentBusyAction) return;
     setIterationRunning(true);
     setIterationError(null);
     try {
@@ -751,7 +989,7 @@ function App() {
 
   const approvePlan = async () => {
     const approval = approvals.find((item) => item.type === "plan" && item.status === "pending");
-    if (!approval || iterationRunning) return;
+    if (!approval || iterationRunning || agentBusyAction) return;
     setIterationRunning(true);
     setIterationError(null);
     try {
@@ -765,7 +1003,7 @@ function App() {
   };
 
   const beginRepair = async () => {
-    if (!activeTask || iterationRunning) return;
+    if (!activeTask || iterationRunning || agentBusyAction) return;
     setIterationRunning(true);
     setIterationError(null);
     try {
@@ -781,7 +1019,7 @@ function App() {
   };
 
   const changeTaskState = async (action: "pause" | "resume" | "cancel", confirmed = false) => {
-    if (!activeTask || iterationRunning) return;
+    if (!activeTask || iterationRunning || (agentBusyAction && agentBusyAction !== "run_tests")) return;
     if (action === "cancel" && !confirmed) { setConfirmAction("cancel"); return; }
     setConfirmAction(null);
     setIterationRunning(true);
@@ -797,7 +1035,7 @@ function App() {
   };
 
   const confirmRecovery = async () => {
-    if (!activeTask || iterationRunning) return;
+    if (!activeTask || iterationRunning || agentBusyAction) return;
     setIterationRunning(true);
     setIterationError(null);
     try {
@@ -813,12 +1051,19 @@ function App() {
     if (!activeTask?.runId) return;
     const [task, nextIterations, events, repositoryList, snapshot, summary, approvalList] = await Promise.all([
       getTask(activeTask.id), listIterations(activeTask.id), listRunEvents(activeTask.runId), listRepositories(),
-      activeTask.repositoryId ? getTaskGitSnapshot(activeTask.id) : Promise.resolve(null), getWorkspaceSummary(), listApprovals(activeTask.id),
+      activeTaskHasGit ? getTaskGitSnapshot(activeTask.id) : Promise.resolve(null), getWorkspaceSummary(), listApprovals(activeTask.id),
     ]);
+    if (taskRef.current !== activeTask.id) return;
     updateTaskFromApi(task); setIterations(nextIterations.items); setRunEvents(events.items);
     setRepositories(repositoryList.items); setGitSnapshot(snapshot); setWorkspaceSummary(summary); setApprovals(approvalList.items);
     setTestResult(nextIterations.items.at(-1)?.test_result ?? null);
     setPatchPreviewResult(null); setPatchApplied(null); setCommitPreviewResult(null); setPatchExpectedHash(undefined);
+  };
+
+  const refreshApprovalTask = async (taskId: string) => {
+    if (taskId === activeTask?.id) await refreshActiveTask();
+    else updateTaskFromApi(await getTask(taskId));
+    setWorkspaceSummary(await getWorkspaceSummary());
   };
 
   const prepareSourceChange = (file: SourceFile) => {
@@ -831,28 +1076,37 @@ function App() {
     setSelectedRepositoryId(activeTask.repositoryId); setSourceLocation({ path, line }); setActiveNav("repositories");
   };
 
+  const agentRevision = [activeTask?.updatedAt, iterations.map(item => item.updated_at + String(item.rolled_back)).join(), approvals.map(item => item.id + item.status).join(), publishState?.pull_request?.updated_at].join(":");
+  const operationBusy = Boolean(isRunning || testRunning || patchRunning || gitRunning || iterationRunning || publishRunning || repositorySaving || confirmAction || agentBusyAction || approvalRunning);
   const filteredTasks = tasks.filter(task => taskFilter === "all" || task.status === taskFilter);
+  const chatTrack: TaskTrack = chatComposingNew ? railTab : (activeTask?.track ?? railTab);
+  const chatRepositoryId = !chatComposingNew && activeTask && !["done", "completed", "cancelled"].includes(activeTask.lifecycleStatus) ? activeTask.repositoryId ?? "" : selectedRepositoryId;
+  const openChatRun = () => {
+    setActiveNav("runs");
+    void refreshActiveTask().catch(error => setIterationError(error instanceof Error ? error.message : t("common.error")));
+  };
 
   return (
-    <div className="app-shell">
-      <Dialog open={repositoryDialogOpen} title={t("addGitRepository")} onClose={() => { if (!repositorySaving) setRepositoryDialogOpen(false); }}>
-        <form onSubmit={event => { event.preventDefault(); void saveRepository(); }}>
-          <label className="dialog-label" htmlFor="repository-path">{t("repositoryPathPrompt")}</label>
+    <div className="app-shell" data-page={activeNav}>
+      <Dialog open={repositoryDialogOpen} title={t("folder.openLocal")} onClose={() => { if (!repositorySaving) setRepositoryDialogOpen(false); }}>
+        <form className="folder-dialog" onSubmit={event => { event.preventDefault(); saveRepository(); }}>
+          <div className="folder-dialog-intro"><span className="folder-dialog-icon"><FolderOpen size={24} strokeWidth={1.5} /></span><p>{t("folder.dialogDescription")}</p></div>
+          {isDesktopShell ? <button type="button" className="folder-browse-button" onClick={addRepository} disabled={repositorySaving}><FolderOpen size={17} />{t("folder.browseAction")}<ArrowUpRight size={15} /></button> : <p className="folder-browser-hint">{t("folder.browserHint")}</p>}
+          <label className="dialog-label" htmlFor="repository-path">{t("folder.pathLabel")}</label>
           <div className="repository-path-row">
-            <input id="repository-path" autoFocus value={repositoryPathInput} onChange={event => setRepositoryPathInput(event.target.value)} disabled={repositorySaving} />
-            {isDesktopShell ? <button type="button" className="small-action small-action--muted" onClick={() => void pickRepositoryDirectory()} disabled={repositorySaving}><FolderOpen size={13} /> {t("desktop.pickDirectory")}</button> : null}
+            <input id="repository-path" autoFocus placeholder={t("folder.pathPlaceholder")} value={repositoryPathInput} onChange={event => setRepositoryPathInput(event.target.value)} disabled={repositorySaving} aria-invalid={Boolean(repositoryError)} aria-describedby={repositoryError ? "folder-open-error" : undefined} />
           </div>
-          {isDesktopShell ? <div className="desktop-runtime">
+          {repositoryError ? <p id="folder-open-error" className="inline-error" role="alert">{repositoryError}</p> : null}
+          {repositories.length ? <div className="folder-recents"><h3>{t("folder.recent")}</h3>{repositories.slice(0, 5).map(repository => <button type="button" className="folder-recent" key={repository.id} onClick={() => openRegisteredFolder(repository.id)} disabled={repositorySaving}><FolderOpen size={17} /><span><strong>{repository.name}</strong><small title={repository.path}>{repository.path}</small></span><ArrowUpRight size={14} /></button>)}</div> : null}
+          {isDesktopShell ? <details className="folder-workspace-settings" open={Boolean(repositoryError)}><summary>{t("folder.workspaceSettings")}</summary><div className="desktop-runtime">
             <div className="desktop-runtime-row"><span>{t("desktop.workspaceRoot")}</span><code>{desktopRuntime?.workspaceRoot || t("common.none")}</code></div>
-            <div className="desktop-runtime-row"><span>{t("desktop.apiEndpoint")}</span><code>{desktopRuntime?.apiBaseUrl || t("common.none")}</code></div>
             <div className="desktop-runtime-actions">
               <button type="button" className="text-button" onClick={() => void changeWorkspaceRoot()} disabled={repositorySaving}><FolderSync size={13} /> {t("desktop.changeWorkspace")}</button>
               <button type="button" className="text-button" onClick={() => void desktopBridge?.openLog()}>{t("desktop.openLog")}</button>
             </div>
             <p className="desktop-runtime-hint">{t("desktop.workspaceHint")}</p>
-          </div> : null}
-          {repositoryError ? <p className="inline-error" role="alert">{repositoryError}</p> : null}
-          <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={repositorySaving} onClick={() => setRepositoryDialogOpen(false)}>{t("cancel")}</button><button className="small-action" disabled={repositorySaving || !repositoryPathInput.trim()}>{repositorySaving ? t("common.loading") : t("add")}</button></div>
+          </div></details> : null}
+          <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={repositorySaving} onClick={() => setRepositoryDialogOpen(false)}>{t("cancel")}</button><button className="small-action folder-confirm" disabled={repositorySaving || !repositoryPathInput.trim()}>{repositorySaving ? t("folder.opening") : t("folder.openAction")}</button></div>
         </form>
       </Dialog>
       <Dialog open={confirmAction !== null} title={confirmAction === "delete" ? t("patch.delete") : t("cancel")} onClose={() => setConfirmAction(null)}>
@@ -860,64 +1114,78 @@ function App() {
         {confirmAction === "delete" ? <pre>{patchPreviewResult?.files.join("\n")}</pre> : null}
         <div className="dialog-actions"><button className="small-action small-action--muted" onClick={() => setConfirmAction(null)}>{t("common.back")}</button><button className="small-action" onClick={() => confirmAction === "delete" ? void applyActivePatch(true) : void changeTaskState("cancel", true)}>{t("common.confirm")}</button></div>
       </Dialog>
-      <aside className={`sidebar ${sidebarOpen ? "sidebar--open" : ""}`}>
-        <div className="brand-row">
-          <div className="brand-mark">F</div>
-          <div>
-            <div className="brand-name">FORGE</div>
-            <div className="brand-subtitle">coding agent / 0.1</div>
+      <aside className={`sidebar rail ${sidebarOpen ? "sidebar--open" : ""}`}>
+        <div className="rail-brand"><Code2 size={19} /><span>Coding Agent</span></div>
+        <div className="rail-head">
+          <div className="rail-tabs" role="tablist" aria-label={t("workspace")}>
+            <button role="tab" aria-selected={railTab === "cowork"} className={railTab === "cowork" ? "is-active" : ""} onClick={() => { if (railTab !== "cowork") { setRailTab("cowork"); startNewChatSession(); } }}>
+              <ListChecks size={14} /> {t("rail.cowork")}
+            </button>
+            <button role="tab" aria-selected={railTab === "code"} className={railTab === "code" ? "is-active" : ""} onClick={() => { if (railTab !== "code") { setRailTab("code"); startNewChatSession(); } }}>
+              <Code2 size={14} /> {t("rail.code")}
+            </button>
           </div>
           <button className="icon-button mobile-close" aria-label={t("closeNavigation")} onClick={() => setSidebarOpen(false)}>
             <X size={17} />
           </button>
         </div>
 
-          <button className="workspace-switcher" onClick={() => void addRepository()} title={t("addGitRepository")}>
-          <span className="workspace-icon"><Code2 size={15} /></span>
-          <span className="workspace-copy">
-            <strong>{repositories[0]?.name ?? t("noRepository")}</strong>
-            <small>{repositories[0] ? t("localWorkspace") : t("addGitRepository")}</small>
-          </span>
-          <ChevronDown size={15} />
+        <button className="rail-new" onClick={() => { startNewChatSession(); setSidebarOpen(false); }}>
+          <Plus size={15} /> {t("rail.new")}
         </button>
+        <button className="rail-open-folder" onClick={addRepository} disabled={repositorySaving}><FolderOpen size={16} />{repositorySaving ? t("folder.opening") : t("folder.openLocal")}</button>
 
-        <div className="nav-label">{t("workspace")}</div>
-        <nav className="primary-nav" aria-label={t("primaryNavigation")}>
+        <nav className="rail-nav" aria-label={t("primaryNavigation")}>
           {navItems.map((item) => {
             const Icon = item.icon;
             return (
-              <button
-                key={item.key}
-                className={`nav-item ${activeNav === item.key ? "nav-item--active" : ""}`}
-                onClick={() => {
-                  setActiveNav(item.key);
-                  setSidebarOpen(false);
-                }}
-              >
-                <Icon size={17} strokeWidth={1.8} />
+              <button key={item.key} className={`rail-nav-item ${activeNav === item.key ? "is-active" : ""}`} onClick={() => { setActiveNav(item.key); setSidebarOpen(false); }}>
+                <Icon size={16} strokeWidth={1.8} />
                 <span>{t(`nav.${item.key}`)}</span>
-                {(item.key === "tasks" ? tasks.length : item.key === "approvals" ? reviewTasks.length : item.count) ? <span className="nav-count">{item.key === "tasks" ? tasks.length : item.key === "approvals" ? reviewTasks.length : item.count}</span> : null}
+                {item.key === "approvals" && approvalCount ? <span className="nav-count">{approvalCount}</span> : null}
               </button>
             );
           })}
         </nav>
 
-        <div className="nav-label nav-label--spaced">{t("tools")}</div>
-        <nav className="primary-nav">
-          <button className="nav-item"><Bot size={17} strokeWidth={1.8} /><span>{t("agentSkills")}</span><ArrowUpRight size={13} className="external-icon" /></button>
-          <button className="nav-item"><LockKeyhole size={17} strokeWidth={1.8} /><span>{t("securityPolicy")}</span></button>
-          <button className="nav-item"><Settings2 size={17} strokeWidth={1.8} /><span>{t("settings")}</span></button>
-        </nav>
+        <div className="rail-section"><span>{railTab === "cowork" ? t("rail.chats") : t("rail.folders")}</span>{railTab === "code" ? <button className="icon-button" aria-label={t("folder.openLocal")} onClick={addRepository} disabled={repositorySaving}><Plus size={15} /></button> : null}</div>
+        <div className="rail-conversations">
+          {railTab === "cowork" ? (
+            coworkTasks.length ? (
+              coworkTasks.map((task) => <RailSession key={task.id} task={task} active={task.id === activeTaskId && !chatComposingNew} onClick={() => { selectChatSession(task.id); setSidebarOpen(false); }} />)
+            ) : <p className="rail-empty">{t("chat.noSessions")}</p>
+          ) : (
+            railGroups.length ? (
+              railGroups.map(({ id, name, path, rows }) => (
+                <div className="rail-group" key={id}>
+                  <details className="rail-folder-group" open><summary title={path || name}><FolderOpen size={14} /><span>{name}</span><span className="rail-folder-count">{rows.length}</span></summary><div className="rail-folder-sessions">
+                  {rows.map((task) => <RailSession key={task.id} task={task} active={task.id === activeTaskId && !chatComposingNew} onClick={() => { selectChatSession(task.id); setSidebarOpen(false); }} />)}
+                  {path ? <button className="rail-folder-new" onClick={() => openRegisteredFolder(id)}><Plus size={13} />{t("rail.newInFolder")}</button> : null}
+                  </div></details>
+                </div>
+              ))
+            ) : <p className="rail-empty">{t("rail.emptyFolders")}</p>
+          )}
+        </div>
 
-        <div className="sidebar-footer">
-          <div className="sandbox-card">
-            <div className="sandbox-topline"><span className="pulse-dot" /> {t("localExecution")}</div>
-            <div className="sandbox-detail">{t("localExecutionDetail")}</div>
-          </div>
-          <div className="user-row">
-            <div className="avatar">LC</div>
-            <div className="user-copy"><strong>Lin Chen</strong><span>{t("owner")}</span></div>
-            <MoreHorizontal size={16} />
+        <div className="rail-footer">
+          <div className="rail-local"><span className="pulse-dot" /> {t("localExecution")}</div>
+          <div className="rail-account-wrap">
+            {accountMenuOpen ? (
+              <>
+                <button className="rail-backdrop" aria-hidden tabIndex={-1} onClick={() => setAccountMenuOpen(false)} />
+                <div className="rail-menu" role="menu">
+                  <label className="preference-control"><Languages size={14} /><select value={language} onChange={(event) => setLanguage(event.target.value as Language)} aria-label={t("language")}><option value="zh-CN">{t("chinese")}</option><option value="en-US">{t("english")}</option></select></label>
+                  <label className="preference-control"><span className="preference-theme-icon">{theme === "light" ? <Sun size={14} /> : theme === "dark" ? <Moon size={14} /> : <Monitor size={14} />}</span><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeMode)} aria-label={t("theme")}><option value="system">{t("system")}</option><option value="light">{t("light")}</option><option value="dark">{t("dark")}</option></select></label>
+                  <button className="rail-menu-item" disabled><Settings2 size={14} /> {t("settings")}</button>
+                </div>
+              </>
+            ) : null}
+            <button className="rail-account" aria-label={t("rail.account")} aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((open) => !open)}>
+              <div className="avatar"><Monitor size={16} /></div>
+              <div className="user-copy"><strong>{t("rail.localAccount")}</strong><span>{t("rail.preferences")}</span></div>
+              <MoreHorizontal size={16} />
+            </button>
           </div>
         </div>
       </aside>
@@ -926,22 +1194,43 @@ function App() {
         <header className="topbar">
           <div className="topbar-left">
           <button className="icon-button menu-toggle" aria-label={t("openNavigation")} onClick={() => setSidebarOpen(true)}><Menu size={18} /></button>
-            <div className="breadcrumbs"><span>{t("workspace")}</span><span className="breadcrumb-slash">/</span><strong>{pageTitle}</strong></div>
+            <div className="breadcrumbs"><span>{t("workspace")}</span><span className="breadcrumb-slash">/</span><strong>{activeNav === "chat" ? t(`rail.${chatTrack}`) : pageTitle}</strong></div>
           </div>
           <div className="topbar-actions">
             <div className={`connection-status connection-status--${apiStatus}`}><span className="pulse-dot" /> {apiStatus === "connected" ? t("apiConnected") : apiStatus === "offline" ? t("apiOffline") : t("checkingApi")}</div>
-            <div className="preference-controls" aria-label={t("preferences")}>
-              <label className="preference-control"><Languages size={14} /><span className="sr-only">{t("language")}</span><select value={language} onChange={(event) => setLanguage(event.target.value as Language)} aria-label={t("language")}><option value="zh-CN">{t("chinese")}</option><option value="en-US">{t("english")}</option></select></label>
-              <label className="preference-control"><span className="preference-theme-icon">{theme === "light" ? <Sun size={14} /> : theme === "dark" ? <Moon size={14} /> : <Monitor size={14} />}</span><span className="sr-only">{t("theme")}</span><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeMode)} aria-label={t("theme")}><option value="system">{t("system")}</option><option value="light">{t("light")}</option><option value="dark">{t("dark")}</option></select></label>
-            </div>
-            <button className="icon-button" aria-label={t("search")} title={t("search")}><Search size={17} /></button>
-            <button className="icon-button" aria-label={t("commandMenu")} title={t("commandMenu")}><Command size={17} /></button>
-            <div className="topbar-avatar">LC</div>
+            <button className="topbar-folder" onClick={addRepository} disabled={repositorySaving}><FolderOpen size={15} /><span>{t("folder.openLocal")}</span></button>
           </div>
         </header>
 
         <div className="page-wrap" data-view={activeNav}>
-          {activeNav === "repositories" ? <RepositoryBrowser repositories={repositories} repositoryId={selectedRepositoryId} onRepositoryChange={(id) => { setSelectedRepositoryId(id); setSourceLocation(null); }} onEdit={prepareSourceChange} canEdit={Boolean(activeTask?.repositoryId === selectedRepositoryId && activeTask.lifecycleStatus === "coding")} initialFile={sourceLocation} /> : null}
+          <ChatPanel
+            goal={chatComposingNew || chatTrack === "cowork" ? null : (activeTask?.title ?? null)}
+            plan={chatComposingNew || chatTrack === "cowork" ? undefined : (activeTask?.plan ?? undefined)}
+            events={chatComposingNew ? [] : runEvents}
+            loopRunning={chatTrack === "code" && loopRunning}
+            sending={chatSending}
+            status={chatComposingNew ? null : (activeTask?.lifecycleStatus ?? null)}
+            hasActiveRun={!chatComposingNew && Boolean(activeTask?.runId)}
+            track={chatTrack}
+            repositories={repositories}
+            selectedRepositoryId={chatRepositoryId}
+            onSelectRepository={setSelectedRepositoryId}
+            onImportFolder={addRepository}
+            onBrowseFolder={() => { setSelectedRepositoryId(chatRepositoryId); setActiveNav("repositories"); }}
+            onSend={sendChatMessage}
+            onStop={stopChatLoop}
+            onOpenPublish={openChatRun}
+            reviewPatch={!chatComposingNew && activeTask?.mode === "conservative" && chatAction === "review_patch" && !loopRunning}
+            onReviewPatch={openChatRun}
+            error={chatError}
+            mode={chatComposingNew || !activeTask ? chatMode : activeTask.mode}
+            modeLocked={!chatComposingNew && Boolean(activeTask)}
+            onModeChange={setChatMode}
+            pending={chatComposingNew ? null : chatPending}
+            onDecide={decideChatApproval}
+            budget={chatComposingNew ? null : chatBudget}
+          />
+          {activeNav === "repositories" ? <RepositoryBrowser repositories={repositories} repositoryId={selectedRepositoryId} onRepositoryChange={(id) => { setSelectedRepositoryId(id); setSourceLocation(null); }} onOpenFolder={addRepository} onEdit={prepareSourceChange} canEdit={Boolean(activeTask?.repositoryId === selectedRepositoryId && activeTask.lifecycleStatus === "coding")} initialFile={sourceLocation} /> : null}
           <section className="hero-block">
             <div className="hero-copy">
               <div className="eyebrow"><span className="eyebrow-line" /> {t("controlRoom")} / {new Intl.DateTimeFormat(language, { weekday: "long", day: "2-digit", month: "short" }).format(new Date()).toUpperCase()}</div>
@@ -969,7 +1258,7 @@ function App() {
             </div>
           ) : null}
 
-          <section className="command-panel">
+          <section className="command-panel" inert={Boolean(agentBusyAction) || approvalRunning}>
             <div className="section-heading"><div><div className="section-kicker"><Sparkles size={13} /> {t("startTask")}</div><h2>{t("whatShouldForgeWorkOn")}</h2></div><span className="shortcut-hint" title={t("shortcuts.taskPrompt")}><Command size={12} /> K</span></div>
             <div className="prompt-row">
               <div className="prompt-prefix"><span className="prompt-dot" /><span>forge</span><span className="prompt-arrow">›</span></div>
@@ -979,7 +1268,7 @@ function App() {
             <div className="prompt-footer"><span><CircleDot size={12} /> {t("agentInspect")}</span><span className="prompt-footer-right"><LockKeyhole size={12} /> {t("localExecutionDetail")}</span></div>{taskError ? <div className="repo-error task-error">{taskError}</div> : null}
           </section>
 
-          <div className="content-grid">
+          <div className="content-grid" inert={approvalRunning}>
             <section className="panel task-panel">
               <div className="panel-header"><div><div className="section-kicker">{t("inFlight")}</div><h2>{t("taskQueue")}</h2></div><button className="text-button" onClick={() => setActiveNav("tasks")}>{t("viewAll")} <ArrowUpRight size={14} /></button></div>
               <div className="task-filter"><label htmlFor="task-filter">{t("task.filter")}</label><select id="task-filter" value={taskFilter} onChange={event => setTaskFilter(event.target.value)}>{["all", "queued", "running", "review", "done", "failed", "paused", "cancelled"].map(status => <option value={status} key={status}>{status === "all" ? t("task.all") : t(status)}</option>)}</select></div>
@@ -988,7 +1277,7 @@ function App() {
                   <div className="empty-operation queue-empty"><AsyncMessage tone="loading">{t("common.loading")}</AsyncMessage></div>
                 ) : (
                   <>
-                    {(activeNav === "tasks" ? filteredTasks : filteredTasks.slice(0, 4)).map((task) => <TaskRow key={task.id} task={task} active={task.id === activeTaskId} onClick={() => { if (!patchRunning && !gitRunning && !iterationRunning && !testRunning) { setActiveTaskId(task.id); setActiveNav("runs"); } }} />)}
+                    {(activeNav === "tasks" ? filteredTasks : filteredTasks.slice(0, 4)).map((task) => <TaskRow key={task.id} task={task} active={task.id === activeTaskId} onClick={() => { if (!operationBusy) { setActiveTaskId(task.id); setActiveNav("runs"); } }} />)}
                     {!filteredTasks.length ? <div className="empty-operation queue-empty"><Zap size={17} /><span>{tasks.length ? t("task.noMatch") : t("noTasks")}</span></div> : null}
                   </>
                 )}
@@ -998,8 +1287,8 @@ function App() {
 
             <section className="panel stream-panel">
               <div className="panel-header"><div><div className="section-kicker">TRACE / {activeTask?.id.toUpperCase()}</div><h2>{t("executionStream")}</h2></div><span className="live-badge"><span className="pulse-dot" /> {t("liveEvents")}</span></div>
-              {activeTask?.requiresRecovery ? <div className="recovery-note" role="status"><AlertTriangle size={14} /><span>{t("recovery.title")}</span><button className="small-action" onClick={() => void confirmRecovery()} disabled={iterationRunning}>{t("recovery.action")}</button></div> : null}
-              {activeTask ? <div className="iteration-bar"><div className="iteration-status"><strong>{t("iteration")} {activeTask.currentIteration || iterations.length || 0}</strong><span>{activeTask.nextAction ?? activeTask.plan?.objective ?? t("currentCodingLoop")}</span></div><div className="iteration-actions">{activeTask.status === "failed" ? <button className="small-action" onClick={() => void beginRepair()} disabled={iterationRunning}>{t("repair")}</button> : activeTask.status === "paused" ? <button className="small-action" onClick={() => void changeTaskState("resume")} disabled={iterationRunning}>{t("resume")}</button> : (activeTask.status === "review" && !iterations.length || activeTask.lifecycleStatus === "coding" && Boolean(iterations.at(-1)?.rolled_back)) ? planApproval?.status === "approved" ? <button className="small-action" onClick={() => void beginIteration()} disabled={iterationRunning || Boolean(activeTask.repositoryId && !activeTask.taskBranch)} title={activeTask.repositoryId && !activeTask.taskBranch ? t("createBranchBeforeCommit") : undefined}>{t("startIteration")}</button> : <button className="small-action" onClick={() => void requestPlanApproval()} disabled={iterationRunning}>{planApproval ? t("awaitingApproval") : t("requestPlanApproval")}</button> : null}{planApproval?.status === "pending" ? <button className="small-action small-action--muted" onClick={() => void approvePlan()} disabled={iterationRunning}>{t("approvePlan")}</button> : null}{["coding", "testing", "running"].includes(activeTask.status) ? <button className="small-action small-action--muted" onClick={() => void changeTaskState("pause")} disabled={iterationRunning}>{t("pause")}</button> : null}{!["cancelled", "done"].includes(activeTask.status) ? <button className="text-button" onClick={() => void changeTaskState("cancel")} disabled={iterationRunning}>{t("cancel")}</button> : null}</div></div> : null}
+              {activeTask?.requiresRecovery ? <div className="recovery-note" role="status"><AlertTriangle size={14} /><span>{t("recovery.title")}</span><button className="small-action" onClick={() => void confirmRecovery()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("recovery.action")}</button></div> : null}
+              {activeTask ? <div className="iteration-bar"><div className="iteration-status"><strong>{t("iteration")} {activeTask.currentIteration || iterations.length || 0}</strong><span>{activeTask.nextAction ?? activeTask.plan?.objective ?? t("currentCodingLoop")}</span></div><div className="iteration-actions">{activeTask.status === "failed" ? <button className="small-action" onClick={() => void beginRepair()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("repair")}</button> : activeTask.status === "paused" ? <button className="small-action" onClick={() => void changeTaskState("resume")} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("resume")}</button> : (activeTask.status === "review" && !iterations.length || activeTask.lifecycleStatus === "coding" && Boolean(iterations.at(-1)?.rolled_back)) ? planApproval?.status === "approved" ? <button className="small-action" onClick={() => void beginIteration()} disabled={iterationRunning || Boolean(agentBusyAction) || Boolean(activeTaskHasGit && !activeTask.taskBranch)} title={activeTaskHasGit && !activeTask.taskBranch ? t("createBranchBeforeCommit") : undefined}>{t("startIteration")}</button> : <button className="small-action" onClick={() => void requestPlanApproval()} disabled={iterationRunning || Boolean(agentBusyAction)}>{planApproval ? t("awaitingApproval") : t("requestPlanApproval")}</button> : null}{planApproval?.status === "pending" ? <button className="small-action small-action--muted" onClick={() => void approvePlan()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("approvePlan")}</button> : null}{["coding", "testing", "running"].includes(activeTask.status) ? <button className="small-action small-action--muted" onClick={() => void changeTaskState("pause")} disabled={iterationRunning || Boolean(agentBusyAction && agentBusyAction !== "run_tests")}>{t("pause")}</button> : null}{!["cancelled", "done"].includes(activeTask.status) ? <button className="text-button" onClick={() => void changeTaskState("cancel")} disabled={iterationRunning || Boolean(agentBusyAction && agentBusyAction !== "run_tests")}>{t("cancel")}</button> : null}</div></div> : null}
               {iterationError ? <div className="inline-error">{iterationError}</div> : null}
               {activeTask?.plan ? <div className="plan-list"><div className="plan-label">{t("plan")} / {activeTask.plan.steps.length} {t("steps")}</div>{activeTask.plan.steps.map((step, index) => <div className="plan-step" key={step.id}><span className={`plan-step-index ${index === 0 ? "plan-step-index--active" : ""}`}>{index + 1}</span><div className="plan-step-copy"><strong>{step.title}</strong><span>{step.description}</span></div><span className={`plan-risk plan-risk--${step.risk}`}>{t(`risk.${step.risk}`)}</span></div>)}</div> : null}
               {iterations.length ? <div className="iteration-history"><div className="plan-label">{t("iterations")} / {iterations.length}</div>{iterations.map((iteration) => <div className="iteration-row" key={iteration.id}><span className={`iteration-dot iteration-dot--${iteration.status}`} /><div className="iteration-row-copy"><strong>#{iteration.number} {t(`iterationStatus.${iteration.status}`)}</strong><span>{iteration.goal}</span>{iteration.failure_summary ? <small>{iteration.failure_summary}</small> : null}</div>{iteration.test_result?.failed_tests?.[0] ? <span className="failure-location">{iteration.test_result.failed_tests[0].path ?? t("testOutput")}{iteration.test_result.failed_tests[0].line ? `:${iteration.test_result.failed_tests[0].line}` : ""}</span> : null}</div>)}</div> : null}
@@ -1018,7 +1307,9 @@ function App() {
             </section>
           </div>
 
-          <section className="operations-grid">
+          {activeTask?.runId ? <AgentPanel key={activeTask.id} taskId={activeTask.id} revision={agentRevision} testKind={testKind} testTarget={testTarget} disabled={operationBusy} hidden={activeNav !== "runs"} onAdvanced={refreshActiveTask} onBusyChange={setAgentBusyAction} /> : null}
+
+          <section className="operations-grid" inert={Boolean(agentBusyAction) || approvalRunning}>
             <section className="panel test-panel">
               <div className="panel-header"><div><div className="section-kicker"><PackageCheck size={13} /> {t("validation")}</div><h2>{t("testConsole")}</h2></div><button className="small-action" onClick={() => void executeTests()} disabled={!activeTask?.runId || testRunning || !iterations.length || Boolean(iterations.at(-1)?.rolled_back) || ["paused", "cancelled", "done"].includes(activeTask.status)}>{testRunning ? <><Activity size={13} className="spin" /> {t("running")}</> : <><TerminalSquare size={13} /> {t("runTests")}</>}</button></div>
               <div className="validation-options"><label>{t("validation.kind")}<select value={testKind} onChange={event => setTestKind(event.target.value as TestKind)} disabled={testRunning}>{["auto", "pytest", "frontend", "static"].map(kind => <option value={kind} key={kind}>{t("validation." + kind)}</option>)}</select></label><input value={testTarget} onChange={event => setTestTarget(event.target.value)} aria-label={t("validation.target")} placeholder={t("validation.target")} disabled={testRunning} /></div>
@@ -1038,15 +1329,15 @@ function App() {
                 <label className="patch-operation">{t("patch.operation")}<select value={patchOperation} onChange={event => { setPatchOperation(event.target.value as PatchFileInput["operation"]); setPatchPreviewResult(null); }}>{["update", "create", "delete"].map(operation => <option value={operation} key={operation}>{t("patch." + operation)}</option>)}</select></label>
                 <input value={patchPath} onChange={(event) => { setPatchPath(event.target.value); setPatchExpectedHash(undefined); setPatchPreviewResult(null); }} placeholder={t("patchPathPlaceholder")} aria-label={t("patchPath")} />
                 <textarea value={patchContent} disabled={patchOperation === "delete"} onChange={(event) => { setPatchContent(event.target.value); setPatchPreviewResult(null); }} placeholder={t("patchContentPlaceholder")} aria-label={t("patchContent")} rows={4} />
-                <div className="patch-form-actions"><span>{t("updateOnly")}</span><button className="small-action" onClick={() => void previewActivePatch()} disabled={!activeTask?.runId || !patchPath.trim() || patchRunning}>{patchRunning ? t("working") : t("previewDiff")}</button></div>
+                <div className="patch-form-actions"><span>{patchPath.trim() ? `${t("patch.draftContext")}：${patchPath.trim()}` : t("updateOnly")}</span><div className="patch-form-buttons"><button className="small-action small-action--muted" onClick={() => void draftActivePatch()} disabled={!activeTask?.runId || patchRunning}>{patchRunning ? t("patch.drafting") : t("patch.draft")}</button><button className="small-action" onClick={() => void previewActivePatch()} disabled={!activeTask?.runId || !patchPath.trim() || patchRunning}>{patchRunning ? t("working") : t("previewDiff")}</button></div></div>
               </div>
-              {patchPreviewResult ? <div className="patch-result"><div className="patch-summary"><span>{patchPreviewResult.files.length} {t("file")}</span><span className="diff-add">+{patchPreviewResult.additions}</span><span className="diff-del">-{patchPreviewResult.deletions}</span><span>{patchPreviewResult.bytes_changed} {t("bytes")}</span></div><pre className="diff-view">{patchPreviewResult.diff || t("noChangesDetected")}</pre><div className="patch-result-actions"><span>{t("reviewUnifiedDiff")}</span><div className="patch-result-buttons"><button className="small-action small-action--muted" onClick={cancelPatchPreview} disabled={patchRunning}>{t("cancel")}</button><button className="small-action" onClick={() => void applyActivePatch()} disabled={patchRunning || !patchPreviewResult.diff}>{t("applyCheckpoint")}</button></div></div></div> : <div className="empty-operation"><FileCode2 size={17} /><span>{t("previewBeforeRepository")}</span></div>}
+              {patchPreviewResult ? <div className="patch-result">{patchRationale ? <div className="patch-rationale"><strong>{t("patch.rationale")}</strong> {patchRationale}</div> : null}<div className="patch-summary"><span>{patchPreviewResult.files.length} {t("file")}</span><span className="diff-add">+{patchPreviewResult.additions}</span><span className="diff-del">-{patchPreviewResult.deletions}</span><span>{patchPreviewResult.bytes_changed} {t("bytes")}</span></div><pre className="diff-view">{patchPreviewResult.diff || t("noChangesDetected")}</pre><div className="patch-result-actions"><span>{t("reviewUnifiedDiff")}</span><div className="patch-result-buttons"><button className="small-action small-action--muted" onClick={cancelPatchPreview} disabled={patchRunning}>{t("cancel")}</button><button className="small-action" onClick={() => void applyActivePatch()} disabled={patchRunning || !patchPreviewResult.diff}>{t("applyCheckpoint")}</button></div></div></div> : <div className="empty-operation"><FileCode2 size={17} /><span>{t("previewBeforeRepository")}</span></div>}
               {patchApplied ? <div className="success-note"><Check size={14} /> {patchApplied}</div> : null}
               {patchError ? <div className="inline-error">{patchError}</div> : null}
             </section>
           </section>
 
-          <section className="operations-grid git-grid">
+          {activeTaskHasGit ? <><section className="operations-grid git-grid" inert={Boolean(agentBusyAction) || approvalRunning}>
             <section className="panel git-panel">
               <div className="panel-header"><div><div className="section-kicker"><GitBranch size={13} /> {t("branchIsolation")}</div><h2>{t("taskBranch")}</h2></div>{gitSnapshot ? <span className="patch-safety">{gitSnapshot.clean ? t("clean") : `${gitSnapshot.changed_files.length} ${t("changed")}`}</span> : null}</div>
               {gitSnapshot ? <div className="git-snapshot"><div><span>{t("branch")}</span><strong>{gitSnapshot.branch}</strong></div><div><span>HEAD</span><code>{gitSnapshot.head.slice(0, 10)}</code></div></div> : <div className="empty-operation"><GitBranch size={17} /><span>{t("createBranchBeforeCommit")}</span></div>}
@@ -1060,7 +1351,7 @@ function App() {
             </section>
           </section>
 
-          <section className="operations-grid publish-grid">
+          <section className="operations-grid publish-grid" inert={Boolean(agentBusyAction) || approvalRunning}>
             <section className="panel publish-panel">
               <div className="panel-header"><div><div className="section-kicker"><Rocket size={13} /> {t("publish.kicker")}</div><h2>{t("publish.title")}</h2></div><span className="patch-safety"><LockKeyhole size={12} /> {t("publish.gated")}</span></div>
               <div className="publish-target">{publishState?.remote_url ? <div><span>{t("publish.remote")}</span><code>{publishState.remote_url}</code></div> : <div className="publish-muted">{t("publish.noRemote")}</div>}{remoteTarget ? <div><span>{t("publish.defaultBranch")}</span><code>{remoteTarget.host} · {remoteTarget.default_branch}</code></div> : null}</div>
@@ -1079,15 +1370,24 @@ function App() {
               </div>
               {pullRequestPreview ? <div className="patch-result"><div className="patch-summary"><span>{pullRequestPreview.files.length} {t("files")}</span><span>{pullRequestPreview.source_branch} → {pullRequestPreview.target_branch}</span><span>{pullRequestPreview.ready ? t("ready") : t("publish.notReady")}</span></div><pre className="diff-view">{pullRequestPreview.body}</pre></div> : null}
               {publishState?.pull_request ? <div className="success-note"><Check size={14} /><a className="publish-link" href={publishState.pull_request.html_url} target="_blank" rel="noreferrer">{t("publish.openPr")}</a><ArrowUpRight size={13} /></div> : null}
+              {publishState?.remote_calls.length ? <div className="remote-call-log">
+                <div className="plan-label">{t("publish.remoteCalls")} / {publishState.remote_calls.length}</div>
+                {publishState.remote_calls.slice(-5).reverse().map((call) => <div className={`remote-call remote-call--${call.outcome}`} key={call.id}>
+                  <span className="remote-call-op">{t("publish.op." + call.operation)}</span>
+                  <span className="remote-call-meta">{call.outcome === "error" ? (call.error_code ?? t("publish.callError")) : (call.status_code ?? "—")} · {call.attempts}× · {call.duration_ms}ms</span>
+                </div>)}
+              </div> : null}
               {publishError ? <div className="inline-error">{publishError}</div> : null}
             </section>
           </section>
 
-          {activeTask?.runId && activeNav !== "repositories" ? <RunHistory runId={activeTask.runId} revision={iterations.map(item => item.updated_at + String(item.rolled_back)).join()} onRestored={refreshActiveTask} disabled={testRunning || patchRunning || gitRunning || ["cancelled", "done"].includes(activeTask.status)} /> : null}
+          </> : null}
 
-          <section className="lower-grid">
+          {activeTask?.runId && activeNav !== "repositories" ? <RunHistory runId={activeTask.runId} revision={iterations.map(item => item.updated_at + String(item.rolled_back)).join()} onRestored={refreshActiveTask} disabled={testRunning || patchRunning || gitRunning || Boolean(agentBusyAction) || ["cancelled", "done"].includes(activeTask.status)} /> : null}
+
+          <section className="lower-grid" inert={Boolean(agentBusyAction)}>
             <section className="panel repo-panel"><div className="panel-header"><div><div className="section-kicker">{t("codebasePulse")}</div><h2>{t("repositories")}</h2></div><button className="small-action" onClick={() => void addRepository()}><Plus size={13} /> {t("add")}</button></div>{overviewLoading && !repositories.length ? <div className="repo-empty"><AsyncMessage tone="loading">{t("common.loading")}</AsyncMessage></div> : repositories.length ? repositories.map((repository, index) => <RepoRow key={repository.id} repository={repository} tone={["amber", "cyan", "lime"][index % 3]} t={t} />) : <div className="repo-empty"><GitBranch size={18} /><span>{t("noRepositoryConnected")}</span><button className="text-button" onClick={() => void addRepository()}>{t("addRepository")} <ArrowUpRight size={13} /></button></div>}{repositoryError ? <div className="repo-error">{repositoryError}</div> : null}</section>
-            <section className="panel approval-panel"><div className="panel-header"><div><div className="section-kicker">{t("humanInTheLoop")}</div><h2>{t("needsYourCall")}</h2></div><span className="approval-count">{String(reviewTasks.length).padStart(2, "0")}</span></div>{reviewTasks.length ? reviewTasks.slice(0, 3).map((task) => <div className="approval-item" key={task.id}><div className="approval-icon approval-icon--rose"><ShieldCheck size={16} /></div><div className="approval-copy"><strong>{t("reviewTaskPlan")}</strong><span>{task.id} · {task.title}</span></div><button className="small-action" onClick={() => setActiveTaskId(task.id)}>{t("review")}</button></div>) : <div className="empty-operation"><ShieldCheck size={17} /><span>{t("noApprovalTasks")}</span></div>}</section>
+            <ApprovalPanel compact={activeNav !== "approvals"} revision={agentRevision} disabled={operationBusy} tasks={tasks} onOpenTask={taskId => { setActiveTaskId(taskId); setActiveNav("runs"); }} onOpenCenter={() => setActiveNav("approvals")} onChanged={refreshApprovalTask} onBusyChange={setApprovalRunning} onPendingCount={setApprovalCount} />
           </section>
 
           <footer className="page-footer"><span><span className="footer-mark" /> {t("forgeRunningLocally")}</span><span>{t("lastSynced")}</span></footer>
@@ -1105,6 +1405,15 @@ function TaskRow({ task, active, onClick }: { task: Task; active: boolean; onCli
   const { t } = usePreferences();
   const statusLabel = task.status === "running" ? t("running") : task.status === "review" ? t("review") : task.status === "failed" ? t("failed") : task.status === "done" ? t("done") : task.status === "paused" ? t("paused") : task.status === "cancelled" ? t("cancelled") : t("queued");
   return <button className={`task-row ${active ? "task-row--active" : ""}`} onClick={onClick}><span className={`task-accent task-accent--${task.accent}`} /><span className="task-main"><span className="task-title">{task.title}</span><span className="task-meta"><span>{task.repo}</span><span className="meta-separator">·</span><span>{task.branch}</span></span></span><span className={`task-status task-status--${task.status}`}>{task.status === "running" ? <><span className="pulse-dot" />{statusLabel}</> : statusLabel}</span><span className="task-time">{task.time === "now" ? t("now") : task.time}</span></button>;
+}
+
+function RailSession({ task, active, onClick }: { task: Task; active: boolean; onClick: () => void }) {
+  return (
+    <button className={`chat-session ${active ? "is-active" : ""}`} onClick={onClick} title={task.title}>
+      <span className={`chat-session-dot chat-session-dot--${task.track === "cowork" ? "cowork" : task.status}`} />
+      <span className="chat-session-title">{task.title}</span>
+    </button>
+  );
 }
 
 function RepoRow({ repository, tone, t }: { repository: Repository; tone: string; t: (key: string) => string }) {

@@ -48,6 +48,7 @@ class RepositorySummary(BaseModel):
     name: str
     path: str
     branch: str
+    has_git: bool = True
     head: str | None = None
     last_commit: str | None = None
     changed_files: int = 0
@@ -144,11 +145,23 @@ TaskStatus = Literal[
     "paused",
 ]
 RiskLevel = Literal["low", "medium", "high"]
+AgentMode = Literal["conservative", "standard", "autonomous"]
+TaskTrack = Literal["cowork", "code"]
 
 
 class TaskCreateRequest(BaseModel):
     goal: str = Field(min_length=3, max_length=4_000)
     repository_id: str | None = None
+    mode: AgentMode = "standard"
+    track: TaskTrack = "code"
+
+
+class ChatMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8_000)
+
+
+class ChatMessageResponse(BaseModel):
+    reply: str
 
 
 class PlanStep(BaseModel):
@@ -164,6 +177,19 @@ class TaskPlan(BaseModel):
     objective: str
     repository_summary: str
     steps: list[PlanStep]
+
+
+class TaskBudget(BaseModel):
+    max_iterations: int = Field(default=8, ge=1)
+    max_wall_time_seconds: int = Field(default=3_600, ge=1)
+    max_remote_calls: int = Field(default=50, ge=1)
+    max_consecutive_failures: int = Field(default=3, ge=1)
+    iterations: int = 0
+    elapsed_seconds: float = 0
+    remote_calls: int = 0
+    consecutive_failures: int = 0
+    started_at: datetime | None = None
+    exhausted_reason: Literal["iterations", "wall_time", "remote_calls", "consecutive_failures"] | None = None
 
 
 class TaskSummary(BaseModel):
@@ -186,6 +212,9 @@ class TaskSummary(BaseModel):
     task_branch: str | None = None
     resume_state: TaskStatus | None = None
     requires_recovery: bool = False
+    budget: TaskBudget = Field(default_factory=TaskBudget)
+    mode: AgentMode = "standard"
+    track: TaskTrack = "code"
 
 
 IterationStatus = Literal["coding", "testing", "passed", "failed", "cancelled"]
@@ -304,6 +333,32 @@ class RemoteBranchListResponse(BaseModel):
     total: int
 
 
+RemoteCallOperation = Literal["validate", "push", "create_pr", "refresh_pr"]
+
+
+class RemoteCallRecord(BaseModel):
+    """Observability for one outward provider call: timing, HTTP status, attempts.
+
+    Never stores the token or the full response body — only the status line.
+    """
+
+    id: str = Field(default_factory=lambda: f"rcall-{uuid4().hex[:12]}")
+    task_id: str
+    run_id: str
+    operation: RemoteCallOperation
+    status_code: int | None = None
+    duration_ms: int = 0
+    attempts: int = 1
+    outcome: Literal["ok", "error"] = "ok"
+    error_code: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RemoteCallListResponse(BaseModel):
+    items: list[RemoteCallRecord]
+    total: int
+
+
 class TaskPushRequest(BaseModel):
     remote: str = Field(default="origin", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 
@@ -370,6 +425,7 @@ class TaskPublishStateResponse(BaseModel):
     commits: list[CommitRecord] = Field(default_factory=list)
     remote_branches: list[RemoteBranchRecord] = Field(default_factory=list)
     pull_request: PullRequestRecord | None = None
+    remote_calls: list[RemoteCallRecord] = Field(default_factory=list)
 
 
 ApprovalType = Literal["plan", "write", "push", "pr"]
@@ -401,6 +457,7 @@ class ApprovalSummary(BaseModel):
     expires_at: datetime
     decided_at: datetime | None = None
     decided_by: str | None = None
+    continued_at: datetime | None = None
 
 
 class ApprovalListResponse(BaseModel):
@@ -450,6 +507,7 @@ class CheckpointSummary(BaseModel):
     restored: bool = False
     repository_id: str
     files: list[str]
+    diff: str = ""
     created_at: datetime
 
 
@@ -457,6 +515,17 @@ class PatchApplyResponse(BaseModel):
     patch_id: str
     checkpoint: CheckpointSummary
     applied_files: list[str]
+
+
+class DraftPatchRequest(BaseModel):
+    context_paths: list[str] = Field(default_factory=list, max_length=20)
+    feedback: str | None = Field(default=None, max_length=4_000)
+
+
+class DraftPatchResponse(PatchPreviewResponse):
+    """A model-drafted patch preview: the same shape the manual flow produces, plus the model's rationale."""
+
+    rationale: str = ""
 
 
 class RollbackRequest(BaseModel):
@@ -497,11 +566,64 @@ class TestRunResponse(BaseModel):
     stdout: str
     stderr: str
     output_truncated: bool = False
+    output_pruned: bool = False
     validation_hash: str | None = None
     failed_tests: list[TestFailure] = Field(default_factory=list)
 
 
 TaskIteration.model_rebuild()
+
+
+AgentAction = Literal[
+    "recover",
+    "request_plan_approval",
+    "await_plan_approval",
+    "connect_repository",
+    "create_branch",
+    "start_iteration",
+    "review_patch",
+    "run_tests",
+    "wait_for_tests",
+    "start_repair",
+    "review_commit",
+    "review_push",
+    "review_pr",
+    "await_pr",
+    "completed",
+    "paused",
+    "cancelled",
+    "manual_review",
+]
+
+
+class AgentAdvanceRequest(TestRunRequest):
+    action: Literal["auto", "request_plan_approval", "start_iteration", "start_repair", "run_tests"] = "auto"
+    goal: str | None = Field(default=None, min_length=3, max_length=4_000)
+    feedback: str | None = Field(default=None, max_length=4_000)
+
+
+class AgentLoopRequest(BaseModel):
+    """Kick the autonomous agent loop. `mode` sets the posture on the first start (None keeps the task's current posture on resume); `feedback` steers the next coding/repair iteration."""
+
+    feedback: str | None = Field(default=None, max_length=4_000)
+    mode: AgentMode | None = None
+
+
+class AgentStateResponse(BaseModel):
+    task: TaskSummary
+    action: AgentAction
+    can_advance: bool
+    requires_approval: bool = False
+    approval_type: ApprovalType | None = None
+    message: str
+    iteration: TaskIteration | None = None
+    pending_approval: ApprovalSummary | None = None
+    last_test: TestRunResponse | None = None
+    loop_running: bool = False
+
+
+class AgentAdvanceResponse(AgentStateResponse):
+    performed_action: Literal["noop", "request_plan_approval", "start_iteration", "start_repair", "run_tests"] = "noop"
 
 
 class AuditEvent(BaseModel):
@@ -519,5 +641,3 @@ class AuditEvent(BaseModel):
 class AuditEventListResponse(BaseModel):
     items: list[AuditEvent]
     total: int
-
-

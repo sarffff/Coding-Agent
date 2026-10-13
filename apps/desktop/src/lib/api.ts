@@ -1,5 +1,5 @@
-import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
-export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
+import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
+export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
 
 import { desktopBridge } from "./desktop";
 
@@ -66,10 +66,17 @@ export function getRepositoryTree(repositoryId: string, signal?: AbortSignal): P
   return request<{ items: TreeEntry[]; truncated: boolean }>(`/api/v1/repositories/${repositoryId}/tree?max_depth=6`, { signal });
 }
 
-export function createTask(goal: string, repositoryId?: string): Promise<AgentTask> {
+export function createTask(goal: string, repositoryId?: string, mode?: AgentMode, track?: TaskTrack): Promise<AgentTask> {
   return request<AgentTask>("/api/v1/tasks", {
     method: "POST",
-    body: JSON.stringify({ goal, repository_id: repositoryId }),
+    body: JSON.stringify({ goal, repository_id: repositoryId, mode, track }),
+  });
+}
+
+export function sendCoworkChat(taskId: string, message: string): Promise<{ reply: string }> {
+  return request<{ reply: string }>(`/api/v1/tasks/${taskId}/chat`, {
+    method: "POST",
+    body: JSON.stringify({ message }),
   });
 }
 
@@ -136,6 +143,14 @@ export function listApprovals(taskId: string, signal?: AbortSignal): Promise<{ i
   return request<{ items: Approval[]; total: number }>(`/api/v1/tasks/${taskId}/approvals`, { signal });
 }
 
+export function listAllApprovals(signal?: AbortSignal): Promise<{ items: Approval[]; total: number }> {
+  return request<{ items: Approval[]; total: number }>("/api/v1/approvals", { signal });
+}
+
+export function continueApproval(approvalId: string): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/approvals/${approvalId}/continue`, { method: "POST" });
+}
+
 export function requestApproval(taskId: string, type: Approval["type"], summary: string, scopeHash?: string): Promise<Approval> {
   return request<Approval>(`/api/v1/tasks/${taskId}/approvals`, {
     method: "POST",
@@ -158,6 +173,19 @@ export function getTask(taskId: string, signal?: AbortSignal): Promise<AgentTask
   return request<AgentTask>(`/api/v1/tasks/${taskId}`, { signal });
 }
 
+export function getAgentState(taskId: string, signal?: AbortSignal): Promise<AgentState> {
+  return request<AgentState>(`/api/v1/tasks/${taskId}/agent`, { signal });
+}
+
+export function advanceAgent(taskId: string, payload: AgentAdvanceRequest = {}, idempotencyKey?: string, signal?: AbortSignal): Promise<AgentAdvanceResponse> {
+  return request<AgentAdvanceResponse>(`/api/v1/tasks/${taskId}/agent/advance`, {
+    method: "POST",
+    headers: idempotencyKey ? { "idempotency-key": idempotencyKey } : undefined,
+    body: JSON.stringify(payload),
+    signal,
+  });
+}
+
 export function listRunEvents(runId: string, signal?: AbortSignal): Promise<{ items: AuditEvent[]; total: number }> {
   return request<{ items: AuditEvent[]; total: number }>(`/api/v1/runs/${runId}/events`, { signal });
 }
@@ -174,6 +202,24 @@ export function previewPatch(runId: string, files: PatchFileInput[], confirmDele
     method: "POST",
     body: JSON.stringify({ files, confirm_delete: confirmDelete }),
   });
+}
+
+export function draftPatch(runId: string, body: { context_paths?: string[]; feedback?: string } = {}): Promise<DraftPatch> {
+  return request<DraftPatch>(`/api/v1/runs/${runId}/patches/draft`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function startAgentLoop(runId: string, body: AgentLoopRequest = {}): Promise<AgentState> {
+  return request<AgentState>(`/api/v1/runs/${runId}/loop`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function stopAgentLoop(runId: string): Promise<AgentState> {
+  return request<AgentState>(`/api/v1/runs/${runId}/loop/stop`, { method: "POST" });
 }
 
 export function applyPatch(runId: string, patchId: string, confirm = false): Promise<{ patch_id: string; checkpoint: { id: string; files: string[] }; applied_files: string[] }> {

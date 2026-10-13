@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AsyncMessage } from "@coding-agent/ui";
-import { ChevronDown, ChevronRight, FileCode2, Folder, Search, RefreshCw, Pencil } from "lucide-react";
+import { ChevronDown, ChevronRight, FileCode2, Folder, FolderOpen, Search, RefreshCw, Pencil } from "lucide-react";
 import { getRepositoryContext, getRepositoryTree, readSourceFile, searchRepository, type Repository, type RepositoryContext, type SearchMatch, type SourceFile, type TreeEntry } from "../lib/api";
 import { usePreferences } from "../lib/preferences";
 
@@ -8,12 +8,13 @@ type Props = {
   repositories: Repository[];
   repositoryId: string;
   onRepositoryChange: (id: string) => void;
+  onOpenFolder: () => void;
   onEdit: (file: SourceFile) => void;
   canEdit: boolean;
   initialFile?: { path: string; line: number } | null;
 };
 
-export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChange, onEdit, canEdit, initialFile }: Props) {
+export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChange, onOpenFolder, onEdit, canEdit, initialFile }: Props) {
   const { t } = usePreferences();
   const [entries, setEntries] = useState<TreeEntry[]>([]);
   const [context, setContext] = useState<RepositoryContext | null>(null);
@@ -32,6 +33,7 @@ export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChan
   const fileRequest = useRef<AbortController | null>(null);
   const searchRequest = useRef<AbortController | null>(null);
   const source = useRef<HTMLPreElement>(null);
+  const repository = repositories.find(item => item.id === repositoryId);
 
   useEffect(() => {
     fileRequest.current?.abort();
@@ -90,10 +92,10 @@ export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChan
   });
 
   return <section className="repository-workspace" aria-label={t("browser.title")}>
-    <div className="workspace-heading"><div><div className="section-kicker">SOURCE / EXPLORER</div><h1>{t("browser.title")}</h1><p>{t("browser.subtitle")}</p></div>
-      <div className="workspace-controls"><label><span className="sr-only">{t("browser.repository")}</span><select value={repositoryId} onChange={event => onRepositoryChange(event.target.value)}>{!repositories.length ? <option value="">{t("noRepository")}</option> : repositories.map(repository => <option value={repository.id} key={repository.id}>{repository.name} · {repository.branch}</option>)}</select></label><button className="icon-button" title={t("common.refresh")} aria-label={t("common.refresh")} disabled={loading || !repositoryId} onClick={() => setRevision(value => value + 1)}><RefreshCw size={16} /></button></div>
+    <div className="workspace-heading"><div><div className="section-kicker">SOURCE / EXPLORER</div><h1>{t("browser.title")}</h1><p>{repository?.path ?? t("browser.subtitle")}</p></div>
+      <div className="workspace-controls"><button className="small-action" onClick={onOpenFolder}><FolderOpen size={14} /> {t("chat.importFolder")}</button><label><span className="sr-only">{t("browser.repository")}</span><select value={repositoryId} onChange={event => onRepositoryChange(event.target.value)}>{!repositoryId ? <option value="">{t("chat.needRepository")}</option> : null}{repositories.map(item => <option value={item.id} key={item.id}>{item.name}{item.has_git ? ` · ${item.branch}` : ""}</option>)}</select></label><button className="icon-button" title={t("common.refresh")} aria-label={t("common.refresh")} disabled={loading || !repositoryId} onClick={() => setRevision(value => value + 1)}><RefreshCw size={16} /></button></div>
     </div>
-    {!repositories.length ? <div className="panel browser-empty">{t("browser.empty")}</div> : <>
+    {!repositoryId ? <div className="panel browser-empty">{t("browser.empty")}</div> : <>
       <form className="browser-search" onSubmit={event => { event.preventDefault(); void search(); }}><Search size={16} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder={t("browser.query")} aria-label={t("browser.query")} /><input className="glob-input" value={glob} onChange={event => setGlob(event.target.value)} placeholder={t("browser.glob")} aria-label={t("browser.glob")} /><button className="small-action" disabled={!query.trim() || searching}>{searching ? t("common.loading") : t("browser.search")}</button></form>
       {error ? <AsyncMessage tone="error" onRetry={() => setRevision(value => value + 1)} retryLabel={t("common.retry")}>{error}</AsyncMessage> : null}
       {context ? <div className="repository-context"><div><span>{t("browser.context")}</span><strong>{Object.keys(context.languages).join(" · ") || t("common.none")}</strong><small>{context.file_count} {t("files")} · {context.package_manager || t("common.none")}</small></div><div><span>{t("browser.entries")}</span>{context.entry_files.slice(0, 4).map(name => <button className="path-link" key={name} onClick={() => void openFile(name)}>{name}</button>)}</div><div><span>{t("browser.tests")}</span><small>{context.test_directories.join(", ") || t("common.none")}</small><span>{t("browser.config")}</span><small>{context.config_files.slice(0, 4).join(", ") || t("common.none")}</small></div></div> : null}

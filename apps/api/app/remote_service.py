@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from typing import TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -16,15 +19,18 @@ from .models import (
     PullRequestPreviewResponse,
     PullRequestRecord,
     RemoteBranchRecord,
+    RemoteCallRecord,
     RemoteTargetResponse,
     TaskPublishStateResponse,
     TaskSummary,
 )
 from .process_env import child_env
-from .remote_provider import FakeRemoteProvider, GitHubRemoteProvider, REMOTE_NAME_RE, RemoteProvider
+from .remote_provider import _CAPTURE, FakeRemoteProvider, GitHubRemoteProvider, REMOTE_NAME_RE, RemoteProvider
 from .repository_service import RepositoryError, RepositoryService
 from .store import StateStore
 from .task_service import TaskService
+
+T = TypeVar("T")
 
 
 class RemoteService:
@@ -58,6 +64,7 @@ class RemoteService:
         self._commits: dict[str, CommitRecord] = {}
         self._remote_branches: dict[str, RemoteBranchRecord] = {}
         self._pull_requests: dict[str, PullRequestRecord] = {}
+        self._remote_calls: dict[str, RemoteCallRecord] = {}
         self._keys: dict[str, str] = {}
         for key, record in store.models("commits", CommitRecord):
             self._commits[record.id] = record
@@ -68,6 +75,9 @@ class RemoteService:
         for key, record in store.models("pull_requests", PullRequestRecord):
             self._pull_requests[record.id] = record
             self._keys[f"pull_requests:{record.id}"] = key
+        for key, record in store.models("remote_calls", RemoteCallRecord):
+            self._remote_calls[record.id] = record
+            self._keys[f"remote_calls:{record.id}"] = key
 
     def _put(self, scope: str, record_id: str, record: BaseModel, updated_at: datetime) -> None:
         key = self._keys.setdefault(f"{scope}:{record_id}", self.store.next_key(scope))
@@ -84,6 +94,47 @@ class RemoteService:
     def _persist_pull_request(self, record: PullRequestRecord) -> None:
         self._pull_requests[record.id] = record
         self._put("pull_requests", record.id, record, record.updated_at)
+
+    async def _call(self, task_id: str, run_id: str, operation: str, call: Callable[[], Awaitable[T]]) -> T:
+        """Run one provider call and persist its timing, HTTP status and attempts.
+
+        Captured statuses come from the provider via a ContextVar sink; the token
+        and response body never enter the record. ponytail: records grow with the
+        other remote tables (commits/PRs) and share their accepted unbounded
+        retention until the P1 retention policy covers them.
+        """
+        self.tasks.consume_remote_call(task_id)
+        token = _CAPTURE.set([])
+        started = time.perf_counter()
+        outcome, error_code = "ok", None
+        try:
+            return await call()
+        except RepositoryError as exc:
+            outcome, error_code = "error", exc.code
+            raise
+        except Exception:
+            outcome, error_code = "error", "INTERNAL_ERROR"
+            raise
+        finally:
+            captured = _CAPTURE.get() or []
+            _CAPTURE.reset(token)
+            record = RemoteCallRecord(
+                task_id=task_id,
+                run_id=run_id,
+                operation=operation,
+                status_code=next((status for status in reversed(captured) if status is not None), None),
+                duration_ms=round((time.perf_counter() - started) * 1000),
+                attempts=max(1, len(captured)),
+                outcome=outcome,
+                error_code=error_code,
+            )
+            self._remote_calls[record.id] = record
+            self._put("remote_calls", record.id, record, record.created_at)
+            self.tasks.record_remote_result(task_id, outcome == "ok")
+
+    def list_remote_calls(self, task_id: str) -> list[RemoteCallRecord]:
+        records = [record for record in self._remote_calls.values() if record.task_id == task_id]
+        return sorted(records, key=lambda record: record.created_at)
 
     def record_commit(
         self,
@@ -135,6 +186,7 @@ class RemoteService:
             commits=self.list_commits(task_id),
             remote_branches=self.list_remote_branches(task_id),
             pull_request=self.get_pull_request(task_id),
+            remote_calls=self.list_remote_calls(task_id),
         )
 
     def peek_remote_url(self, repository_id: str | None, remote_name: str = "origin") -> str | None:
@@ -149,6 +201,8 @@ class RemoteService:
         if not REMOTE_NAME_RE.fullmatch(remote_name):
             raise RepositoryError("INVALID_REMOTE_NAME", "Choose a valid Git remote name.")
         repository = self.repositories.get(repository_id)
+        if not repository.has_git:
+            raise RepositoryError("GIT_NOT_AVAILABLE", "Remote operations require an opened Git repository with an initial commit.")
         result = subprocess.run(
             ["git", "remote", "get-url", remote_name],
             cwd=str(repository.path),
@@ -168,7 +222,7 @@ class RemoteService:
         task = self.tasks.get(task_id)
         repository_id = self._require_repository(task)
         remote_url = self.get_remote_url(repository_id, remote_name)
-        info = await self.provider.validate_repository(remote_url)
+        info = await self._call(task.id, task.run_id, "validate", lambda: self.provider.validate_repository(remote_url))
         return RemoteTargetResponse(
             provider=self.settings.remote_provider,
             remote_url=remote_url,
@@ -202,7 +256,7 @@ class RemoteService:
 
         remote_url = self.get_remote_url(repository_id, remote_name)
         self.provider.validate_remote_url(remote_url)
-        pushed_sha = await self.provider.push_task_branch(self.repositories.get(repository_id).path, remote_url, branch, remote=remote_name)
+        pushed_sha = await self._call(task.id, task.run_id, "push", lambda: self.provider.push_task_branch(self.repositories.get(repository_id).path, remote_url, branch, remote=remote_name))
 
         record = RemoteBranchRecord(
             id=f"rbranch-{uuid4().hex[:12]}",
@@ -281,20 +335,20 @@ class RemoteService:
             raise RepositoryError("BRANCH_NOT_PUSHED", "Push the task branch before creating a Pull Request.")
         remote_url = pushed[-1].remote_url
 
-        await self.provider.validate_repository(remote_url)
-        if not await self.provider.check_branch_exists(remote_url, branch):
+        await self._call(task.id, task.run_id, "validate", lambda: self.provider.validate_repository(remote_url))
+        if not await self._call(task.id, task.run_id, "validate", lambda: self.provider.check_branch_exists(remote_url, branch)):
             raise RepositoryError("REMOTE_SOURCE_BRANCH_MISSING", f"'{branch}' is no longer present on the remote.")
-        if not await self.provider.check_branch_exists(remote_url, payload.target_branch):
+        if not await self._call(task.id, task.run_id, "validate", lambda: self.provider.check_branch_exists(remote_url, payload.target_branch)):
             raise RepositoryError("REMOTE_TARGET_BRANCH_MISSING", f"Target branch '{payload.target_branch}' is not present on the remote.")
 
-        pr_data = await self.provider.create_pull_request(
+        pr_data = await self._call(task.id, task.run_id, "create_pr", lambda: self.provider.create_pull_request(
             remote_url=remote_url,
             source_branch=branch,
             target_branch=payload.target_branch,
             title=payload.title,
             body=payload.body,
             draft=payload.draft,
-        )
+        ))
         now = datetime.now(timezone.utc)
         record = PullRequestRecord(
             id=f"pr-{uuid4().hex[:12]}",
@@ -333,16 +387,24 @@ class RemoteService:
         pushed = [item for item in self.list_remote_branches(task_id) if item.branch == record.source_branch]
         if not pushed:
             raise RepositoryError("BRANCH_NOT_PUSHED", "No push record to reconcile this Pull Request against.")
-        remote = await self.provider.get_pull_request(pushed[-1].remote_url, record.number)
+        remote = await self._call(record.task_id, record.run_id, "refresh_pr", lambda: self.provider.get_pull_request(pushed[-1].remote_url, record.number))
         if remote is None:
             record.state = "closed"
         else:
-            record.state = "draft" if remote.draft else remote.state
+            if remote.merged or remote.state == "merged":
+                record.state = "merged"
+            elif remote.state == "closed":
+                record.state = "closed"
+            else:
+                record.state = "draft" if remote.draft else remote.state
+            record.draft = remote.draft
             record.title = remote.title
             record.body = remote.body
             record.target_branch = remote.target_branch
         record.updated_at = datetime.now(timezone.utc)
         self._persist_pull_request(record)
+        if record.state == "merged" and self.tasks.get(task_id).status == "pr_created":
+            self.tasks.transition(task_id, "completed", next_action=f"Pull Request #{record.number} was merged.")
         return record
 
     def _require_repository(self, task: TaskSummary) -> str:

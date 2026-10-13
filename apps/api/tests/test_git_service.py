@@ -6,6 +6,26 @@ from app.repository_service import RepositoryError
 from conftest import git_output
 
 
+def test_local_validation_tracks_content_and_deletion(demo_repository, git_services):
+    repositories, service, _ = git_services
+    folder = demo_repository.parent / "local"
+    folder.mkdir()
+    source = folder / "app.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    opened = repositories.register(str(folder))
+    original = service.validation_hash(opened.id, ["app.py"])
+    source.write_text("value = 2\n", encoding="utf-8")
+    changed = service.validation_hash(opened.id, ["app.py"])
+    source.unlink()
+    deleted = service.validation_hash(opened.id, ["app.py"])
+    assert len({original, changed, deleted}) == 3
+    assert deleted == service.validation_hash(opened.id, ["app.py"])
+    for invalid in ("../demo/app.py", ".env"):
+        with pytest.raises(RepositoryError):
+            service.validation_hash(opened.id, [invalid])
+    assert not (folder / ".git").exists()
+
+
 def test_commit_matches_preview_and_preserves_other_staging(demo_repository, git_services):
     _, service, repository_id = git_services
     service.create_task_branch(repository_id, "codex/scoped-commit")

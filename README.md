@@ -1,6 +1,6 @@
 # Coding Agent (Forge)
 
-企业级 Coding / DevOps Agent 的 Monorepo：本地可运行、可审计、可恢复的研发闭环工作台。
+本地 Coding Agent 的 Monorepo：以文件夹为入口，支持可审计、可恢复的修改与验证，Git 发布为可选能力。
 
 ## 目录
 
@@ -62,6 +62,9 @@ pnpm dev            # 只启动 Desktop：http://127.0.0.1:5173
 | `FORGE_ALLOWED_REPOSITORIES` | 同上 | `owner/repo` 白名单（JSON 数组），为空表示不额外限制 | `[]` |
 | `FORGE_REMOTE_TIMEOUT_SECONDS` | 同上 | 远程 REST 调用与推送超时 | 30 |
 | `FORGE_IDEMPOTENCY_TTL_HOURS` | 同上 | `Idempotency-Key` 记录保留时长 | 24 |
+| `FORGE_LLM_PROVIDER` | 同上 | 补丁起草 Provider：`anthropic` / `openai` / 离线 `fake`（仅测试，需显式 seed） | `anthropic` |
+| `FORGE_ANTHROPIC_API_KEY` / `FORGE_OPENAI_API_KEY` | 同上 | 对应 Provider 的 API key，用于补丁起草；只进请求头 | 空 |
+| `FORGE_LLM_MODEL` | 同上 | 起草模型，须与 provider 匹配（anthropic 可设 `claude-opus-5-5`，openai 设 gpt 模型；其余 `FORGE_LLM_*`/`FORGE_OPENAI_API_URL` 见 `.env.example`） | `claude-sonnet-5-5` |
 | `FORGE_CORS_ORIGINS` | 同上 | 允许访问 API 的源 | `http://localhost:5173`、`http://127.0.0.1:5173` |
 | `VITE_API_BASE_URL` | `apps/desktop/.env` | Desktop 连接的 API 地址 | `http://127.0.0.1:8000` |
 
@@ -99,7 +102,15 @@ pnpm desktop:electron:smoke  # 隐藏窗口自检：DOM 已挂载、桥可用、
 > `icacls "node_modules\.pnpm\electron@<版本>\node_modules\electron\dist" /grant *S-1-15-2-1:(OI)(CI)(RX)`
 > 或者把仓库放在正常 ACL 路径下。当前分支的桌面壳就是在受限工作区里完成实现的，窗口层尚未真机验证。
 
-## 演示流程
+## 打开文件夹
+
+从侧栏或输入框旁点击「打开本地文件夹」：Electron 直接弹出系统目录选择器，选中后打开并进入 Code 新会话；浏览器显示绝对路径输入框。已打开的文件夹在侧栏独立分组，即使还没有任务也能新建对话；输入框旁的「项目或文件夹」菜单可切换已有目录，并查看完整路径。目录需位于配置的 `FORGE_WORKSPACE_ROOT` 内，打开失败会保留所选路径，桌面端可展开「工作区设置」更换根目录。
+
+普通文件夹不需要 `git init`：可以浏览与搜索文件、运行 Code 的 AI 修改与测试、从检查点回滚。打开后进入 Code 新会话，界面显示实际路径和「浏览文件」入口；验证通过后进入本地结果审阅，不创建分支、提交或 PR。每个检查点保存可展开查看的修改差异，重启后仍可审阅；本地任务验证通过后继续提问，会在同一目录创建新任务，保留旧任务的检查点。
+
+文件操作始终限定在选中的目录。选中 Git 仓库的子目录不会自动扩大到父仓库；只有直接打开已有初始提交的 Git 根目录才启用分支、提交与发布功能。尚无提交的 Git 目录先按普通文件夹使用，建立初始提交后重新打开即可启用 Git 功能。
+
+## Git 演示流程
 
 ```bash
 pnpm demo:init                        # 默认生成 .forge/demo/phase-1
@@ -110,7 +121,7 @@ python scripts/create_demo.py --name my-demo   # 需要其它名字时
 
 在 Desktop 中按顺序执行：
 
-1. 侧栏「添加 Git 仓库」→ 填入 `.forge/demo/phase-1` 的绝对路径。
+1. 「打开文件夹」→ 填入 `.forge/demo/phase-1` 的绝对路径。
 2. 「仓库」视图确认文件树、搜索、符号列表和仓库摘要（语言、入口、测试目录、配置文件、包管理器）。
 3. 输入任务目标并运行 → 检查三步计划 → 请求并批准方案审批。
 4. 创建任务分支（工作区必须干净）。
@@ -123,6 +134,28 @@ python scripts/create_demo.py --name my-demo   # 需要其它名字时
 
 命令行等价流程见 `docs/phase-1-todolist.md` 的「推荐接口顺序」。
 
+## 本地 Agent 编排
+
+运行视图的「Agent 下一步」面板根据任务、当前轮次、审批与验证结果决定下一步。点击「推进下一步」每次执行一个动作：发起计划审批、开始编码轮次、运行验证或根据真实测试失败开始修复轮次。计划审批、任务分支、Patch 预览/应用和受控发布继续使用现有面板。
+
+- `GET /api/v1/tasks/{task_id}/agent`：查询 `action`、`can_advance`、`message`，以及当前任务、轮次、待审批记录和最近测试结果。
+- `POST /api/v1/tasks/{task_id}/agent/advance`：以 `{}` 推进当前可执行动作；也可指定 `action` 为 `request_plan_approval`、`start_iteration`、`start_repair` 或 `run_tests`。动作已经变化时返回 `409 AGENT_ACTION_NOT_AVAILABLE`，应先刷新状态。
+- 测试参数复用原接口：`kind`、`target`、`timeout_seconds`；可传 `goal` 指定编码轮次目标、`feedback` 指定修复说明。未传修复说明时使用原任务目标和最近失败信息。
+- 推进接口返回新的 Agent 状态与 `performed_action`。等待人工操作、运行中的测试、暂停、取消和重启待恢复状态下，自动推进返回 `noop`。
+- 支持 `Idempotency-Key`：重试同一次请求时保持同一键和请求体，下一次推进使用新键；成功响应以 HTTP 200 回放。每次实际推进记录 `agent.advance` 审计事件。
+
+典型顺序为：请求计划审批 → 人工批准并创建任务分支 → 开始轮次 → 人工准备、预览并应用 Patch → 运行测试 → 失败时开始修复轮次，或通过后进入提交审阅。静态检查单独通过不能满足提交门禁；文件变更导致验证过期时会要求重新测试。命令不可用、环境阻塞和超时会交给人工处理。
+
+PR 刷新会识别明确的合并结果并完成任务；关闭但未确认合并的 PR 留待人工复核。
+
+Code 聊天还可启动后台循环（`POST /api/v1/runs/{run_id}/loop`），停止接口为同一路径的 `/stop`。计划仍由规则生成；模型起草会带入显式文件路径、最近失败文件、已改文件，以及有限搜索和入口/测试文件的完整内容，受文件数和字节预算约束。修复轮次保留最近失败测试的摘要与输出。
+
+- **保守**：人工批准计划后，在每轮补丁前停下；通过「审阅补丁」进入运行面板，AI 起草或手填补丁、预览 diff、确认应用。Git 提交、推送和 PR 也需人工批准。
+- **标准**：自动完成计划、补丁、测试及 Git 提交；推送与 PR 等待人工批准。普通文件夹在本地验证通过后停止，保留审阅和回滚入口。
+- **自治**：在已启用 Git 的目录中，还可自动推送和创建 Draft PR；普通文件夹仍只执行本地流程。
+
+模型输出统一经过补丁保护路径、大小和检查点门禁。模型只能修改或删除已提供完整上下文的文件，服务端绑定读取时的内容哈希；等待模型期间的外部修改会触发冲突，保留用户的新内容。停止会取消正在等待的模型请求，并在写盘前再次检查停止标记。模型起草、Cowork 对话、GitHub 校验/推送/PR/刷新共享任务调用预算；成功模型或远程调用不会清除连续失败记录，只有测试通过才清零。Cowork 仍是附带可选目录摘要的聊天，不执行文件修改或命令。
+
 ## 验证
 
 ```bash
@@ -131,6 +164,7 @@ pnpm api:init     # 创建/查看本地状态存储，并打印已保存的记�
 pnpm check        # Desktop 类型检查
 pnpm build        # Desktop 生产构建
 pnpm desktop:smoke # 校验构建产物完整性与关键样式/DOM 字符串（不是交互回放）
+pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅与发布入口（不是浏览器点击）
 ```
 
 ## 故障排查
@@ -148,6 +182,7 @@ pnpm desktop:smoke # 校验构建产物完整性与关键样式/DOM 字符串（
 - **`NO_APPROVED_COMMIT` / `REMOTE_HEAD_MOVED` / `TASK_BRANCH_NOT_CHECKED_OUT`（409）**：推送绑定的是「已审批的那个提交」。工作区切走了分支或 HEAD 变了，就重新预览并提交，绝不会把别人的提交推上去。
 - **`BRANCH_NOT_PUSHED`（409）/ `REMOTE_SOURCE_BRANCH_MISSING` / `REMOTE_TARGET_BRANCH_MISSING`**：创建 PR 前必须已推送任务分支，且源/目标分支在远端仍然存在。
 - **`IDEMPOTENCY_KEY_REUSED`（409）**：同一个 `Idempotency-Key` 被用于不同端点或不同请求体。换一个键；同键同体重发会直接返回首次结果，不会二次推送或二次建 PR。
+- **`AGENT_ACTION_NOT_AVAILABLE`（409）**：请求的 Agent 动作与当前任务下一步不匹配，刷新 Agent 状态后继续。
 - **`IDEMPOTENCY_IN_PROGRESS`（409）**：同键的另一个请求仍在执行中。
 - **`PATCH_TOO_LARGE` / `PROTECTED_PATH` / `BINARY_FILE_NOT_ALLOWED`**：受 Phase 1 安全限制约束，缩小改动范围或排除受保护路径（`.env`、私钥、凭据文件、`.git`、依赖与构建目录）。
 
@@ -156,13 +191,13 @@ pnpm desktop:smoke # 校验构建产物完整性与关键样式/DOM 字符串（
 Phase 1（单仓库理解 → 计划 → 低风险修改 → 测试 → 审计 → 回滚）已完成并在浏览器与 API 两端验证。
 Phase 2 的本地部分与远程代码路径均已完成：多轮编码、验证循环、审批门禁、任务分支、提交、推送、GitHub Provider 与 Draft PR、幂等键、持久化与恢复。
 
-- 状态保存在本地 sqlite（默认 `.forge/state`，含检查点文件与提交/远程分支/PR 记录）；API 重启后未完成任务必须显式确认才继续写入。审计与测试输出仍无保留期限。
-- 远程段已接通并带完整门禁，但**尚未对真实 GitHub 验证过**：测试与演示走 `FORGE_REMOTE_PROVIDER=fake`，真实令牌与演示仓库仍缺（见 `docs/todo.md` 的 P0）。
-- 幂等键只覆盖有外部副作用的写端点（推送、创建 PR）；分支创建与提交由 `scope_hash` + 预览确认防重。
-- 没有预算熔断：不限制最大轮次、总耗时与远程调用次数，连续失败不会自动转人工。
-- 计划由规则/模板生成，尚未接入 LangGraph 等真实推理编排；无沙箱容器，命令在主机上以受控白名单方式执行。
-- Desktop 的 `pnpm desktop:smoke` 只校验构建产物，交互流程仍靠浏览器人工走查；侧栏「Agent 技能 / 安全策略 / 设置」尚无行为；审批中心（拒绝/要求修改/过期列表）未实现。
+- 状态保存在本地 sqlite（默认 `.forge/state`，含检查点文件与提交/远程分支/PR 记录）；API 重启后未完成任务必须显式确认才继续写入。审计与测试输出有保留期限与上限（`FORGE_AUDIT_*` / `FORGE_TEST_OUTPUT_*`）。
+- 远程段已接通并带完整门禁，但**尚未对真实 GitHub 验证过**：测试与演示走 `FORGE_REMOTE_PROVIDER=fake`，真实令牌与演示仓库仍缺（见 `docs/todo.md` 的 P1）。
+- 幂等键覆盖 Agent 推进、推送和创建 PR；提交仍需审批与预览确认。
+- 任务预算熔断已接入：最大轮次、总耗时、远程调用次数、连续失败阈值（`FORGE_TASK_MAX_*`），任一触顶即锁定并转人工复核。
+- 已有本地 Agent 单步编排和后台循环；计划由规则/模板生成，模型通过 Anthropic 或 OpenAI 兼容接口起草。实际写入权限取决于上述模式。无沙箱容器，命令在主机上以受控白名单方式执行。
+- 审批中心的拒绝、要求修改、过期列表与预算视图已接入。产物冒烟与组件渲染检查不能替代浏览器交互；设置等扩展入口仍未完成。
 - 桌面壳（Electron）已接入并与浏览器路径并存：壳托管本地 API、状态落在 `userData`、原生目录选择器。窗口层在本受限工作区未真机验证（Windows ACL，见上面的前置条件）；没有打包分发配置，`apps/api` 仍以源码方式运行。
-- 单一工作区根目录、单仓库任务；多仓库、CI 交互、Review 评论、冲突处理与自动合并属于后续阶段。
+- 单一工作区根目录、单文件夹任务；Git 子目录保留所选范围并使用本地流程。多仓库、CI 交互、Review 评论、冲突处理与自动合并属于后续阶段。
 
 各阶段勾选与验收口径以 `docs/phase-1-todolist.md`、`docs/phase-2-todolist.md` 为准；Phase 3（CI 交互、自动修复、冲突处理与治理）的范围见 `docs/phase-3-todolist.md`，其第 0 节列出了开工前必须先收口的 Phase 2 遗留项。

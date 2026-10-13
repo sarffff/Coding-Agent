@@ -15,6 +15,7 @@
     "desktop:electron:smoke": "node scripts/electron.js smoke",
     "check": "pnpm --filter @coding-agent/desktop typecheck",
     "desktop:smoke": "node scripts/desktop_smoke.js",
+    "desktop:chat-check": "node scripts/desktop_chat_check.mjs",
     "demo:init": "node scripts/py.js scripts/create_demo.py"
   }
 }

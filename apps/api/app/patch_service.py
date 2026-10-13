@@ -210,6 +210,7 @@ class PatchService:
                 raise RepositoryError("PATCH_CONFLICT", f"File changed after preview: {relative_path}")
         checkpoint = self._create_checkpoint(repository, patch.files)
         checkpoint.summary.run_id = patch.run_id
+        checkpoint.summary.diff = patch.diff
         checkpoint.applied_hashes = {item.path: self._content_hash(None if item.operation == "delete" else item.content) for item in patch.files}
         self._persist(checkpoint)
         try:

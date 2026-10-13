@@ -34,8 +34,8 @@ assert(cssContent.includes("plan-step-copy"), "CSS 缺少 plan-step-copy 样式�
 assert(cssContent.includes("async-message"), "CSS 缺少 async-message 状态样式");
 assert(cssContent.includes("focus-visible"), "CSS 缺少 focus-visible 焦点环");
 
-// 4. 校验 JS 产物包含关键核心交互逻辑
+// 4. 校验 JS 产物包含关键核心交互逻辑(Cowork/Code 工作区分栏文案)
 const jsContent = fs.readFileSync(path.join(assetsDir, jsBundle), "utf-8");
-assert(jsContent.includes("FORGE"), "JS 缺少应用品牌与核心文本");
+assert(jsContent.includes("Cowork") && jsContent.includes("Code"), "JS 缺少应用核心文本");
 
 console.log("[Smoke Test] Desktop 核心冒烟测试通过！构建产物健康且完整。");
