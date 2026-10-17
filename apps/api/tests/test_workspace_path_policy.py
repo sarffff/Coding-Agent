@@ -48,6 +48,7 @@ def test_outside_workspace_reports_the_resolved_path_and_root(tmp_path, demo_rep
     rejected = service.validate(str(tmp_path))
     assert rejected.valid is False
     assert rejected.reason
+    assert rejected.reason_code == "PATH_OUTSIDE_WORKSPACE"
 
 
 def test_narrowing_the_workspace_root_locks_out_existing_repositories(tmp_path, demo_repository):

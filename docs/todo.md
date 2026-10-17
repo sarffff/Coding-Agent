@@ -20,8 +20,9 @@
 - [x] 补充普通目录、Git 子目录、空 Git、停止、上下文、预算和保守模式回归，以及真实 React 组件渲染检查 `pnpm desktop:chat-check`。
 - [x] API 全量回归：109 passed、1 skipped（主机不能创建测试符号链接）；后续检查点差异持久化专项 10 passed，模型并发保护、编码循环与模式专项 26 passed（专项与全量有重叠，不累加）。
 - [x] `pnpm build`（包含 TypeScript 检查）、`pnpm desktop:chat-check`、`pnpm desktop:smoke` 通过。
+- [x] 桌面壳的非窗口两层钉住：`pnpm desktop:backend-test`（4 项，真起 uvicorn 子进程）验证根目录/状态目录注入、CORS 白名单、端口记忆与释放、三类启动失败分别报告；`pnpm desktop:unit`（10 项）覆盖原生选择器的 Windows 路径事实与 `forge-app://desktop` 的 dist 穿越防护。
 - [ ] 浏览器完整点击验收：本轮打开本地验收页面被自动审批服务 503 阻断，未执行；组件检查不能替代点击回放。
-- [ ] 正常 Windows 环境下的 Electron 原生目录选择、窗口、工作区切换验收。
+- [x] 正常 Windows 环境下的 Electron 原生目录选择、窗口、工作区切换验收。已通过给 electron/dist 授予 *S-1-15-2-1 (ALL APPLICATION PACKAGES) 权限并在 scripts/electron.js 中自动处理 Windows Sandbox ACL，desktop:electron:smoke 烟雾测试已全通（pass: true, mounted: 469, bridge: true, health: true）。
 
 ## 后续优先级
 

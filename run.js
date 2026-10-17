@@ -2,9 +2,10 @@
  * 前后端一键启动脚本
  *
  * 用法:
- *   node run.js            - 同时启动前后端
+ *   node run.js            - 同时启动前后端（Web 浏览器版）
  *   node run.js backend    - 只启动后端
  *   node run.js frontend   - 只启动前端
+ *   node run.js electron   - 启动 Electron 桌面版（开发模式）
  */
 
 const { spawn } = require("child_process");
@@ -169,13 +170,26 @@ async function main() {
     const processes = [];
 
     try {
-        if (!["all", "backend", "frontend"].includes(mode)) {
+        if (!["all", "backend", "frontend", "electron", "desktop"].includes(mode)) {
             log(
                 "系统",
-                `未知模式 "${mode}"，可用：all（默认）/ backend / frontend，选项 --no-migrate`,
+                `未知模式 "${mode}"，可用：all（默认）/ backend / frontend / electron，选项 --no-migrate`,
                 colors.red,
             );
             process.exit(1);
+        }
+
+        if (mode === "electron" || mode === "desktop") {
+            log("系统", "正在启动 Electron 桌面应用（开发模式）...", colors.cyan);
+            const electronProc = spawn(process.execPath, [path.join(__dirname, "scripts", "electron.js"), "dev"], {
+                cwd: __dirname,
+                stdio: "inherit",
+            });
+            processes.push(electronProc);
+            electronProc.on("close", (code) => {
+                process.exit(code ?? 0);
+            });
+            return;
         }
 
         // 启动后端

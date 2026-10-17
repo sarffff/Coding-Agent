@@ -30,6 +30,7 @@ export type RepositoryValidation = {
   path: string;
   git_root: string | null;
   reason: string | null;
+  reason_code: string | null;
 };
 
 export type TreeEntry = {

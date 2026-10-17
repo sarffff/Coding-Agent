@@ -156,7 +156,7 @@ try {
   assert.deepEqual(canceledFolder.saved.registered, [], "Canceling the chooser must not register a folder");
   assert.equal(canceledFolder.saved.selectedRepositoryId, "previous-folder");
   assert.equal(canceledFolder.saved.chatComposingNew, false);
-  assert.equal(canceledFolder.saved.repositoryDialogOpen, false);
+  assert.equal(canceledFolder.saved.repositoryDialogOpen, true, "Canceling the native chooser must open workspace settings");
   assert.equal(canceledFolder.saved.repositorySaving, false);
 
   const browserFolder = checkFolderCallbacks({ desktop: false });
@@ -174,6 +174,49 @@ try {
   assert.equal(rejectedFolder.saved.repositoryError, "Outside the workspace");
   assert.equal(rejectedFolder.saved.repositoryDialogOpen, true);
   assert.equal(rejectedFolder.saved.chatComposingNew, false);
+
+  const workspaceHandlers = code.slice(code.indexOf("const changeWorkspaceRoot ="), code.indexOf("const executeTests ="));
+  const stopLoopName = workspaceHandlers.match(/([\w$]+)\.stopAgentLoop/)[1];
+  const checkWorkspace = ({ canceled = false, error = "" } = {}) => {
+    const saved = { selectedRepositoryId: "old-folder", sourceLocation: { path: "a.py", line: 1 },
+      desktopRuntime: { workspaceRoot: "D:/old" }, repositoryError: null, repositorySaving: false,
+      loaded: 0, stopped: [], activeNav: "runs", chatComposingNew: false, activeTaskId: "old-task",
+      loopRunning: true, runEvents: ["old"], chatPending: {}, chatBudget: {}, chatAction: "working", chatError: "old" };
+    const context = {
+      desktopBridge: {
+        pickWorkspaceRoot: async () => canceled ? { canceled: true } : { canceled: false, workspaceRoot: "D:/new", error },
+      },
+      [stopLoopName]: { stopAgentLoop: async runId => saved.stopped.push(runId) },
+      activeTask: { runId: "run-1" },
+      loadOverviewData: async () => { saved.loaded += 1; },
+      t: key => key, Error,
+    };
+    for (const key of Object.keys(saved).filter(key => !["loaded", "stopped"].includes(key))) {
+      context[`set${key[0].toUpperCase()}${key.slice(1)}`] = value => {
+        saved[key] = typeof value === "function" ? value(saved[key]) : value;
+      };
+    }
+    const callbacks = runInNewContext(`${newSession}\n${workspaceHandlers}; ({ changeWorkspaceRoot });`, context);
+    return { ...callbacks, saved };
+  };
+  const switched = checkWorkspace();
+  await switched.changeWorkspaceRoot();
+  assert.equal(switched.saved.desktopRuntime.workspaceRoot, "D:/new");
+  assert.deepEqual(switched.saved.stopped, ["run-1"]);
+  assert.equal(switched.saved.selectedRepositoryId, "");
+  assert.equal(switched.saved.sourceLocation, null);
+  assert.equal(switched.saved.chatComposingNew, true);
+  assert.equal(switched.saved.activeTaskId, "");
+  assert.equal(switched.saved.loaded, 1);
+  assert.equal(switched.saved.repositorySaving, false);
+  const canceledWorkspace = checkWorkspace({ canceled: true });
+  await canceledWorkspace.changeWorkspaceRoot();
+  assert.equal(canceledWorkspace.saved.loaded, 0);
+  assert.equal(canceledWorkspace.saved.selectedRepositoryId, "old-folder");
+  const failedWorkspace = checkWorkspace({ error: "backend down" });
+  await failedWorkspace.changeWorkspaceRoot();
+  assert.equal(failedWorkspace.saved.repositoryError, "backend down");
+  assert.equal(failedWorkspace.saved.loaded, 0);
 
   const checkCallbacks = (hasGit) => {
     const original = { id: "old-task", runId: "old-run", repositoryId: "original-folder",

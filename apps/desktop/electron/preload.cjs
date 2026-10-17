@@ -8,7 +8,7 @@ contextBridge.exposeInMainWorld("forge", {
   status,
   getStatus: () => ipcRenderer.invoke("forge:status"),
   pickDirectory: (options) => ipcRenderer.invoke("forge:pick-directory", options),
-  pickWorkspaceRoot: () => ipcRenderer.invoke("forge:pick-workspace-root"),
+  pickWorkspaceRoot: (options) => ipcRenderer.invoke("forge:pick-workspace-root", options),
   openLog: () => ipcRenderer.invoke("forge:open-log"),
   onStatusChanged: (listener) => {
     const handler = (_event, payload) => listener(payload);

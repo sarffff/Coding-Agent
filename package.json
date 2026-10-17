@@ -8,6 +8,7 @@
     "preview": "pnpm --filter @coding-agent/desktop preview",
     "api:dev": "node scripts/py.js -m uvicorn app.main:app --reload --reload-dir apps/api/app --app-dir apps/api",
     "api:test": "node scripts/py.js -m pytest apps/api/tests -q",
+    "api:acceptance": "node scripts/py.js scripts/interaction_demo.py",
     "api:init": "node scripts/py.js scripts/init_state.py",
     "start": "node run.js",
     "desktop:electron": "node scripts/electron.js",
@@ -15,6 +16,8 @@
     "desktop:electron:smoke": "node scripts/electron.js smoke",
     "check": "pnpm --filter @coding-agent/desktop typecheck",
     "desktop:smoke": "node scripts/desktop_smoke.js",
+    "desktop:unit": "node --test apps/desktop/electron/folders.test.cjs apps/desktop/electron/dist-file.test.cjs",
+    "desktop:backend-test": "node --test apps/desktop/electron/backend.test.cjs",
     "desktop:chat-check": "node scripts/desktop_chat_check.mjs",
     "demo:init": "node scripts/py.js scripts/create_demo.py"
   }

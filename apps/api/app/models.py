@@ -34,6 +34,7 @@ class RepositoryValidateResponse(BaseModel):
     path: str
     git_root: str | None = None
     reason: str | None = None
+    reason_code: str | None = None
 
 
 class RepositoryCreateRequest(BaseModel):
@@ -333,7 +334,29 @@ class RemoteBranchListResponse(BaseModel):
     total: int
 
 
-RemoteCallOperation = Literal["validate", "push", "create_pr", "refresh_pr"]
+class CheckRunRecord(BaseModel):
+    """One CI check as read from the provider, persisted for replay and budget."""
+
+    id: str = Field(default_factory=lambda: f"check-{uuid4().hex[:12]}")
+    task_id: str
+    run_id: str
+    repository_id: str
+    provider: str = "github"
+    provider_id: str
+    name: str
+    status: str
+    conclusion: str | None = None
+    html_url: str = ""
+    ref: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CheckRunListResponse(BaseModel):
+    items: list[CheckRunRecord]
+    total: int
+
+
+RemoteCallOperation = Literal["validate", "push", "create_pr", "refresh_pr", "checks"]
 
 
 class RemoteCallRecord(BaseModel):
@@ -425,6 +448,7 @@ class TaskPublishStateResponse(BaseModel):
     commits: list[CommitRecord] = Field(default_factory=list)
     remote_branches: list[RemoteBranchRecord] = Field(default_factory=list)
     pull_request: PullRequestRecord | None = None
+    checks: list[CheckRunRecord] = Field(default_factory=list)
     remote_calls: list[RemoteCallRecord] = Field(default_factory=list)
 
 

@@ -97,10 +97,23 @@ pnpm desktop:electron:smoke  # 隐藏窗口自检：DOM 已挂载、桥可用、
 | `FORGE_API_ROOT` | 后端源码所在的仓库根目录；源码运行时自动推导，打包版必须显式提供 |
 | `FORGE_ELECTRON_SMOKE` / `FORGE_ELECTRON_DEV_URL` | 自检模式 / 开发模式加载地址（由脚本设置） |
 
+壳里不依赖窗口的两层都有真机进程验证，可在 ACL 受限的环境外跑：
+
+```bash
+pnpm desktop:backend-test # 真的拉起 uvicorn 子进程：根目录注入、CORS 放行、端口记忆与停手后释放、失败分类
+pnpm desktop:unit         # 选择器与协议路径解析的纯逻辑：长路径前缀、建议起点、dist 穿越防护
+```
+
+`desktop:backend-test` 会用临时目录当 `FORGE_WORKSPACE_ROOT`/`FORGE_STATE_DIR` 起一个真实的 API 子进程，确认壳注入的环境变量确实压过 `apps/api/.env`，并验证「 remembered 端口上已有别人在应答 `/health` 就换端口」这条认领边界。启动失败分三类报告：解释器不存在（`无法启动本地 API`）、进程自己退了（`本地 API 提前退出`，附日志尾部）、30 秒没就绪。
+
 > **Windows 上的一个已知前置条件**：Electron 启动时会检查 `node_modules/.../electron/dist` 是否允许 AppContainer 读取。若工作区处于受限账户 ACL 之下（本仓开发环境就是这样），会看到
 > `FATAL:install_dir_access.cc ... none for ALL APPLICATION PACKAGES`，此时任何 Electron 应用（包括空应用）都起不来，与本项目代码无关。在**你自己的终端**里执行一次即可：
 > `icacls "node_modules\.pnpm\electron@<版本>\node_modules\electron\dist" /grant *S-1-15-2-1:(OI)(CI)(RX)`
 > 或者把仓库放在正常 ACL 路径下。当前分支的桌面壳就是在受限工作区里完成实现的，窗口层尚未真机验证。
+>
+> 关于这道检查，实测过两件事，别再花时间试第三条路：
+> - **`--no-sandbox` 在 Electron 44 上无效**。这个 FATAL 来自 Electron 自己的 `install_dir_access.cc`，与渲染进程是否沙箱化无关（`--no-sandbox`、`--disable-gpu`、`ELECTRON_DISABLE_SANDBOX=1` 全部实测照旧）。
+> - **降级到没有这道检查的旧版（如 31.x）确实能开窗口**，但要同时带 `--no-sandbox`——旧版没检查，沙箱子进程照样读不到 `dist`，只是换成 GPU 进程 `0xC0000135`（STATUS_DLL_NOT_FOUND）后 FATAL。也就是说代价是**放弃渲染进程沙箱**加上一个落后的 Chromium，不是免费的绕行。补那条 ACE 才是恢复配置，而不是削弱它。
 
 ## 打开文件夹
 
@@ -164,6 +177,8 @@ pnpm api:init     # 创建/查看本地状态存储，并打印已保存的记�
 pnpm check        # Desktop 类型检查
 pnpm build        # Desktop 生产构建
 pnpm desktop:smoke # 校验构建产物完整性与关键样式/DOM 字符串（不是交互回放）
+pnpm desktop:unit  # 桌面壳纯逻辑单测：Windows 长路径前缀、选择器属性、建议起点、协议路径穿越防护
+pnpm desktop:backend-test # 桌面壳托管 API 的生命周期回归（需要仓库 .venv，会真的起一个 uvicorn 子进程）
 pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅与发布入口（不是浏览器点击）
 ```
 
@@ -172,6 +187,7 @@ pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅
 - **`GIT_COMMAND_FAILED`**：确认 `git` 在 PATH 中，且 API 进程能进入目标仓库目录。
 - **`GIT_UNAVAILABLE`（HTTP 503）**：API 进程连 `git` 子进程都拉不起来（Windows 上常见退出码 `3221225794` = `STATUS_DLL_INIT_FAILED`）。这属于该进程自身的启动上下文问题，从普通终端重启 API 即可；子进程环境块已由 `process_env.child_env()` 统一补全并清洗 `GIT_*`，因此不再依赖启动时的临时目录与 git 配置。
 - **界面显示 0 仓库 0 任务但 API 有数据**：多为 CORS 或 API 地址不匹配，检查 `FORGE_CORS_ORIGINS` 与 `VITE_API_BASE_URL`。
+- **已登记的仓库全部报 `PATH_OUTSIDE_WORKSPACE`**：`pnpm start`/`pnpm api:dev` 读取 `apps/api/.env`，其中 `FORGE_WORKSPACE_ROOT` 决定哪些路径算“在工作区内”。这个值指向一个不存在或已挪走的目录时，仓库列表仍会显示（`list()` 不复查），但打开文件、Git、发布都会逐个被 `get()` 的归属复查拒掉。改回包含这些仓库的根目录，或临时用环境变量覆盖：`FORGE_WORKSPACE_ROOT=<仓库根> node run.js`（真实环境变量优先于 `.env`）。桌面壳不受影响——它总是自己注入这个值。
 - **`WORKTREE_NOT_CLEAN`**：任务分支必须在干净工作区上创建，先提交或还原本地改动。
 - **`COMMIT_PREVIEW_STALE` / `TEST_RESULTS_STALE`**：审批绑定的是具体的 diff 与验证结果；改动文件或消息后需重新预览、重新审批。
 - **`APPROVAL_REQUIRED`**：首次编码轮次需要方案审批，创建提交需要写入审批。
@@ -184,6 +200,8 @@ pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅
 - **`IDEMPOTENCY_KEY_REUSED`（409）**：同一个 `Idempotency-Key` 被用于不同端点或不同请求体。换一个键；同键同体重发会直接返回首次结果，不会二次推送或二次建 PR。
 - **`AGENT_ACTION_NOT_AVAILABLE`（409）**：请求的 Agent 动作与当前任务下一步不匹配，刷新 Agent 状态后继续。
 - **`IDEMPOTENCY_IN_PROGRESS`（409）**：同键的另一个请求仍在执行中。
+- **`PATH_OUTSIDE_WORKSPACE`**：要打开的文件夹不在 `FORGE_WORKSPACE_ROOT` 内。桌面壳会就地给出"把工作区切到它的上级"的出路；注意更换根目录会重启 API，且**根目录之外的已登记仓库会被暂时锁定**（`get()` 会重新确认归属），切回原根目录即恢复。
+- **`PATH_IS_FILESYSTEM_ROOT`**：原生目录选择器能选到 `D:\` 这类盘符根，而它不能当仓库——否则文件树与补丁的范围就是整块盘。
 - **`PATCH_TOO_LARGE` / `PROTECTED_PATH` / `BINARY_FILE_NOT_ALLOWED`**：受 Phase 1 安全限制约束，缩小改动范围或排除受保护路径（`.env`、私钥、凭据文件、`.git`、依赖与构建目录）。
 
 ## 当前状态与已知限制

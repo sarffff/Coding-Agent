@@ -88,9 +88,29 @@ function ping(port) {
   });
 }
 
+function ensureWindowsSandboxAcl() {
+  if (process.platform !== "win32") return;
+  try {
+    const electronCli = localBin("electron", "cli.js");
+    if (!fs.existsSync(electronCli)) return;
+    const realCli = fs.realpathSync(electronCli);
+    const distDir = path.join(path.dirname(realCli), "dist");
+    if (fs.existsSync(distDir)) {
+      const { execFileSync } = require("node:child_process");
+      execFileSync("icacls", [distDir, "/grant", "*S-1-15-2-1:(OI)(CI)(RX)"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    }
+  } catch {
+    // 忽略异常，由 Electron 自身处理
+  }
+}
+
 async function launchElectron(env) {
   const electronCli = localBin("electron", "cli.js");
   if (!isFile(electronCli)) throw new Error("找不到 apps/desktop/node_modules/electron，请先 pnpm install");
+  ensureWindowsSandboxAcl();
   return run(process.execPath, [electronCli, "."], { cwd: desktopDir, env, windowsHide: true });
 }
 

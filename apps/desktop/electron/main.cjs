@@ -5,6 +5,8 @@ const { pathToFileURL } = require("node:url");
 
 const { createConfig } = require("./config.cjs");
 const { defaultWorkspaceRoot, startBackend } = require("./backend.cjs");
+const { directoryDialogOptions, pickedDirectory, workspaceDialogStart } = require("./folders.cjs");
+const { resolveDistRequest } = require("./dist-file.cjs");
 
 const APP_SCHEME = "forge-app";
 const APP_HOST = "desktop";
@@ -110,14 +112,9 @@ function installAppScheme() {
 
 function serveDist() {
   protocol.handle(APP_SCHEME, (request) => {
-    const url = new URL(request.url);
-    const requested = decodeURIComponent(url.pathname).replace(/^\/+/, "");
-    const target = path.resolve(distDir, requested || "index.html");
-    if (target !== distDir && !target.startsWith(distDir + path.sep)) {
-      return new Response("Forbidden", { status: 403 });
-    }
-    const usable = fs.existsSync(target) && !fs.statSync(target).isDirectory();
-    return net.fetch(pathToFileURL(usable ? target : path.join(distDir, "index.html")).toString());
+    const resolved = resolveDistRequest(distDir, request.url);
+    if (resolved.forbidden) return new Response("Forbidden", { status: 403 });
+    return net.fetch(pathToFileURL(resolved.file).toString());
   });
 }
 
@@ -180,6 +177,8 @@ async function runSmokeChecks() {
   const probe = `({
     mounted: document.querySelectorAll("#root *").length,
     bridge: Boolean(window.forge),
+    pickDirectory: typeof window.forge?.pickDirectory === "function",
+    pickWorkspaceRoot: typeof window.forge?.pickWorkspaceRoot === "function",
     apiBaseUrl: window.forge ? window.forge.status.apiBaseUrl : "",
     workspaceRoot: window.forge ? window.forge.status.workspaceRoot : "",
     title: document.title,
@@ -196,9 +195,19 @@ async function runSmokeChecks() {
   } catch (failure) {
     error = describe(failure);
   }
-  const pass = Boolean(result && health && result.mounted > 0 && result.bridge && !error && !lastError);
+  const pass = Boolean(result && health && result.mounted > 0 && result.bridge && result.pickDirectory && result.pickWorkspaceRoot && !error && !lastError);
   console.log(JSON.stringify({ smoke: "forge-electron", pass, health, error, lastError, ...result }, null, 2));
   app.exit(pass ? 0 : 1);
+}
+
+async function chooseDirectory(title, preferred) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  }
+  const fallback = preferred && fs.existsSync(preferred) ? preferred : app.getPath("home");
+  const result = await dialog.showOpenDialog(mainWindow ?? undefined, directoryDialogOptions(title, fallback));
+  return pickedDirectory(result);
 }
 
 function registerIpc() {
@@ -208,23 +217,13 @@ function registerIpc() {
   ipcMain.handle("forge:status", () => statusPayload());
   ipcMain.handle("forge:pick-directory", async (_event, options) => {
     const fallback = typeof options?.fallbackPath === "string" ? options.fallbackPath : statusPayload().workspaceRoot;
-    const result = await dialog.showOpenDialog(mainWindow, {
-      title: "打开文件夹",
-      defaultPath: fs.existsSync(fallback) ? fallback : app.getPath("home"),
-      properties: ["openDirectory", "createDirectory"],
-    });
-    if (result.canceled || !result.filePaths.length) return null;
-    return path.resolve(result.filePaths[0]);
+    return chooseDirectory("打开文件夹", fallback);
   });
-  ipcMain.handle("forge:pick-workspace-root", async () => {
-    const current = statusPayload().workspaceRoot;
-    const result = await dialog.showOpenDialog(mainWindow, {
-      title: "选择工作区根目录（API 只允许读写其内的仓库）",
-      defaultPath: fs.existsSync(current) ? current : app.getPath("home"),
-      properties: ["openDirectory", "createDirectory"],
-    });
-    if (result.canceled || !result.filePaths.length) return { canceled: true, ...statusPayload() };
-    const nextRoot = path.resolve(result.filePaths[0]);
+  ipcMain.handle("forge:pick-workspace-root", async (_event, options) => {
+    // 选中目录在工作区之外时，从它的上级目录开始选，用户不必再手动爬一遍盘。
+    const start = workspaceDialogStart(statusPayload().workspaceRoot, options?.suggestPath);
+    const nextRoot = await chooseDirectory("选择工作区根目录（API 只允许读写其内的仓库）", start);
+    if (!nextRoot) return { canceled: true, ...statusPayload() };
     config.update({ workspaceRoot: nextRoot });
     await stopManagedBackend();
     try {

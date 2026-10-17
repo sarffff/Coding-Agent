@@ -262,6 +262,33 @@ def test_remote_records_survive_restart_and_gate_the_next_write(remote_api, remo
     assert len(remote_api.services.store.items("pull_requests")) == 1
 
 
+def test_checks_require_a_push_and_refresh_replaces_the_snapshot_across_restart(remote_api):
+    from app.remote_provider import CheckRunData
+
+    client = remote_api.client
+    task = passing_task(client, remote_api.repository)
+    task_url = f"/api/v1/tasks/{task['id']}"
+    commit_passing_task(client, task)
+    blocked = client.get(task_url + "/checks")
+    assert blocked.status_code == 409
+    assert blocked.json()["code"] == "BRANCH_NOT_PUSHED"
+
+    approve(client, task, "push")
+    pushed = post(client, task_url + "/push", {"remote": "origin"})
+    slug = remote_api.provider.repo_slug(pushed["remote_url"])
+    remote_api.provider.check_runs[slug] = [CheckRunData(id="1", name="pytest", status="in_progress")]
+    first = client.get(task_url + "/checks").json()
+    assert [(item["name"], item["status"], item["ref"]) for item in first["items"]] == [("pytest", "in_progress", pushed["pushed_sha"])]
+
+    remote_api.provider.check_runs[slug] = [CheckRunData(id="1", name="pytest", status="completed", conclusion="failure")]
+    client.get(task_url + "/checks")
+    restarted = remote_api.mount()
+    stored = restarted.get(task_url + "/publish-state").json()["checks"]
+    assert [(item["status"], item["conclusion"]) for item in stored] == [("completed", "failure")]
+    calls = [item["operation"] for item in restarted.get(task_url + "/remote-calls").json()["items"]]
+    assert calls.count("checks") == 2
+
+
 def test_provider_refuses_to_publish_protected_branches(remote_api, remote_repository):
     provider = remote_api.provider
     with pytest.raises(RepositoryError) as error:

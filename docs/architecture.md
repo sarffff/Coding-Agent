@@ -9,7 +9,7 @@ apps/desktop (React + Vite + TypeScript)
   src/lib/preferences.tsx ── 语言 / 主题
   src/components/ ── RepositoryBrowser（浏览与编辑）、RunHistory（测试历史与回滚）、AgentPanel（下一步、单步推进与预算/熔断仪表盘）、ApprovalPanel（审批中心：过滤、拒绝理由、要求修改续推）
   src/App.tsx ── runs 视图内的「受控发布」面板：推送审批 → 推送 → Draft PR 预览/创建/对账
-  electron/  ── 桌面壳：main(窗口/协议/IPC) + backend(uvicorn 生命周期) + config + preload
+  electron/  ── 桌面壳：main(窗口/协议/IPC) + backend(uvicorn 生命周期) + config + preload + folders(原生选择器) + dist-file(协议路径解析)
   packages/types ─► 共享领域类型   packages/ui ─► Dialog / AsyncMessage
 
 apps/api/app/
@@ -53,7 +53,9 @@ apps/api/app/
 
 ## Desktop shell
 
-`apps/desktop/electron/` 是可选项：`pnpm start` 的浏览器路径完全不依赖它。壳启动顺序固定为「解析解释器 → 选端口 → 起 uvicorn → 轮询 `/health` → 建窗口」，因此渲染进程可以在模块顶层同步读到 `window.forge.status.apiBaseUrl`；后端起不来时窗口显示一份自解释的错误页（含日志路径），而不是一个空白工作台。配置（工作区根目录、记住的端口）写在 `userData/forge-desktop.json`，状态与日志在 `userData/state`、`userData/logs`。窗口层在本仓库的受限工作区里无法真机验证（见 README 的 Windows ACL 前置条件），但 `backend.cjs` 的解释器解析、端口避让、健康等待、`forge-app://desktop` 的 CORS 预检与终止清理已用真实 uvicorn 进程验证过。
+`apps/desktop/electron/` 是可选项：`pnpm start` 的浏览器路径完全不依赖它。壳启动顺序固定为「解析解释器 → 选端口 → 起 uvicorn → 轮询 `/health` → 建窗口」，因此渲染进程可以在模块顶层同步读到 `window.forge.status.apiBaseUrl`；后端起不来时窗口显示一份自解释的错误页（含日志路径），而不是一个空白工作台。配置（工作区根目录、记住的端口）写在 `userData/forge-desktop.json`，状态与日志在 `userData/state`、`userData/logs`。
+
+窗口层在本仓库的受限工作区里无法真机验证（见 README 的 Windows ACL 前置条件），但壳里不碰窗口的两层是钉住的：`pnpm desktop:backend-test` 用临时根目录真的起一个 uvicorn 子进程，验证注入的 `FORGE_WORKSPACE_ROOT`/`FORGE_STATE_DIR` 压过 `apps/api/.env`、`forge-app://desktop` 在 CORS 白名单内而别的来源不在、端口记忆只沿用无人应答的端口、`stop()` 之后端口真的释放，以及三类启动失败各说各的话（解释器缺失 / 进程提前退出 / 30 秒没就绪——子进程的 `error` 与 `close` 事件分开记，否则“没装 Python”会被误报成超时）。`pnpm desktop:unit` 覆盖 `folders.cjs` 的 Windows 路径事实与 `dist-file.cjs` 的协议路径解析：特权 scheme 只能读到 `dist/` 内的文件，穿越要么被 URL 解析折叠、要么被前缀检查拒掉，畸形的百分号编码不会在 handler 里抛异常。
 
 ## Persistence
 

@@ -94,7 +94,11 @@ class TestService:
                 result = self._result(run_id, kind, command, status, started, stdout=out[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), stderr=err[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"))
                 result.exit_code = process.returncode
                 result.output_truncated = len(out) > self.OUTPUT_LIMIT or len(err) > self.OUTPUT_LIMIT
-                if status == "blocked":
+                if status == "failed" and len(command) > 2 and command[1:3] == ["-m", "pytest"]:
+                    if "No module named pytest" in result.stderr or process.returncode == 5:
+                        status = result.status = "blocked"
+                        result.stderr += "\nInstall pytest in the project environment or configure discoverable tests before retrying."
+                if status == "blocked" and is_process_startup_failure(process.returncode):
                     result.stderr = (result.stderr + "\n" if result.stderr else "") + "The validation process could not be started by the API process. Restart the API from a normal shell."
                 if status == "timed_out":
                     result.stderr += "\nValidation exceeded its time limit."
@@ -142,7 +146,7 @@ class TestService:
             selected = selected_path.relative_to(repository.path).as_posix() + ("::" + target.split("::", 1)[1] if "::" in target else "")
         python_tests = any(any(repository.path.glob(pattern)) for pattern in ("tests", "test_*.py", "*_test.py"))
         if kind == "pytest" or (kind == "auto" and python_tests):
-            return [sys.executable, "-m", "pytest", "-q", *([selected] if selected else [])]
+            return [self._python_executable(repository), "-m", "pytest", "-q", *([selected] if selected else [])]
         package = repository.path / "package.json"
         data = json.loads(package.read_text(encoding="utf-8")) if package.exists() else {}
         scripts = data.get("scripts", {})
@@ -154,7 +158,7 @@ class TestService:
             if python_tests or (repository.path / "pyproject.toml").exists():
                 paths = [selected.split("::", 1)[0]] if selected else [name for name in ("app", "src", "tests") if (repository.path / name).is_dir()]
                 paths = paths or [file.name for file in repository.path.glob("*.py")]
-                return [sys.executable, "-m", "compileall", "-q", *paths] if paths else None
+                return [self._python_executable(repository), "-m", "compileall", "-q", *paths] if paths else None
             return None
         if kind in {"auto", "frontend"} and "test" in scripts:
             dependencies = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
@@ -163,6 +167,18 @@ class TestService:
                 extra.append(selected)
             return [manager, "test", *(["--"] if manager == "npm" and extra else []), *extra]
         return None
+
+    @staticmethod
+    def _python_executable(repository: RepositoryRecord) -> str:
+        relative = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+        for name in (".venv", "venv"):
+            environment = repository.path / name
+            if environment.is_dir():
+                executable = environment / relative
+                if not executable.is_file():
+                    raise RepositoryError("PROJECT_PYTHON_UNAVAILABLE", "The project virtual environment has no Python executable. Recreate it before retrying.", {"path": str(executable)})
+                return str(executable)
+        return sys.executable
 
     @staticmethod
     def _parse_failures(stdout: str, stderr: str) -> list[TestFailure]:

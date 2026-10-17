@@ -139,6 +139,8 @@ class AnthropicModelProvider(ModelProvider):
              "messages": [{"role": "user", "content": _build_prompt(goal, context_files, failure)}]},
         )
         blocks = data.get("content") or []
+        if data.get("stop_reason") == "max_tokens":
+            raise RepositoryError("MODEL_OUTPUT_TRUNCATED", "The model reached its output limit. Reduce the edit scope or increase FORGE_LLM_MAX_TOKENS before retrying.")
         text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text")
         return _proposal_from_payload(extract_proposal_json(text))
 
@@ -176,6 +178,8 @@ class OpenAIModelProvider(ModelProvider):
                           {"role": "user", "content": _build_prompt(goal, context_files, failure)}]},
         )
         choices = data.get("choices") or []
+        if choices and isinstance(choices[0], dict) and choices[0].get("finish_reason") == "length":
+            raise RepositoryError("MODEL_OUTPUT_TRUNCATED", "The model reached its output limit. Reduce the edit scope or increase FORGE_LLM_MAX_TOKENS before retrying.")
         text = choices[0].get("message", {}).get("content", "") if choices and isinstance(choices[0], dict) else ""
         return _proposal_from_payload(extract_proposal_json(text))
 

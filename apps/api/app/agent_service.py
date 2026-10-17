@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -164,6 +165,20 @@ class AgentService:
         state = _ACTIVE_LOOPS.get(task_id)
         return bool(state and not state.task.done())
 
+    def assert_workspace_available(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if not task.repository_id:
+            return
+        path = self.tasks.repositories.get(task.repository_id).path
+        for other in self.tasks.list():
+            if other.id == task_id or not other.repository_id:
+                continue
+            if not self._loop_running(other.id) and not self.tests.is_running(other.run_id):
+                continue
+            other_path = self.tasks.repositories.get(other.repository_id).path
+            if path == other_path or path in other_path.parents or other_path in path.parents:
+                raise RepositoryError("WORKSPACE_BUSY", "Another task is editing or validating this folder. Stop it before continuing.", {"task_id": other.id})
+
     def start_loop(self, run_id: str, request: AgentLoopRequest) -> AgentStateResponse:
         task = self.tasks.get_by_run(run_id)
         if task.track == "cowork":
@@ -171,6 +186,7 @@ class AgentService:
         self.tasks.assert_recovered(task.id)
         if self._loop_running(task.id):
             raise RepositoryError("LOOP_ALREADY_RUNNING", "An agent loop is already running for this task.", {"task_id": task.id})
+        self.assert_workspace_available(task.id)
         if request.mode is not None:
             self.tasks.set_mode(task.id, request.mode)  # first start sets the posture; resumes (mode=None) keep it
         stop = asyncio.Event()
@@ -341,6 +357,7 @@ class AgentService:
     async def run_tests(self, run_id: str, request: TestRunRequest) -> TestRunResponse:
         """Shared validation path for the manual test API and Agent advancement."""
         task = self.tasks.get_by_run(run_id)
+        self.assert_workspace_available(task.id)
         self.tasks.assert_recovered(task.id)
         self.tasks.assert_budget_available(task.id)
         if not task.repository_id:
@@ -376,6 +393,7 @@ class AgentService:
         size and binary checks) and the user still reviews the diff and confirms apply.
         """
         task = self.tasks.get_by_run(run_id)
+        self.assert_workspace_available(task.id)
         self.tasks.assert_recovered(task.id)
         if not task.repository_id:
             raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Connect a repository before drafting a patch.")
@@ -385,13 +403,18 @@ class AgentService:
         failed_iteration = next((item for item in reversed(iterations) if not item.rolled_back and item.test_result and item.test_result.status == "failed"), None)
         failed_test = failed_iteration.test_result if failed_iteration else None
         failure = "\n".join(part for part in (failed_iteration.failure_summary, failed_test.stdout, failed_test.stderr) if part)[:12_000] if failed_iteration else None
-        goal = request.feedback or iteration.goal
+        goal = task.goal
+        if iteration.goal != task.goal:
+            goal += f"\n\nCurrent iteration:\n{iteration.goal}"
+        if request.feedback:
+            goal += f"\n\nAdditional feedback:\n{request.feedback}"
         context_files = self._gather_context(task.repository_id, request.context_paths, task.id, goal, failed_test)
         repository = self.tasks.repositories.get(task.repository_id)
         baselines = {repository.path / path: self.patch._content_hash(content) for path, content in context_files}
         # ponytail: model calls share the task's remote-call budget (one counter with git-host calls); split if it ever matters.
         self.tasks.consume_remote_call(task.id)
         succeeded = False
+        started = time.perf_counter()
         try:
             proposal = await self.models.propose_patch(goal, context_files, failure)
             succeeded = True
@@ -413,6 +436,9 @@ class AgentService:
             task_id=task.id, run_id=run_id,
             # rationale persisted here (capped) so a chat transcript can show the model's reasoning after the fact.
             details={"patch_id": preview.patch_id, "files": preview.files, "model": self.models.settings.llm_model,
+                     "context_paths": [path for path, _ in context_files],
+                     "context_bytes": sum(len(content.encode("utf-8")) for _, content in context_files),
+                     "duration_ms": round((time.perf_counter() - started) * 1000),
                      "rationale": proposal.rationale[:2_000]},
         )
         return DraftPatchResponse(**preview.model_dump(), rationale=proposal.rationale)

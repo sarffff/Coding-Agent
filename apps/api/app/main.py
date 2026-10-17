@@ -58,6 +58,7 @@ from .models import (
     PullRequestListResponse,
     PullRequestPreviewResponse,
     PullRequestRecord,
+    CheckRunListResponse,
     RemoteBranchListResponse,
     RemoteBranchRecord,
     RemoteCallListResponse,
@@ -142,6 +143,7 @@ ERROR_STATUS_BY_CODE = {
     "GIT_BUSY": 503,
     "AGENT_ACTION_NOT_AVAILABLE": 409,
     "LOOP_ALREADY_RUNNING": 409,
+    "WORKSPACE_BUSY": 409,
     "TASK_BUDGET_EXHAUSTED": 409,
     "APPROVAL_NOT_FOUND": 404,
     "APPROVAL_REASON_REQUIRED": 422,
@@ -155,6 +157,7 @@ ERROR_STATUS_BY_CODE = {
     "AUTHENTICATION_FAILED": 401,
     "RATE_LIMITED_OR_FORBIDDEN": 429,
     "MODEL_INVALID_OUTPUT": 400,
+    "MODEL_OUTPUT_TRUNCATED": 400,
     "MODEL_NO_RESPONSE": 400,
     "MODEL_AUTH_FAILED": 401,
     "MODEL_RATE_LIMITED": 429,
@@ -326,6 +329,7 @@ async def start_repair(task_id: str, payload: RepairCreateRequest):
 @app.post("/api/v1/tasks/{task_id}/pause", response_model=TaskActionResponse)
 async def pause_task(task_id: str) -> TaskActionResponse:
     task = task_service.pause(task_id)
+    agent_service.stop_loop(task.run_id)
     test_service.cancel(task.run_id)
     audit_service.record("task.pause", "succeeded", "Paused task", task_id=task_id, run_id=task.run_id)
     return TaskActionResponse(task=task, action="paused")
@@ -343,6 +347,7 @@ async def resume_task(task_id: str) -> TaskActionResponse:
 @app.post("/api/v1/tasks/{task_id}/cancel", response_model=TaskActionResponse)
 async def cancel_task(task_id: str) -> TaskActionResponse:
     task = task_service.cancel(task_id)
+    agent_service.stop_loop(task.run_id)
     test_service.cancel(task.run_id)
     audit_service.record("task.cancel", "succeeded", "Cancelled task", task_id=task_id, run_id=task.run_id)
     return TaskActionResponse(task=task, action="cancelled")
@@ -444,6 +449,7 @@ def repository_id_for_task(task_id: str, require_recovered: bool = True) -> str:
 
 @app.post("/api/v1/tasks/{task_id}/branch", response_model=GitSnapshotResponse)
 async def create_task_branch(task_id: str, payload: BranchCreateRequest) -> GitSnapshotResponse:
+    agent_service.assert_workspace_available(task_id)
     repository_id = repository_id_for_task(task_id)
     task = task_service.get(task_id)
     if task.current_iteration or task.task_branch:
@@ -474,6 +480,7 @@ async def preview_task_commit(task_id: str, payload: CommitPreviewRequest) -> Co
 
 @app.post("/api/v1/tasks/{task_id}/commits", response_model=GitSnapshotResponse)
 async def create_task_commit(task_id: str, payload: CommitCreateRequest) -> GitSnapshotResponse:
+    agent_service.assert_workspace_available(task_id)
     repository_id = repository_id_for_task(task_id)
     task = task_service.get(task_id)
     with git_service.lock(repository_id):
@@ -524,6 +531,14 @@ async def list_task_remote_branches(task_id: str) -> RemoteBranchListResponse:
     task_service.get(task_id)
     items = remote_service.list_remote_branches(task_id)
     return RemoteBranchListResponse(items=items, total=len(items))
+
+
+@app.get("/api/v1/tasks/{task_id}/checks", response_model=CheckRunListResponse)
+async def list_task_checks(task_id: str) -> CheckRunListResponse:
+    """Read CI checks for the latest pushed commit from the provider (refreshes the snapshot)."""
+    task_service.get(task_id)
+    items = await remote_service.list_checks(task_id)
+    return CheckRunListResponse(items=items, total=len(items))
 
 
 @app.get("/api/v1/tasks/{task_id}/remote-calls", response_model=RemoteCallListResponse)
@@ -623,6 +638,7 @@ async def stop_agent_loop(run_id: str) -> AgentStateResponse:
 @app.post("/api/v1/runs/{run_id}/patches/apply", response_model=PatchApplyResponse)
 async def apply_patch(run_id: str, payload: PatchApplyRequest) -> PatchApplyResponse:
     repository_id = repository_id_for_run(run_id)
+    agent_service.assert_workspace_available(task_service.get_by_run(run_id).id)
     task_service.assert_patch_allowed(run_id)
     if not payload.confirm:
         raise RepositoryError("PATCH_CONFIRMATION_REQUIRED", "Confirm the reviewed patch before applying it.")
@@ -638,6 +654,7 @@ async def apply_patch(run_id: str, payload: PatchApplyRequest) -> PatchApplyResp
 @app.post("/api/v1/runs/{run_id}/rollback", response_model=RollbackResponse)
 async def rollback_run(run_id: str, payload: RollbackRequest) -> RollbackResponse:
     repository_id = repository_id_for_run(run_id, require_recovered=False)
+    agent_service.assert_workspace_available(task_service.get_by_run(run_id).id)
     if test_service.is_running(run_id):
         raise RepositoryError("TEST_ALREADY_RUNNING", "Stop validation before restoring files.")
     if task_service.get_by_run(run_id).status in {"cancelled", "completed", "done", "pr_created"}:

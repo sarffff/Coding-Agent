@@ -116,6 +116,21 @@ def test_both_providers_extract_their_response_shapes(monkeypatch):
     assert openai.files[0].path == "a.py"
 
 
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_truncated_model_output_is_rejected_even_when_json_is_valid(monkeypatch, provider):
+    payload = json.dumps({"files": [{"path": "app.py", "operation": "update", "content": "partial"}]})
+    async def truncated(*args):
+        if provider == "anthropic":
+            return {"stop_reason": "max_tokens", "content": [{"type": "text", "text": payload}]}
+        return {"choices": [{"finish_reason": "length", "message": {"content": payload}}]}
+    monkeypatch.setattr(mp, "_post_json", truncated)
+    settings = Settings(anthropic_api_key="test", openai_api_key="test")
+    model = AnthropicModelProvider(settings) if provider == "anthropic" else OpenAIModelProvider(settings)
+    with pytest.raises(RepositoryError) as error:
+        asyncio.run(model.propose_patch("fix", [], None))
+    assert error.value.code == "MODEL_OUTPUT_TRUNCATED"
+
+
 def test_draft_passes_requested_context_file_content_to_the_model(model_api):
     client, directory = model_api
     task = create_task(client, directory)
@@ -163,10 +178,17 @@ def test_repair_draft_keeps_previous_failure_and_failing_test_content(model_api,
     monkeypatch.setattr(main.settings, "llm_max_context_files", 2)
     FakeModelProvider.seed([PatchFile(path="app.py", content="def value():\n    return 2\n")])
     post(client, f"/api/v1/runs/{task['run_id']}/patches/draft", {})
-    _, context, failure = FakeModelProvider._calls[-1]
+    goal, context, failure = FakeModelProvider._calls[-1]
+    assert task["goal"] in goal
+    assert "Repair the failing behavior" in goal
     assert failure and "assert value() == 2" in failure
     assert "return 0" in dict(context)["app.py"]
     assert "assert value() == 2" in dict(context)["test_app.py"]
+    events = client.get(f"/api/v1/runs/{task['run_id']}/events").json()["items"]
+    draft = next(event for event in reversed(events) if event["action"] == "patch.draft")
+    assert draft["details"]["context_paths"] == [path for path, _ in context]
+    assert draft["details"]["context_bytes"] == sum(len(content.encode("utf-8")) for _, content in context)
+    assert draft["details"]["duration_ms"] >= 0
 
 
 def test_model_reply_cannot_overwrite_an_edit_made_while_waiting(model_api, monkeypatch):

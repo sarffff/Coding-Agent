@@ -56,6 +56,17 @@ class PullRequestData:
     merged: bool = False
 
 
+@dataclass(slots=True)
+class CheckRunData:
+    """One CI check as reported by the remote provider."""
+
+    id: str
+    name: str
+    status: str
+    conclusion: str | None = None
+    html_url: str = ""
+
+
 class RemoteProvider(ABC):
     """Abstract interface for remote Git hosting providers."""
 
@@ -146,6 +157,11 @@ class RemoteProvider(ABC):
         """Retrieve pull request metadata by number."""
         ...
 
+    @abstractmethod
+    async def get_check_runs(self, remote_url: str, ref: str) -> list[CheckRunData]:
+        """List CI check runs for one commit SHA or branch on the remote."""
+        ...
+
 
 class GitHubRemoteProvider(RemoteProvider):
     """GitHub REST API implementation."""
@@ -198,6 +214,33 @@ class GitHubRemoteProvider(RemoteProvider):
                 raise RepositoryError("REMOTE_NETWORK_ERROR", f"Failed to reach {host}: {exc}") from exc
             self._emit(resp.status_code)
             return resp.status_code == 200
+
+    async def get_check_runs(self, remote_url: str, ref: str) -> list[CheckRunData]:
+        host, owner, repo = self.validate_remote_url(remote_url)
+        url = f"{self._api_base(host)}/repos/{owner}/{repo}/commits/{quote(ref, safe='')}/check-runs"
+        async with httpx.AsyncClient(timeout=self.settings.remote_timeout_seconds) as client:
+            try:
+                resp = await client.get(url, headers=self._headers())
+            except httpx.RequestError as exc:
+                self._emit(None)
+                raise RepositoryError("REMOTE_NETWORK_ERROR", f"Failed to reach {host}: {exc}") from exc
+            self._emit(resp.status_code)
+            if resp.status_code == 401:
+                raise RepositoryError("AUTHENTICATION_FAILED", "GitHub token is invalid or missing.")
+            if resp.status_code == 403:
+                raise RepositoryError("RATE_LIMITED_OR_FORBIDDEN", "GitHub rate limit exceeded or access forbidden.")
+            if resp.status_code >= 400:
+                raise RepositoryError("REMOTE_ERROR", f"GitHub API error: {resp.status_code}")
+            return [
+                CheckRunData(
+                    id=str(item.get("id")),
+                    name=item.get("name", ""),
+                    status=item.get("status", "unknown"),
+                    conclusion=item.get("conclusion"),
+                    html_url=item.get("html_url", ""),
+                )
+                for item in resp.json().get("check_runs", [])
+            ]
 
     async def push_task_branch(self, repo_path: Path, remote_url: str, branch: str, remote: str = "origin") -> str:
         if branch in PROTECTED_BRANCHES:
@@ -356,6 +399,7 @@ class FakeRemoteProvider(RemoteProvider):
     _repositories: dict[str, RemoteRepoInfo] = {}
     _branches: dict[str, dict[str, str]] = {}  # {repo_slug: {branch: sha}}
     _pull_requests: dict[str, list[PullRequestData]] = {}  # {repo_slug: [pr]}
+    _check_runs: dict[str, list[CheckRunData]] = {}  # {repo_slug: [check]} — tests seed these directly
     _pushes: list[tuple[str, str, str]] = []  # {(slug, branch, sha)} for side-effect assertions
 
     def __init__(self, settings: Settings):
@@ -363,6 +407,7 @@ class FakeRemoteProvider(RemoteProvider):
         self.repositories = FakeRemoteProvider._repositories
         self.branches = FakeRemoteProvider._branches
         self.pull_requests = FakeRemoteProvider._pull_requests
+        self.check_runs = FakeRemoteProvider._check_runs
         self.pushes = FakeRemoteProvider._pushes
 
     @classmethod
@@ -370,6 +415,7 @@ class FakeRemoteProvider(RemoteProvider):
         cls._repositories.clear()
         cls._branches.clear()
         cls._pull_requests.clear()
+        cls._check_runs.clear()
         cls._pushes.clear()
 
     def register_repo(self, host: str, owner: str, repo: str, default_branch: str = "main") -> None:
@@ -452,3 +498,9 @@ class FakeRemoteProvider(RemoteProvider):
                 return pr
         self._emit(404)
         return None
+
+    async def get_check_runs(self, remote_url: str, ref: str) -> list[CheckRunData]:
+        host, owner, repo = self.validate_remote_url(remote_url)
+        slug = f"{host}/{owner}/{repo}".lower()
+        self._emit(200)
+        return list(self.check_runs.get(slug, []))

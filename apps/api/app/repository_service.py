@@ -156,7 +156,7 @@ class RepositoryService:
             git_root = self._maybe_git_root(path)
             return RepositoryValidateResponse(valid=True, path=str(path), git_root=str(git_root) if git_root else None)
         except RepositoryError as exc:
-            return RepositoryValidateResponse(valid=False, path=str(Path(raw_path).expanduser()), reason=exc.message)
+            return RepositoryValidateResponse(valid=False, path=str(Path(raw_path).expanduser()), reason=exc.message, reason_code=exc.code)
 
     def register(self, raw_path: str, name: str | None = None) -> RepositorySummary:
         path = self._resolve_allowed_path(raw_path)

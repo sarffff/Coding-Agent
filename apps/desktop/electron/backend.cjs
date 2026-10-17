@@ -60,10 +60,12 @@ function probeHealth(port, timeoutMs = 1500) {
   });
 }
 
-async function waitForHealth(port, deadlineMs) {
+async function waitForHealth(port, deadlineMs, hasExited) {
   const started = Date.now();
   while (Date.now() - started < deadlineMs) {
     if (await probeHealth(port)) return true;
+    // A child that already died will never become healthy; fail now instead of stalling for the full deadline.
+    if (hasExited?.()) return false;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
@@ -106,28 +108,33 @@ async function startBackend(options) {
   );
 
   let exited = null;
+  let spawnError = null;
   child.stdout.on("data", (chunk) => logStream.write(chunk));
   child.stderr.on("data", (chunk) => logStream.write(chunk));
   child.on("error", (error) => {
-    exited = { code: -1, signal: null, error: error.message };
+    // Keep this apart from `exited`: the close event always follows and would otherwise
+    // overwrite it, turning "python is missing" into a bogus timeout.
+    spawnError = error.message;
+    exited = exited ?? { code: -1, signal: null };
     logStream.write(`spawn error: ${error.message}\n`);
   });
   child.on("close", (code, signal) => {
-    exited = { code, signal, error: null };
+    exited = exited ?? { code, signal, error: null };
     logStream.write(`closed code=${code} signal=${signal}\n`);
   });
 
-  const healthy = await waitForHealth(port, 30_000);
+  const healthy = await waitForHealth(port, 30_000, () => exited !== null);
   if (!healthy) {
     const failure = exited;
     await stopBackend(child);
-    logStream.end(`startup failed: backend never became healthy\n`);
     const tail = readLogTail(logFile);
-    throw new Error(
-      failure?.error
-        ? `无法启动本地 API：${failure.error}（Python: ${python}）`
-        : `本地 API 在 30 秒内没有就绪（Python: ${python}，日志: ${logFile}）\n${tail}`
-    );
+    logStream.end(`startup failed: ${spawnError ?? `exit code=${failure?.code} signal=${failure?.signal}`}\n`);
+    const cause = spawnError
+      ? `无法启动本地 API：${spawnError}（Python: ${python}）`
+      : failure
+        ? `本地 API 提前退出（代码 ${failure.code}，信号 ${failure.signal}，Python: ${python}，日志: ${logFile}）`
+        : `本地 API 在 30 秒内没有就绪（Python: ${python}，日志: ${logFile}）`;
+    throw new Error(`${cause}\n${tail}`);
   }
 
   return {

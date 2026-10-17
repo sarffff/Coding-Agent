@@ -14,6 +14,7 @@ from .audit_service import AuditService
 from .config import Settings
 from .git_service import PROTECTED_BRANCHES, GitService
 from .models import (
+    CheckRunRecord,
     CommitRecord,
     PullRequestCreateRequest,
     PullRequestPreviewResponse,
@@ -65,6 +66,7 @@ class RemoteService:
         self._remote_branches: dict[str, RemoteBranchRecord] = {}
         self._pull_requests: dict[str, PullRequestRecord] = {}
         self._remote_calls: dict[str, RemoteCallRecord] = {}
+        self._checks: dict[str, CheckRunRecord] = {}
         self._keys: dict[str, str] = {}
         for key, record in store.models("commits", CommitRecord):
             self._commits[record.id] = record
@@ -78,6 +80,9 @@ class RemoteService:
         for key, record in store.models("remote_calls", RemoteCallRecord):
             self._remote_calls[record.id] = record
             self._keys[f"remote_calls:{record.id}"] = key
+        for key, record in store.models("checks", CheckRunRecord):
+            self._checks[record.id] = record
+            self._keys[f"checks:{record.id}"] = key
 
     def _put(self, scope: str, record_id: str, record: BaseModel, updated_at: datetime) -> None:
         key = self._keys.setdefault(f"{scope}:{record_id}", self.store.next_key(scope))
@@ -172,6 +177,49 @@ class RemoteService:
     def list_remote_branches(self, task_id: str) -> list[RemoteBranchRecord]:
         return [record for record in self._remote_branches.values() if record.task_id == task_id]
 
+    async def list_checks(self, task_id: str) -> list[CheckRunRecord]:
+        """Read CI checks for the latest pushed commit; records the call in remote_calls.
+
+        Re-reading replaces the stored snapshot for that ref, so a refresh keeps one
+        row per check name rather than an ever-growing history.
+        """
+        task = self.tasks.get(task_id)
+        pushed = self.list_remote_branches(task_id)
+        if not pushed:
+            raise RepositoryError("BRANCH_NOT_PUSHED", "Push the task branch before reading CI checks.")
+        latest = pushed[-1]
+        runs = await self._call(task.id, task.run_id, "checks", lambda: self.provider.get_check_runs(latest.remote_url, latest.pushed_sha))
+        now = datetime.now(timezone.utc)
+        for record_id, item in list(self._checks.items()):
+            if item.task_id == task_id and item.ref == latest.pushed_sha:
+                del self._checks[record_id]
+                key = self._keys.pop(f"checks:{record_id}", None)
+                if key:
+                    self.store.delete("checks", key)
+        result: list[CheckRunRecord] = []
+        for run in runs:
+            record = CheckRunRecord(
+                task_id=task_id,
+                run_id=task.run_id,
+                repository_id=task.repository_id or "",
+                provider=self.settings.remote_provider,
+                provider_id=run.id,
+                name=run.name,
+                status=run.status,
+                conclusion=run.conclusion,
+                html_url=run.html_url,
+                ref=latest.pushed_sha,
+                created_at=now,
+            )
+            self._checks[record.id] = record
+            self._put("checks", record.id, record, record.created_at)
+            result.append(record)
+        return result
+
+    def get_stored_checks(self, task_id: str) -> list[CheckRunRecord]:
+        records = [record for record in self._checks.values() if record.task_id == task_id]
+        return sorted(records, key=lambda record: record.created_at)
+
     def get_pull_request(self, task_id: str) -> PullRequestRecord | None:
         records = [record for record in self._pull_requests.values() if record.task_id == task_id]
         return records[-1] if records else None
@@ -186,6 +234,7 @@ class RemoteService:
             commits=self.list_commits(task_id),
             remote_branches=self.list_remote_branches(task_id),
             pull_request=self.get_pull_request(task_id),
+            checks=self.get_stored_checks(task_id),
             remote_calls=self.list_remote_calls(task_id),
         )
 

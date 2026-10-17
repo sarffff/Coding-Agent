@@ -55,6 +55,7 @@ import {
   previewPatch,
   previewCommit,
   registerRepository,
+  validateRepository,
   resumeTask,
   runTests,
   requestApproval,
@@ -261,6 +262,9 @@ function App() {
   const [repositoryDialogOpen, setRepositoryDialogOpen] = useState(false);
   const [repositoryPathInput, setRepositoryPathInput] = useState("");
   const [desktopRuntime, setDesktopRuntime] = useState<DesktopStatus | null>(desktopStatus);
+  const [outsideRepositoryPath, setOutsideRepositoryPath] = useState<string | null>(null);
+  const [workspaceConfirmOpen, setWorkspaceConfirmOpen] = useState(false);
+  const [workspaceSuggestPath, setWorkspaceSuggestPath] = useState<string | undefined>(undefined);
   const [repositorySaving, setRepositorySaving] = useState(false);
   const repositoryOpeningRef = useRef(false);
   const [confirmAction, setConfirmAction] = useState<"cancel" | "delete" | null>(null);
@@ -654,8 +658,26 @@ function App() {
     setRepositoryError(null);
     try {
       const picked = path || await desktopBridge!.pickDirectory({ fallbackPath: desktopRuntime?.workspaceRoot });
-      if (!picked) return;
+      if (!picked) {
+        setRepositoryDialogOpen(true);
+        return;
+      }
       setRepositoryPathInput(picked);
+      // 先校验再注册：越界目录不该变成一个 400 的英文 reason，而是给出可操作的出路。
+      const check = await validateRepository(picked);
+      if (!check.valid) {
+        const localizedByCode: Record<string, string> = {
+          PATH_OUTSIDE_WORKSPACE: t("desktop.rejectOutside"),
+          PATH_IS_FILESYSTEM_ROOT: t("desktop.rejectDriveRoot"),
+          PATH_NOT_FOUND: t("desktop.rejectNotFound"),
+          PATH_NOT_DIRECTORY: t("desktop.rejectNotDirectory"),
+        };
+        setOutsideRepositoryPath(check.reason_code === "PATH_OUTSIDE_WORKSPACE" ? picked : null);
+        setRepositoryError(localizedByCode[check.reason_code ?? ""] ?? check.reason ?? t("repositoryError"));
+        setRepositoryDialogOpen(true);
+        return;
+      }
+      setOutsideRepositoryPath(null);
       const repository = await registerRepository(picked);
       setRepositories(current => [repository, ...current.filter(item => item.id !== repository.id)]);
       openRegisteredFolder(repository.id);
@@ -673,15 +695,37 @@ function App() {
   const addRepository = () => { void openLocalFolder(); };
   const saveRepository = () => { if (repositoryPathInput.trim()) void openLocalFolder(repositoryPathInput.trim()); };
 
-  const changeWorkspaceRoot = async () => {
+  const requestWorkspaceChange = (suggestPath?: string) => {
     if (!desktopBridge) return;
+    setWorkspaceSuggestPath(suggestPath);
+    setWorkspaceConfirmOpen(true);
+  };
+
+  const applyWorkspaceChange = async () => {
+    if (!desktopBridge) return;
+    setWorkspaceConfirmOpen(false);
     setRepositorySaving(true);
     setRepositoryError(null);
     try {
-      const result = await desktopBridge.pickWorkspaceRoot();
+      const result = await desktopBridge.pickWorkspaceRoot(workspaceSuggestPath ? { suggestPath: workspaceSuggestPath } : undefined);
       if (result.canceled) return;
       setDesktopRuntime((current) => ({ ...(current ?? {}), ...result } as DesktopStatus));
-      if (result.error) setRepositoryError(result.error);
+      if (result.error) {
+        setRepositoryError(result.error);
+        return;
+      }
+      // 记住的端口没保住时，模块顶层解析出的 API 地址已经过期：整页重载取回新快照，
+      // 比让所有请求静默打到死端口上诚实得多。
+      if (result.apiBaseUrl && result.apiBaseUrl !== desktopBridge.status.apiBaseUrl) {
+        window.location.reload();
+        return;
+      }
+      setOutsideRepositoryPath(null);
+      if (activeTask?.runId) await stopAgentLoop(activeTask.runId).catch(() => {});
+      setSelectedRepositoryId("");
+      setSourceLocation(null);
+      startNewChatSession();
+      await loadOverviewData();
     } catch (error) {
       setRepositoryError(error instanceof Error ? error.message : t("repositoryError"));
     } finally {
@@ -1100,14 +1144,21 @@ function App() {
           {repositories.length ? <div className="folder-recents"><h3>{t("folder.recent")}</h3>{repositories.slice(0, 5).map(repository => <button type="button" className="folder-recent" key={repository.id} onClick={() => openRegisteredFolder(repository.id)} disabled={repositorySaving}><FolderOpen size={17} /><span><strong>{repository.name}</strong><small title={repository.path}>{repository.path}</small></span><ArrowUpRight size={14} /></button>)}</div> : null}
           {isDesktopShell ? <details className="folder-workspace-settings" open={Boolean(repositoryError)}><summary>{t("folder.workspaceSettings")}</summary><div className="desktop-runtime">
             <div className="desktop-runtime-row"><span>{t("desktop.workspaceRoot")}</span><code>{desktopRuntime?.workspaceRoot || t("common.none")}</code></div>
+            {outsideRepositoryPath ? <div className="desktop-runtime-row"><span>{t("desktop.pickedFolder")}</span><code>{outsideRepositoryPath}</code></div> : null}
             <div className="desktop-runtime-actions">
-              <button type="button" className="text-button" onClick={() => void changeWorkspaceRoot()} disabled={repositorySaving}><FolderSync size={13} /> {t("desktop.changeWorkspace")}</button>
+              <button type="button" className="text-button" onClick={() => requestWorkspaceChange()} disabled={repositorySaving}><FolderSync size={13} /> {t("desktop.changeWorkspace")}</button>
+              {outsideRepositoryPath ? <button type="button" className="text-button" onClick={() => requestWorkspaceChange(outsideRepositoryPath)} disabled={repositorySaving}><FolderOpen size={13} /> {t("desktop.switchRootToParent")}</button> : null}
               <button type="button" className="text-button" onClick={() => void desktopBridge?.openLog()}>{t("desktop.openLog")}</button>
             </div>
             <p className="desktop-runtime-hint">{t("desktop.workspaceHint")}</p>
           </div></details> : null}
           <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={repositorySaving} onClick={() => setRepositoryDialogOpen(false)}>{t("cancel")}</button><button className="small-action folder-confirm" disabled={repositorySaving || !repositoryPathInput.trim()}>{repositorySaving ? t("folder.opening") : t("folder.openAction")}</button></div>
         </form>
+      </Dialog>
+      <Dialog open={workspaceConfirmOpen} title={t("desktop.changeWorkspace")} onClose={() => setWorkspaceConfirmOpen(false)}>
+        <p>{t("desktop.workspaceConfirmBody")}</p>
+        {workspaceSuggestPath ? <p className="desktop-runtime-hint">{t("desktop.workspaceConfirmSuggest")} <code>{workspaceSuggestPath}</code></p> : null}
+        <div className="dialog-actions"><button className="small-action small-action--muted" onClick={() => setWorkspaceConfirmOpen(false)}>{t("cancel")}</button><button className="small-action" onClick={() => void applyWorkspaceChange()}>{t("common.confirm")}</button></div>
       </Dialog>
       <Dialog open={confirmAction !== null} title={confirmAction === "delete" ? t("patch.delete") : t("cancel")} onClose={() => setConfirmAction(null)}>
         <p>{confirmAction === "delete" ? t("patch.deleteConfirm") : t("cancelTaskConfirm")}</p>

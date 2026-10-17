@@ -122,7 +122,8 @@ def test_agent_loop_reports_running_and_can_be_stopped(model_api):
 
 
 @pytest.mark.parametrize("ignore_cancellation", [False, True])
-def test_stop_cancels_waiting_model_and_never_applies_its_reply(model_api, monkeypatch, ignore_cancellation):
+@pytest.mark.parametrize("action", ["stop", "pause", "cancel"])
+def test_stop_cancels_waiting_model_and_never_applies_its_reply(model_api, monkeypatch, ignore_cancellation, action):
     client, directory = model_api
     task = create_task(client, directory)
     original = (directory / "app.py").read_text(encoding="utf-8")
@@ -141,15 +142,50 @@ def test_stop_cancels_waiting_model_and_never_applies_its_reply(model_api, monke
     monkeypatch.setattr(main.agent_service.models, "propose_patch", delayed_model)
     post(client, f"/api/v1/runs/{task['run_id']}/loop", {})
     assert entered.wait(5)
-    post(client, f"/api/v1/runs/{task['run_id']}/loop/stop")
+    endpoint = f"/api/v1/runs/{task['run_id']}/loop/stop" if action == "stop" else f"/api/v1/tasks/{task['id']}/{action}"
+    post(client, endpoint)
     final = _wait_for_loop(client, task["id"], timeout=5)
     assert cancelled.is_set()
-    assert final["task"]["status"] == "coding"
+    assert final["task"]["status"] == {"stop": "coding", "pause": "paused", "cancel": "cancelled"}[action]
     assert (directory / "app.py").read_text(encoding="utf-8") == original
     assert client.get(f"/api/v1/runs/{task['run_id']}/checkpoints").json()["total"] == 0
     events = client.get(f"/api/v1/runs/{task['run_id']}/events").json()["items"]
     assert not any(event["action"] in {"patch.apply", "tests.run"} for event in events)
     assert events[-1]["summary"] == "Agent loop stopped by request"
+
+
+@pytest.mark.parametrize("overlap", ["same", "child", "separate"])
+def test_running_agent_reserves_overlapping_folders(model_api, tmp_path, monkeypatch, overlap):
+    client, _ = model_api
+    directory = tmp_path / "plain"
+    directory.mkdir()
+    (directory / "app.py").write_text("def value(): return 1", encoding="utf-8")
+    repository = post(client, "/api/v1/repositories", {"path": str(directory)})
+    first = post(client, "/api/v1/tasks", {"repository_id": repository["id"], "goal": "Fix app.py"})
+    entered = Event()
+    async def waiting(*args):
+        entered.set()
+        await asyncio.sleep(60)
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", waiting)
+    post(client, f"/api/v1/runs/{first['run_id']}/loop")
+    assert entered.wait(5)
+    try:
+        other = directory if overlap == "same" else directory / "child" if overlap == "child" else tmp_path / "separate"
+        other.mkdir(exist_ok=True)
+        registered = post(client, "/api/v1/repositories", {"path": str(other)})
+        second = post(client, "/api/v1/tasks", {"repository_id": registered["id"], "goal": "Fix files", "mode": "conservative"})
+        response = client.post(f"/api/v1/runs/{second['run_id']}/loop", json={})
+        if overlap == "separate":
+            assert response.status_code == 200
+            _wait_for_loop(client, second["id"])
+        else:
+            assert response.status_code == 409
+            assert response.json()["code"] == "WORKSPACE_BUSY"
+    finally:
+        post(client, f"/api/v1/runs/{first['run_id']}/loop/stop")
+        _wait_for_loop(client, first["id"], timeout=5)
+    post(client, f"/api/v1/runs/{second['run_id']}/loop")
+    _wait_for_loop(client, second["id"])
 
 
 def test_plain_folder_loop_validates_and_rolls_back_without_git(model_api, tmp_path):
