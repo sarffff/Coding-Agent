@@ -90,9 +90,20 @@ class RepositoryService:
             raise RepositoryError(
                 "PATH_OUTSIDE_WORKSPACE",
                 "Folder path must be inside the configured workspace root.",
-                {"workspace_root": str(root)},
+                {"path": str(path), "workspace_root": str(root)},
             ) from exc
         return path
+
+    def _assert_still_allowed(self, record: RepositoryRecord) -> None:
+        """Re-check containment on use: a workspace root can move after registration."""
+        root = self._workspace_root()
+        path = record.path.expanduser().resolve(strict=False)
+        if path.parent == path or not path.is_relative_to(root):
+            raise RepositoryError(
+                "PATH_OUTSIDE_WORKSPACE",
+                "This repository is outside the current workspace root. Choose a workspace that contains it.",
+                {"repository_id": record.id, "path": str(path), "workspace_root": str(root)},
+            )
 
     def _run_git(self, repo_path: Path, *args: str) -> str:
         try:
@@ -149,6 +160,12 @@ class RepositoryService:
 
     def register(self, raw_path: str, name: str | None = None) -> RepositorySummary:
         path = self._resolve_allowed_path(raw_path)
+        if path.parent == path:
+            raise RepositoryError(
+                "PATH_IS_FILESYSTEM_ROOT",
+                "Choose a repository folder, not a drive or filesystem root.",
+                {"path": str(path)},
+            )
         git_root = self._maybe_git_root(path)
         root = path
         repository_id = hashlib.sha256(os.fspath(root).encode("utf-8")).hexdigest()[:12]
@@ -170,6 +187,7 @@ class RepositoryService:
         record = self._repositories.get(repository_id)
         if record is None:
             raise RepositoryError("REPOSITORY_NOT_FOUND", "Repository is not registered.", {"repository_id": repository_id})
+        self._assert_still_allowed(record)
         return record
 
     def summary(self, record: RepositoryRecord) -> RepositorySummary:
