@@ -10,7 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from .approval_service import ApprovalService, plan_scope_hash
 from .audit_service import AuditService
 from .git_service import GitService
-from .model_provider import ModelProvider
+from .model_provider import ContextRequest, ModelProvider
 from .models import (
     AgentAction,
     AgentAdvanceRequest,
@@ -34,7 +34,7 @@ from .models import (
 from .patch_service import PatchService
 from .remote_service import RemoteService
 from .repository_service import RepositoryError
-from .task_service import TaskService
+from .task_service import TaskService, TaskStateError
 from .test_service import TestService
 
 
@@ -74,6 +74,9 @@ AUTO_GRANT: dict[AgentMode, frozenset[ApprovalType]] = {
 class AgentService:
     """Advance one local step, yielding to the existing patch and approval UI."""
 
+    # Model turns spent only on search/read before the run is declared stuck.
+    CONTEXT_ROUNDS = 4
+
     def __init__(
         self,
         tasks: TaskService,
@@ -94,6 +97,12 @@ class AgentService:
         self.patch = patch
         self.models = models
 
+    def validation_hash(self, task: TaskSummary) -> str:
+        if task.validation_checks:
+            # Required checks validate all readable inputs; committing the same bytes keeps the evidence valid.
+            return self.tests.input_hash(task.repository_id)
+        return self.git.validation_hash(task.repository_id, self.tasks.changed_files(task.id))
+
     def inspect(self, task_id: str) -> AgentStateResponse:
         task = self.tasks.get(task_id)
         iterations = self.tasks.list_iterations(task_id)
@@ -112,6 +121,7 @@ class AgentService:
             pending_approval=approval if approval and approval.status == "pending" else None,
             last_test=iteration.test_result if iteration else None,
             loop_running=self._loop_running(task_id),
+            validation_status=self.tasks.validation_status(task_id, self.validation_hash(task)) if task.validation_checks and task.repository_id else [],
         )
 
     async def advance(self, task_id: str, request: AgentAdvanceRequest) -> AgentAdvanceResponse:
@@ -309,7 +319,7 @@ class AgentService:
                 return AgentDecision("manual_review", "Resolve the validation environment, timeout or cancellation before retrying tests.")
             if result.validation_hash is None:
                 return AgentDecision("run_tests", "Task files changed during validation. Rerun tests before repairing.", can_advance=True)
-            current_hash = self.git.validation_hash(task.repository_id, self.tasks.changed_files(task.id))
+            current_hash = self.validation_hash(task)
             if current_hash != result.validation_hash:
                 return AgentDecision("run_tests", "Task files changed after the failure. Rerun tests before creating a repair iteration.", can_advance=True)
             return AgentDecision("start_repair", "Start a repair iteration using the latest test failure.", can_advance=True)
@@ -328,8 +338,8 @@ class AgentService:
                     requires_approval=not self.approvals.has_approved(task.id, kind), approval_type=kind,
                 )
         result = iteration.test_result
-        validation_hash = self.git.validation_hash(task.repository_id, self.tasks.changed_files(task.id))
-        verified = any(run.kind != "static" and run.status == "passed" and run.validation_hash == validation_hash for run in iteration.test_runs)
+        validation_hash = self.validation_hash(task)
+        verified = self.tasks.validation_passed(task.id, validation_hash)
         if not result or result.status != "passed" or result.validation_hash != validation_hash or not verified:
             return AgentDecision("run_tests", "Run project or selected tests for the current changes before final review.", can_advance=True)
         if not has_git:
@@ -345,17 +355,29 @@ class AgentService:
         self.tasks.assert_budget_available(task.id)
         if not task.repository_id:
             raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Task must be connected to a repository before running tests.")
-        files = self.tasks.changed_files(task.id)
-        before = self.git.validation_hash(task.repository_id, files)
+        before = self.validation_hash(task)
+        check = None
+        if request.check_id:
+            check = next((item for item in task.validation_checks if item.id == request.check_id), None)
+            if check is None:
+                raise RepositoryError("INVALID_TEST_TARGET", "Choose a validation check belonging to this task.")
+        elif task.validation_checks and request.kind == "auto" and not request.target and request.workdir == "." and not request.script:
+            statuses = self.tasks.validation_status(task.id, before)
+            check = next((item.check for item in statuses if item.status != "passed"), task.validation_checks[0])
+        if check:
+            request = TestRunRequest(**check.model_dump(exclude={"id", "label"}), check_id=check.id)
         self.tests.reserve(run_id)
         try:
             self.tasks.begin_test_run(run_id)
         except Exception:
             self.tests.release(run_id)
             raise
-        result = await run_in_threadpool(self.tests.run, run_id, task.repository_id, request.kind, request.timeout_seconds, request.target)
+        options = {"workdir": request.workdir, "script": request.script} if request.workdir != "." or request.script else {}
+        result = await run_in_threadpool(self.tests.run, run_id, task.repository_id, request.kind, request.timeout_seconds, request.target, **options)
+        result.check_id = check.id if check else None
+        result.workdir, result.target, result.script = request.workdir, request.target, request.script
         try:
-            after = self.git.validation_hash(task.repository_id, files)
+            after = self.validation_hash(task)
         except RepositoryError:
             after = None
         if before == after:
@@ -366,6 +388,7 @@ class AgentService:
         self.tasks.record_test_result(run_id, result)
         self.audit.record("tests.run", "succeeded" if result.status == "passed" else "failed", f"Test run {result.status}", task_id=task.id, run_id=run_id,
                           details={"test_id": result.id, "kind": result.kind, "command": result.command, "exit_code": result.exit_code,
+                                   "check_id": result.check_id, "workdir": result.workdir,
                                    "failed_tests": [failure.model_dump() for failure in result.failed_tests]})
         return result
 
@@ -388,15 +411,22 @@ class AgentService:
         goal = request.feedback or iteration.goal
         context_files = self._gather_context(task.repository_id, request.context_paths, task.id, goal, failed_test)
         repository = self.tasks.repositories.get(task.repository_id)
+        rounds = 0
+        while True:
+            proposal = await self._propose(task, goal, context_files, failure)
+            if not proposal.context_requests:
+                break
+            # Bounded on purpose: a model that keeps asking for context must stop, not loop.
+            if rounds >= self.CONTEXT_ROUNDS:
+                raise RepositoryError(
+                    "MODEL_CONTEXT_LIMIT",
+                    "The model kept requesting context without proposing edits. Narrow the goal or add the files to context_paths.",
+                    {"requests": [item.model_dump(exclude_none=True) for item in proposal.context_requests]},
+                )
+            rounds += 1
+            goal, context_files = self._resolve_context_requests(task, goal, context_files, proposal.context_requests)
+        # Edits are applied against the content the model actually saw, so hashes come from the final context.
         baselines = {repository.path / path: self.patch._content_hash(content) for path, content in context_files}
-        # ponytail: model calls share the task's remote-call budget (one counter with git-host calls); split if it ever matters.
-        self.tasks.consume_remote_call(task.id)
-        succeeded = False
-        try:
-            proposal = await self.models.propose_patch(goal, context_files, failure)
-            succeeded = True
-        finally:
-            self.tasks.record_remote_result(task.id, succeeded)
         files = []
         for proposed in proposal.files:
             target = self.tasks.repositories._safe_repo_path(repository, proposed.path.replace("\\", "/"))
@@ -458,6 +488,72 @@ class AgentService:
             f"- languages: {languages}\n- package manager: {ctx.package_manager or 'none'}\n"
             f"- entry files: {entries}\n- file count: {ctx.file_count}"
         )
+
+    async def _propose(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], failure: str | None):
+        """One model turn; a stop or pause while it runs discards the reply instead of applying it."""
+        # ponytail: model calls share the task's remote-call budget (one counter with git-host calls); split if it ever matters.
+        self.tasks.consume_remote_call(task.id)
+        succeeded = False
+        try:
+            proposal = await self.models.propose_patch(goal, context_files, failure)
+            succeeded = True
+        finally:
+            self.tasks.record_remote_result(task.id, succeeded)
+        current = self.tasks.get(task.id)
+        if current.status in {"paused", "cancelled", "done"}:
+            raise TaskStateError("The task stopped while the model was drafting; the reply was discarded.", {"status": current.status})
+        return proposal
+
+    def _resolve_context_requests(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], requests: list[ContextRequest]) -> tuple[str, list[tuple[str, str]]]:
+        """Run the model's search/read requests and fold the results into the next prompt.
+
+        A request that cannot be served (protected, missing, binary) is reported back to the
+        model as a failed note; it never turns into file content, and the caller's round cap
+        stops a model that keeps asking for the same thing.
+        """
+        notes: list[str] = []
+        for request in requests:
+            if request.action == "search":
+                try:
+                    matches, _ = self.tasks.repositories.search(task.repository_id, SearchRequest(query=request.query, max_results=10))
+                except RepositoryError as exc:
+                    notes.append(f"Search {request.query!r} failed: {exc.message}")
+                    self.audit.record("context.request", "failed", f"Search failed: {request.query}", task_id=task.id, run_id=task.run_id,
+                                      details={"action": "search", "query": request.query, "error": exc.code})
+                    continue
+                paths = list(dict.fromkeys(match.path for match in matches))
+                notes.append(f"Search {request.query!r} matched: " + (", ".join(paths) if paths else "nothing"))
+                self.audit.record("context.request", "succeeded", f"Searched for {request.query}", task_id=task.id, run_id=task.run_id,
+                                  details={"action": "search", "query": request.query, "paths": paths[:10]})
+                continue
+            try:
+                source = self.tasks.repositories.read_file(task.repository_id, request.path)
+            except RepositoryError as exc:
+                notes.append(f"Read {request.path} failed: {exc.message}")
+                self.audit.record("context.request", "failed", f"Could not read {request.path}", task_id=task.id, run_id=task.run_id,
+                                  details={"action": "read", "path": request.path, "error": exc.code})
+                continue
+            if source.path not in {path for path, _ in context_files}:
+                context_files = [*context_files, (source.path, source.content)]
+            notes.append(f"Read {source.path}.")
+            self.audit.record("context.request", "succeeded", f"Read {source.path}", task_id=task.id, run_id=task.run_id,
+                              details={"action": "read", "path": source.path})
+        if notes:
+            goal = goal + "\n\n# Context results\n" + "\n".join(notes)
+        return goal, self._trim_context(context_files)
+
+    def _trim_context(self, context_files: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Keep the newest files within the configured count and byte budget."""
+        limit = self.tasks.settings.llm_max_context_files
+        budget = self.tasks.settings.llm_max_context_bytes
+        kept: list[tuple[str, str]] = []
+        for path, content in reversed(context_files):
+            size = len(content.encode("utf-8"))
+            if len(kept) >= limit or size > budget:
+                continue
+            kept.append((path, content))
+            budget -= size
+        return list(reversed(kept))
 
     def _gather_context(self, repository_id: str, context_paths: list[str], task_id: str, goal: str, failure: TestRunResponse | None) -> list[tuple[str, str]]:
         repositories = self.tasks.repositories
@@ -580,6 +676,8 @@ class AgentService:
         body = (task.goal.strip().splitlines()[0] if task.goal.strip() else "agent change")[:180]
         message = f"{task.id}: {body}"  # ponytail: templated from the goal; a model-drafted commit message can replace this later
         prepared = self.git.preview(repository_id, files, message)
+        if not self.tasks.validation_passed(task.id, self.validation_hash(task)):
+            raise RepositoryError("TEST_RESULTS_STALE", "Run all required validation checks before committing.")
         if not self._gate(task, "write", prepared.scope_hash):
             return False
         head = self.git.commit(repository_id, files, message, prepared.scope_hash, task.task_branch or "")

@@ -11,7 +11,10 @@ from .store import StateStore
 
 
 def plan_scope_hash(task: TaskSummary) -> str:
-    return hashlib.sha256((task.id + "\n" + task.goal + "\n" + (task.plan.objective if task.plan else "")).encode("utf-8")).hexdigest()
+    scope = task.id + "\n" + task.goal + "\n" + (task.plan.objective if task.plan else "")
+    if task.validation_checks:
+        scope += "\n" + "\n".join(check.model_dump_json() for check in task.validation_checks)
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()
 
 
 @dataclass(slots=True)

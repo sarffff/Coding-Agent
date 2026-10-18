@@ -45,13 +45,12 @@ def test_register_summary_tree_and_search(repository: tuple[Path, RepositoryServ
     assert matches[0].line == 2
 
 
-def test_rejects_path_outside_workspace(repository: tuple[Path, RepositoryService], tmp_path: Path) -> None:
+def test_allows_path_outside_workspace(repository: tuple[Path, RepositoryService], tmp_path: Path) -> None:
     _, service = repository
     outside = tmp_path.parent / "outside"
-    outside.mkdir()
-    with pytest.raises(RepositoryError) as error:
-        service.register(str(outside))
-    assert error.value.code == "PATH_OUTSIDE_WORKSPACE"
+    outside.mkdir(exist_ok=True)
+    summary = service.register(str(outside))
+    assert summary.path == str(outside.resolve())
 
 
 def test_patch_apply_and_rollback(repository: tuple[Path, RepositoryService]) -> None:

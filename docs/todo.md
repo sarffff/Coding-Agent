@@ -1,6 +1,6 @@
 # Coding-Agent 当前进度与后续 TODO
 
-## 当前判断（2026-10-12）
+## 当前判断（2026-10-17）
 
 以当前工作区实现为准，旧阶段清单的勾选数不再代表最新完成比例。当前是本地 Coding Agent 的集成版本：文件夹修改、验证、检查点与可选 Git 发布已实现；真实模型完成质量和桌面交付仍需验收。
 
@@ -18,10 +18,15 @@
 - [x] 模型起草、Cowork 和 GitHub Provider 调用纳入同一预算；远程成功不清除连续失败计数，只有测试通过清零。
 - [x] 修复聊天领域状态与发布入口、首次错误可见、失败保留输入、发送/审批防重复、Cowork 无文件夹选择。
 - [x] 补充普通目录、Git 子目录、空 Git、停止、上下文、预算和保守模式回归，以及真实 React 组件渲染检查 `pnpm desktop:chat-check`。
-- [x] API 全量回归：109 passed、1 skipped（主机不能创建测试符号链接）；后续检查点差异持久化专项 10 passed，模型并发保护、编码循环与模式专项 26 passed（专项与全量有重叠，不累加）。
-- [x] `pnpm build`（包含 TypeScript 检查）、`pnpm desktop:chat-check`、`pnpm desktop:smoke` 通过。
+- [x] 必跑验证清单：任务可配置最多 12 条检查（`kind`/`workdir`/`target`/`script`/`timeout`），默认按根 `package.json` 推导；清单全绿才允许提交，验证结果绑定整仓输入哈希，首轮开始后锁定。
+- [x] 模型编辑协议：`edits` 精确替换（`old_text` 唯一匹配、累计最多 100 处）与 `context_requests` 自查上下文（最多 4 轮，超限报 `MODEL_CONTEXT_LIMIT`，暂停/停止丢弃迟到回复）。
+- [x] 打开文件夹不再受工作区根约束：只拒绝盘符与文件系统根，`FORGE_WORKSPACE_ROOT` 退化为默认起点。
+- [x] API 全量回归：218 passed（15m17s）；`pnpm check`、`pnpm build`、`pnpm desktop:smoke`、`pnpm desktop:chat-check` 全过。
 - [ ] 浏览器完整点击验收：本轮打开本地验收页面被自动审批服务 503 阻断，未执行；组件检查不能替代点击回放。
-- [ ] 正常 Windows 环境下的 Electron 原生目录选择、窗口、工作区切换验收。
+- [x] 桌面壳真机启动与交互自检：`pnpm desktop:electron:smoke` 退出码 0、14 条断言全过——协议来源与 CSS 子资源都走 `forge-app://desktop`、渲染进程直接 `fetch` 壳托管的 API（特权 scheme 的 CORS 边界由此从推断变成实证）、受控输入使「发送」退出 disabled、端口记忆落盘、以及选择器之后的完整链路（登记 → 侧栏 → 选中 → 文件树 → 读到正文标记串）。前提是 `electron/dist` 拿到 `ALL APPLICATION PACKAGES` 只读授权。
+- [ ] 桌面仍需人工的三项：原生目录选择器、更换工作区根的确认框、深色主题对比度。前两项会弹模态对话框、把自动检查死锁，不能进自检；第三项是纯视觉判断。
+- [x] 桌面壳自检在 2026-10-17 重跑：14/14 断言全过、退出码 0。本轮顺带修掉一个真缺陷——从 Electron 宿主终端（IDE / VS Code / WorkBuddy）启动时，继承的 `ELECTRON_RUN_AS_NODE=1` 会让 `electron.exe` 退化成纯 Node，`main.cjs` 在 `app.setName` 处直接崩；启动器现在会剥离该变量。
+- [ ] 沙箱 ACL 的授权方式仍需拍板：当前分支的 `scripts/electron.js` **不会**自动执行 `icacls`（`ensureWindowsSandboxAcl()` 只存在于未合入的 stash 里），授权靠操作者按 README 手动做一次。本机已授权。若要恢复自动授权，需先定「静默改仓库外权限」是否可接受；否则保持手动，并在缺授权时给出可复制的命令。
 
 ## 后续优先级
 

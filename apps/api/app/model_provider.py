@@ -1,32 +1,74 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Literal
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .config import Settings
 from .models import PatchFile
 from .repository_service import RepositoryError
 
 
+def _relative_path(value: str) -> str:
+    path = PurePosixPath(value.replace("\\", "/"))
+    if not path.parts or path.is_absolute() or ".." in path.parts or PureWindowsPath(path.as_posix()).drive or "\x00" in value:
+        raise ValueError("Paths must be repository-relative and cannot contain '..'.")
+    return path.as_posix()
+
+
+class ContextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["search", "read"]
+    query: str | None = Field(default=None, min_length=1, max_length=500)
+    path: str | None = Field(default=None, min_length=1, max_length=4_096)
+
+    @model_validator(mode="after")
+    def validate_action(self) -> ContextRequest:
+        if self.action == "search":
+            if not self.query or not self.query.strip() or self.path is not None:
+                raise ValueError("A search request requires a query and cannot include a path.")
+            self.query = self.query.strip()
+        else:
+            if self.path is None or self.query is not None:
+                raise ValueError("A read request requires a path and cannot include a query.")
+            self.path = _relative_path(self.path)
+        return self
+
+
 @dataclass(slots=True)
 class PatchProposal:
-    files: list[PatchFile]
+    files: list[PatchFile] = field(default_factory=list)
     rationale: str = ""
+    context_requests: list[ContextRequest] = field(default_factory=list)
 
 
 _SYSTEM_PROMPT = (
     "You are a coding agent that edits files in a user's repository. Given a goal and the "
-    "current content of relevant files, produce the minimal set of whole-file edits that "
-    "achieve it. Respond with ONLY a single JSON object, no prose and no markdown fences:\n"
+    "current content of relevant files, produce the minimal set of edits that achieve it. "
+    "First search and read more files if you need implementation, callers, or tests to understand the change. "
+    "Respond with ONLY one JSON object: request context OR propose edits, never both. "
+    "To request context (at most 8 requests per response):\n"
+    '{"context_requests": [{"action": "search", "query": "<literal text or filename>"}, '
+    '{"action": "read", "path": "<repo-relative path>"}]}\n'
+    "To propose edits, no prose and no markdown fences:\n"
     '{"rationale": "<one short paragraph>", "files": [{"path": "<repo-relative path>", '
     '"operation": "create|update|delete", "content": "<COMPLETE new file content; omit for delete>"}]}\n'
+    "For an update, prefer `edits` instead of `content`: "
+    '[{"old_text": "<exact existing text>", "new_text": "<replacement text>"}]. '
+    "Edits run in order; each nonempty old_text must match exactly once at that point. "
+    "Use at most 100 edits in total. Do not combine content and edits; create/delete cannot use edits. "
     "Rules: only touch files the goal needs; `content` is the whole file, never a diff; never "
     "write secrets or files under .env/keys/vendor/build dirs; keep the existing code style. "
-    "Only update or delete files whose complete contents are supplied in the context; otherwise only create new files."
+    "Only update or delete files whose complete contents are supplied in the context; request a read first otherwise. "
+    "All paths must be repository-relative with no '..' components."
 )
 
 _CHAT_SYSTEM_PROMPT = (
@@ -45,7 +87,7 @@ def extract_proposal_json(text: str) -> dict:
     """Pull the proposal JSON object out of a model reply.
 
     Tolerates ```json fences and surrounding prose by decoding the first `{...}` that
-    parses as an object with a `files` key. Uses json.raw_decode (not a brace counter)
+    parses as an object with a `files` or `context_requests` key. Uses json.raw_decode (not a brace counter)
     so braces inside the generated file content never confuse the span boundaries.
     """
     if not text or not text.strip():
@@ -57,26 +99,65 @@ def extract_proposal_json(text: str) -> dict:
             parsed, _ = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and "files" in parsed:
+        if isinstance(parsed, dict) and ("files" in parsed or "context_requests" in parsed):
             return parsed
     raise RepositoryError("MODEL_INVALID_OUTPUT", "The model response did not contain a valid patch proposal.")
 
-def _proposal_from_payload(payload: dict) -> PatchProposal:
-    raw_files = payload.get("files")
-    if not isinstance(raw_files, list) or not raw_files:
+def _proposal_from_payload(payload: dict, context_files: list[tuple[str, str]] | None = None) -> PatchProposal:
+    raw_files = payload.get("files", [])
+    raw_requests = payload.get("context_requests", [])
+    if not isinstance(raw_files, list) or not isinstance(raw_requests, list) or (raw_files and raw_requests):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "Return either file edits or context requests, not both.")
+    rationale = payload.get("rationale")
+    rationale = rationale if isinstance(rationale, str) else ""
+    if raw_requests:
+        if len(raw_requests) > 8:
+            raise RepositoryError("MODEL_INVALID_OUTPUT", "Request at most 8 context operations at a time.")
+        try:
+            requests = [ContextRequest.model_validate(item) for item in raw_requests]
+        except ValidationError as exc:
+            raise RepositoryError("MODEL_INVALID_OUTPUT", f"Invalid context request: {exc}") from exc
+        return PatchProposal(rationale=rationale, context_requests=requests)
+    if not raw_files:
         raise RepositoryError("MODEL_INVALID_OUTPUT", "The model proposal did not list any file edits.")
+    context = {os.path.normcase(_relative_path(path)): (path, content) for path, content in context_files or []}
     files: list[PatchFile] = []
+    edit_count = 0
     for item in raw_files:
         if not isinstance(item, dict):
             raise RepositoryError("MODEL_INVALID_OUTPUT", "Each proposed edit must be a JSON object.")
         try:
-            files.append(PatchFile.model_validate(
+            proposed = PatchFile.model_validate(
                 {"path": item.get("path"), "operation": item.get("operation", "update"), "content": item.get("content")}
-            ))
-        except Exception as exc:  # pydantic validation of the untrusted model output
+            )
+            proposed.path = _relative_path(proposed.path)
+        except (ValidationError, ValueError) as exc:
             raise RepositoryError("MODEL_INVALID_OUTPUT", f"Invalid proposed edit: {exc}") from exc
-    rationale = payload.get("rationale")
-    return PatchProposal(files=files, rationale=rationale if isinstance(rationale, str) else "")
+        baseline = context.get(os.path.normcase(proposed.path))
+        if "edits" in item:
+            edits = item["edits"]
+            if proposed.operation != "update" or "content" in item or not isinstance(edits, list) or not edits:
+                raise RepositoryError("MODEL_INVALID_OUTPUT", "Only updates can use a nonempty edits list, without content.")
+            edit_count += len(edits)
+            if edit_count > 100:
+                raise RepositoryError("MODEL_INVALID_OUTPUT", "Propose at most 100 text edits at a time.")
+        if proposed.operation != "create" and baseline is None:
+            raise RepositoryError("MODEL_CONTEXT_REQUIRED", "Read the complete file before proposing changes.", {"path": proposed.path})
+        if baseline is not None:
+            proposed.path = _relative_path(baseline[0])
+        if "edits" in item:
+            content = baseline[1]
+            for edit in edits:
+                if not isinstance(edit, dict) or not isinstance(edit.get("old_text"), str) or not edit["old_text"] or not isinstance(edit.get("new_text"), str):
+                    raise RepositoryError("MODEL_INVALID_OUTPUT", "Each text edit requires nonempty old_text and string new_text.")
+                old_text = edit["old_text"]
+                match = content.find(old_text)
+                if match < 0 or match != content.rfind(old_text):
+                    raise RepositoryError("MODEL_EDIT_CONFLICT", "The text to replace must appear exactly once in the current file.", {"path": proposed.path})
+                content = content[:match] + edit["new_text"] + content[match + len(old_text):]
+            proposed.content = content
+        files.append(proposed)
+    return PatchProposal(files=files, rationale=rationale)
 
 
 def _build_prompt(goal: str, context_files: list[tuple[str, str]], failure: str | None) -> str:
@@ -87,7 +168,7 @@ def _build_prompt(goal: str, context_files: list[tuple[str, str]], failure: str 
         parts.append("# Current files")
         parts += [f"## {path}\n```\n{content}\n```" for path, content in context_files]
     else:
-        parts.append("# Current files\n(None supplied; create the files the goal needs.)")
+        parts.append("# Current files\n(None supplied; search and read existing files before modifying them.)")
     return "\n\n".join(parts)
 
 
@@ -140,7 +221,7 @@ class AnthropicModelProvider(ModelProvider):
         )
         blocks = data.get("content") or []
         text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text")
-        return _proposal_from_payload(extract_proposal_json(text))
+        return _proposal_from_payload(extract_proposal_json(text), context_files)
 
     async def chat(self, messages: list[tuple[str, str]], system: str | None = None) -> str:
         if not self.settings.anthropic_api_key:
@@ -177,7 +258,7 @@ class OpenAIModelProvider(ModelProvider):
         )
         choices = data.get("choices") or []
         text = choices[0].get("message", {}).get("content", "") if choices and isinstance(choices[0], dict) else ""
-        return _proposal_from_payload(extract_proposal_json(text))
+        return _proposal_from_payload(extract_proposal_json(text), context_files)
 
     async def chat(self, messages: list[tuple[str, str]], system: str | None = None) -> str:
         if not self.settings.openai_api_key:

@@ -18,6 +18,8 @@ from .models import (
     TaskSummary,
     TaskTrack,
     TestRunResponse,
+    ValidationCheck,
+    ValidationCheckStatus,
 )
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
 from .retention import prune_test_outputs
@@ -201,10 +203,14 @@ class TaskService:
         self._persist(record)
         return record.summary
 
-    def create(self, goal: str, repository_id: str | None = None, mode: AgentMode = "standard", track: TaskTrack = "code") -> TaskSummary:
+    def create(self, goal: str, repository_id: str | None = None, mode: AgentMode = "standard", track: TaskTrack = "code", validation_checks: list[ValidationCheck] | None = None) -> TaskSummary:
         repository: RepositoryRecord | None = None
         if repository_id:
             repository = self.repositories.get(repository_id)
+        if validation_checks:
+            if track != "code" or not repository:
+                raise TaskStateError("Validation checks require a coding task with a repository.")
+            self._validate_check_paths(repository, validation_checks)
         now = datetime.now(timezone.utc)
         task_id = f"task-{uuid4().hex[:10]}"
         run_id = f"run-{uuid4().hex[:10]}"
@@ -222,6 +228,7 @@ class TaskService:
                 status="awaiting_approval", plan=self._build_plan(goal, repository), created_at=now, updated_at=now,
                 next_action="Review and approve the task plan before the first coding iteration.",
                 budget=self._new_budget(), mode=mode, track="code",
+                validation_checks=validation_checks or [],
             )
         self._tasks[task_id] = TaskRecord(summary=summary)
         self._persist(self._tasks[task_id])
@@ -256,6 +263,53 @@ class TaskService:
 
     def changed_files(self, task_id: str) -> list[str]:
         return sorted({name for iteration in self._record(task_id).iterations if not iteration.rolled_back for name in iteration.changed_files})
+
+    def set_validation_checks(self, task_id: str, checks: list[ValidationCheck]) -> TaskSummary:
+        self.assert_recovered(task_id)
+        record = self._record(task_id)
+        if record.summary.track != "code" or record.iterations or record.summary.status != "awaiting_approval":
+            raise TaskStateError("Configure validation checks before the first coding iteration.")
+        if not record.summary.repository_id:
+            raise TaskStateError("Validation checks require a repository.")
+        self._validate_check_paths(self.repositories.get(record.summary.repository_id), checks)
+        record.summary.validation_checks = checks
+        record.summary.updated_at = datetime.now(timezone.utc)
+        record.summary.next_action = "Review and approve the plan and required validation checks."
+        self._persist(record)
+        return record.summary
+
+    def _validate_check_paths(self, repository: RepositoryRecord, checks: list[ValidationCheck]) -> None:
+        for check in checks:
+            directory = self.repositories._safe_repo_path(repository, check.workdir)
+            if not directory.is_dir():
+                raise RepositoryError("INVALID_TEST_TARGET", "Validation working directory must exist inside the repository.")
+            if check.target:
+                target = self.repositories._safe_repo_path(repository, check.workdir + "/" + check.target.split("::", 1)[0])
+                if not target.is_relative_to(directory):
+                    raise RepositoryError("INVALID_TEST_TARGET", "The test target must stay inside its working directory.")
+
+    def validation_status(self, task_id: str, validation_hash: str | None) -> list[ValidationCheckStatus]:
+        record = self._record(task_id)
+        iteration = record.iterations[-1] if record.iterations else None
+        runs = iteration.test_runs if iteration and not iteration.rolled_back else []
+        statuses = []
+        for check in record.summary.validation_checks:
+            result = next((run for run in reversed(runs) if run.check_id == check.id), None)
+            status = "pending" if result is None else "stale" if not validation_hash or result.validation_hash != validation_hash else result.status
+            statuses.append(ValidationCheckStatus(check=check, status=status, result=result))
+        return statuses
+
+    def validation_passed(self, task_id: str, validation_hash: str | None) -> bool:
+        record = self._record(task_id)
+        if not validation_hash or not record.iterations or record.iterations[-1].rolled_back:
+            return False
+        statuses = self.validation_status(task_id, validation_hash)
+        if statuses:
+            return all(item.status == "passed" for item in statuses)
+        iteration = record.iterations[-1]
+        latest = iteration.test_result
+        return bool(latest and latest.status == "passed" and latest.validation_hash == validation_hash
+                    and any(run.kind != "static" and run.status == "passed" and run.validation_hash == validation_hash for run in iteration.test_runs))
 
     def list_iterations(self, task_id: str) -> list[TaskIteration]:
         record = self._record(task_id)
@@ -333,9 +387,13 @@ class TaskService:
             return iteration
         if result.status == "passed":
             record.summary.budget.consecutive_failures = 0
-            iteration.status = "passed"
-            self._transition(record, "ready_for_pr")
-            record.summary.next_action = "Review the final diff and approve commit or PR creation."
+            if record.summary.validation_checks and not self.validation_passed(record.summary.id, result.validation_hash):
+                iteration.status = "testing"
+                record.summary.next_action = "Run the remaining required validation checks."
+            else:
+                iteration.status = "passed"
+                self._transition(record, "ready_for_pr")
+                record.summary.next_action = "Review the final diff and approve commit or PR creation."
         else:
             record.summary.budget.consecutive_failures += 1
             iteration.status = "failed"

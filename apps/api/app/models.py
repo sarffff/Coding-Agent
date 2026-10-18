@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 
 class ApiError(BaseModel):
@@ -149,11 +150,61 @@ AgentMode = Literal["conservative", "standard", "autonomous"]
 TaskTrack = Literal["cowork", "code"]
 
 
+TestKind = Literal["auto", "pytest", "frontend", "static", "script"]
+
+
+class TestRunRequest(BaseModel):
+    kind: TestKind = "auto"
+    timeout_seconds: int = Field(default=30, ge=1, le=300)
+    target: str | None = Field(default=None, max_length=500)
+    workdir: str = Field(default=".", min_length=1, max_length=500)
+    script: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9:_.-]*$", max_length=100)
+    check_id: str | None = Field(default=None, max_length=80)
+
+
+class ValidationCheck(BaseModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    label: str = Field(min_length=1, max_length=120)
+    kind: TestKind = "auto"
+    workdir: str = Field(default=".", min_length=1, max_length=500)
+    target: str | None = Field(default=None, max_length=500)
+    script: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9:_.-]*$", max_length=100)
+    timeout_seconds: int = Field(default=30, ge=1, le=300)
+
+    @model_validator(mode="after")
+    def valid_command(self):
+        if self.kind == "script" and (not self.script or self.target):
+            raise PydanticCustomError("invalid_check", "A script check requires a script name and no test target.")
+        if self.kind != "script" and self.script:
+            raise PydanticCustomError("invalid_check", "Only script checks accept a script name.")
+        return self
+
+
+def unique_checks(checks: list[ValidationCheck]) -> None:
+    if len({check.id for check in checks}) != len(checks):
+        raise PydanticCustomError("duplicate_check_id", "Validation check ids must be unique.")
+
+
+class ValidationChecksRequest(BaseModel):
+    checks: list[ValidationCheck] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def unique_ids(self):
+        unique_checks(self.checks)
+        return self
+
+
 class TaskCreateRequest(BaseModel):
     goal: str = Field(min_length=3, max_length=4_000)
     repository_id: str | None = None
     mode: AgentMode = "standard"
     track: TaskTrack = "code"
+    validation_checks: list[ValidationCheck] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def unique_ids(self):
+        unique_checks(self.validation_checks)
+        return self
 
 
 class ChatMessageRequest(BaseModel):
@@ -215,6 +266,7 @@ class TaskSummary(BaseModel):
     budget: TaskBudget = Field(default_factory=TaskBudget)
     mode: AgentMode = "standard"
     track: TaskTrack = "code"
+    validation_checks: list[ValidationCheck] = Field(default_factory=list)
 
 
 IterationStatus = Literal["coding", "testing", "passed", "failed", "cancelled"]
@@ -538,15 +590,6 @@ class RollbackResponse(BaseModel):
     restored_checkpoint_ids: list[str] = Field(default_factory=list)
 
 
-TestKind = Literal["auto", "pytest", "frontend", "static"]
-
-
-class TestRunRequest(BaseModel):
-    kind: TestKind = "auto"
-    timeout_seconds: int = Field(default=30, ge=1, le=300)
-    target: str | None = Field(default=None, max_length=500)
-
-
 class TestFailure(BaseModel):
     path: str | None = None
     line: int | None = None
@@ -569,6 +612,16 @@ class TestRunResponse(BaseModel):
     output_pruned: bool = False
     validation_hash: str | None = None
     failed_tests: list[TestFailure] = Field(default_factory=list)
+    check_id: str | None = None
+    workdir: str = "."
+    target: str | None = None
+    script: str | None = None
+
+
+class ValidationCheckStatus(BaseModel):
+    check: ValidationCheck
+    status: Literal["pending", "stale", "passed", "failed", "timed_out", "not_found", "blocked", "cancelled"]
+    result: TestRunResponse | None = None
 
 
 TaskIteration.model_rebuild()
@@ -620,6 +673,7 @@ class AgentStateResponse(BaseModel):
     pending_approval: ApprovalSummary | None = None
     last_test: TestRunResponse | None = None
     loop_running: bool = False
+    validation_status: list[ValidationCheckStatus] = Field(default_factory=list)
 
 
 class AgentAdvanceResponse(AgentStateResponse):

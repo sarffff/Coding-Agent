@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     max_tree_entries: int = 5_000
     max_search_results: int = 200
     git_timeout_seconds: int = 10
-    command_timeout_seconds: int = 30
+    command_timeout_seconds: int = 300
     github_token: str | None = None
     allowed_remote_hosts: list[str] = ["github.com"]
     allowed_repositories: list[str] = []

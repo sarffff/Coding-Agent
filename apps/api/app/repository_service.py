@@ -78,20 +78,14 @@ class RepositoryService:
         key = self._keys.setdefault(record.id, self.store.next_key("repositories"))
         self.store.put("repositories", key, record, record.registered_at.isoformat())
 
-    def _workspace_root(self) -> Path:
-        return self.settings.workspace_root.expanduser().resolve()
-
     def _resolve_allowed_path(self, raw_path: str | Path) -> Path:
         path = Path(raw_path).expanduser().resolve(strict=False)
-        root = self._workspace_root()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
+        if path.parent == path:
             raise RepositoryError(
-                "PATH_OUTSIDE_WORKSPACE",
-                "Folder path must be inside the configured workspace root.",
-                {"workspace_root": str(root)},
-            ) from exc
+                "PATH_IS_FILESYSTEM_ROOT",
+                "Choose a repository folder, not a drive or filesystem root.",
+                {"path": str(path)},
+            )
         return path
 
     def _run_git(self, repo_path: Path, *args: str) -> str:

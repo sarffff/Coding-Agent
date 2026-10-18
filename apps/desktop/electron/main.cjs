@@ -29,14 +29,33 @@ function logFile() {
 }
 
 function stateDir() {
-  return path.join(app.getPath("userData"), "state");
+  return path.join(app.getPath("userData"), SMOKE ? "state-smoke" : "state");
+}
+
+/**
+ * The self-check registers a throwaway repository, and the API has no unregister
+ * endpoint, so smoke runs get roots they can be destroyed again instead of the
+ * operator's real desktop state.
+ */
+function acceptanceWorkspaceRoot() {
+  return path.join(app.getPath("home"), "forge-workspace-acceptance");
+}
+
+function resetSmokeRoots() {
+  fs.rmSync(stateDir(), { recursive: true, force: true });
+  fs.rmSync(acceptanceWorkspaceRoot(), { recursive: true, force: true });
+}
+
+function currentWorkspaceRoot() {
+  if (SMOKE) return acceptanceWorkspaceRoot();
+  const settings = config ? config.read() : { workspaceRoot: "" };
+  return settings.workspaceRoot || defaultWorkspaceRoot();
 }
 
 function statusPayload() {
-  const settings = config ? config.read() : { workspaceRoot: "" };
   return {
     apiBaseUrl: backend ? `http://127.0.0.1:${backend.port}` : "",
-    workspaceRoot: settings.workspaceRoot || defaultWorkspaceRoot(),
+    workspaceRoot: currentWorkspaceRoot(),
     stateDir: stateDir(),
     logFile: backend?.logFile || logFile(),
     version: app.getVersion(),
@@ -65,7 +84,7 @@ async function startManagedBackend() {
   if (!apiRoot) {
     throw new Error("打包版没有内置 Python API。请设置 FORGE_API_ROOT 指向仓库根目录，或先用 pnpm desktop:electron 以源码方式运行。");
   }
-  const workspaceRoot = config.read().workspaceRoot || defaultWorkspaceRoot();
+  const workspaceRoot = currentWorkspaceRoot();
   backend = await startBackend({
     repoRoot: apiRoot,
     workspaceRoot,
@@ -153,6 +172,7 @@ function createWindow() {
 }
 
 async function boot() {
+  if (SMOKE) resetSmokeRoots();
   try {
     await startManagedBackend();
   } catch (error) {
@@ -176,28 +196,146 @@ async function boot() {
   if (SMOKE) await runSmokeChecks();
 }
 
+const INTERACTION_PROBE = `(async () => {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const steps = [];
+  const add = (name, ok, detail) => {
+    steps.push({ step: name, ok: Boolean(ok), detail: String(detail === undefined ? "" : detail).slice(0, 180) });
+  };
+
+  add("协议来源", location.origin === "forge-app://desktop", location.origin);
+
+  const bodyBackground = getComputedStyle(document.body).backgroundColor;
+  add("样式随协议加载", bodyBackground !== "rgba(0, 0, 0, 0)", bodyBackground);
+
+  const bridge = window.forge;
+  add("桥可用", Boolean(bridge && typeof bridge.pickDirectory === "function" && typeof bridge.pickWorkspaceRoot === "function"), typeof bridge);
+
+  let api = { status: -1, items: null };
+  try {
+    const response = await fetch(bridge.status.apiBaseUrl + "/api/v1/repositories");
+    const json = await response.json().catch(() => null);
+    api = { status: response.status, items: json && Array.isArray(json.items) ? json.items.length : null };
+  } catch (failure) {
+    api = { status: -1, items: String(failure) };
+  }
+  add("渲染进程直连 API", api.status === 200 && typeof api.items === "number", JSON.stringify(api));
+
+  const box = [...document.querySelectorAll("textarea")].find((el) => (el.getAttribute("aria-label") || "").includes("描述目标"));
+  if (box) {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+    setValue.call(box, "桌面端交互验收探针");
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    await wait(150);
+    // The send button carries only an icon; its accessible name comes from aria-label.
+    const send = document.querySelector("button.chat-send");
+    add("受控输入与发送态", box.value.includes("验收探针") && Boolean(send) && send.disabled === false, send ? "disabled=" + send.disabled : "未找到发送按钮");
+  } else {
+    const seen = [...document.querySelectorAll("textarea")].map((el) => el.getAttribute("aria-label") || el.getAttribute("placeholder") || "?").join(" | ");
+    add("受控输入与发送态", false, "未找到目标输入框；现有 textarea: " + (seen || "无"));
+  }
+
+  return { steps, mounted: document.querySelectorAll("#root *").length, title: document.title, apiBaseUrl: bridge ? bridge.status.apiBaseUrl : "", workspaceRoot: bridge ? bridge.status.workspaceRoot : "" };
+})()`;
+
+const FOLDER_FLOW_PROBE = `(async (marker) => {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const steps = [];
+  const add = (name, ok, detail) => steps.push({ step: name, ok: Boolean(ok), detail: String(detail === undefined ? "" : detail).slice(0, 180) });
+  const text = () => document.body.innerText || "";
+  const clickWhere = async (predicate, settle) => {
+    const el = [...document.querySelectorAll("button")].find(predicate);
+    if (!el) return false;
+    el.click();
+    await wait(settle);
+    return true;
+  };
+
+  // The smoke window is created with show:false, so innerText is not a reliable
+  // visibility signal here; assert the entry exists and report what it says.
+  const entries = [...document.querySelectorAll("button")].filter((el) => el.textContent.includes(marker.folder));
+  add(
+    "侧栏登记了新文件夹",
+    document.body.textContent.includes(marker.folder) && entries.length > 0,
+    "条目=" + entries.length + "; 首个文字=" + (entries[0] ? entries[0].textContent.trim().replace(/\\s+/g, " ").slice(0, 80) : "无"),
+  );
+  add("选中该文件夹", await clickWhere((el) => el.textContent.includes(marker.folder), 400), "无可选条目");
+
+  const nav = await clickWhere((el) => el.textContent.trim() === "文件浏览", 600);
+  add("切到文件浏览", nav && text().includes(marker.file), text().includes(marker.file) ? "" : "文件树里没有 " + marker.file);
+
+  const opened = await clickWhere((el) => el.textContent.trim() === marker.file, 700);
+  add("读取文件内容", opened && text().includes(marker.token), opened ? "正文里没有标记串" : "文件树里点不到 " + marker.file);
+
+  return steps;
+})`;
+
+/**
+ * The native picker cannot be driven headlessly (a modal dialog would hang the run),
+ * so registration goes through the shell's own API and the window reloads to pick it
+ * up. Everything downstream of the picker - sidebar entry, selection, tree, file read -
+ * is then exercised for real inside the renderer.
+ */
+async function runFolderFlow(apiBaseUrl) {
+  const folder = path.join(acceptanceWorkspaceRoot(), "acceptance-folder");
+  fs.mkdirSync(folder, { recursive: true });
+  const marker = { folder: "acceptance-folder", file: "notes.md", token: "ACCEPTANCE_TOKEN_7431" };
+  fs.writeFileSync(path.join(folder, marker.file), `# acceptance\n\n${marker.token}\n`);
+
+  const response = await net.fetch(`${apiBaseUrl}/api/v1/repositories`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: folder, name: marker.folder }),
+  });
+  if (!response.ok) throw new Error(`注册返回 ${response.status}: ${(await response.text()).slice(0, 160)}`);
+
+  mainWindow.webContents.reload();
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    // Evaluation can reject while the document is being replaced; that just means "not ready".
+    try {
+      const ready = await mainWindow.webContents.executeJavaScript(`document.body ? document.body.textContent.includes(${JSON.stringify(marker.folder)}) : false`, true);
+      if (ready) break;
+    } catch {
+      /* keep polling */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return mainWindow.webContents.executeJavaScript(`(${FOLDER_FLOW_PROBE})(${JSON.stringify(marker)})`, true);
+}
+
 async function runSmokeChecks() {
-  const probe = `({
-    mounted: document.querySelectorAll("#root *").length,
-    bridge: Boolean(window.forge),
-    apiBaseUrl: window.forge ? window.forge.status.apiBaseUrl : "",
-    workspaceRoot: window.forge ? window.forge.status.workspaceRoot : "",
-    title: document.title,
-  })`;
-  let result = null;
+  let probe = null;
   let health = false;
   let error = "";
+  const steps = [];
+  const add = (name, ok, detail) => {
+    steps.push({ step: name, ok: Boolean(ok), detail: String(detail === undefined ? "" : detail).slice(0, 180) });
+  };
+
   try {
-    result = await mainWindow.webContents.executeJavaScript(probe, true);
-    if (!result.apiBaseUrl) throw new Error("window.forge.status.apiBaseUrl is empty");
-    const response = await net.fetch(`${result.apiBaseUrl}/health`);
+    const loadedUrl = mainWindow.webContents.getURL();
+    add("窗口加载地址", loadedUrl.startsWith(APP_ORIGIN) || (DEV_URL && loadedUrl.startsWith(DEV_URL)), loadedUrl);
+
+    probe = await mainWindow.webContents.executeJavaScript(INTERACTION_PROBE, true);
+    if (!probe.apiBaseUrl) throw new Error("window.forge.status.apiBaseUrl is empty");
+    const response = await net.fetch(`${probe.apiBaseUrl}/health`);
     health = response.ok;
-    if (!health) throw new Error(`health returned ${response.status}`);
+    add("壳侧健康检查", health, response.status);
+    add("渲染已挂载", probe.mounted > 0, probe.mounted);
+    add("工作区根目录已建立", fs.existsSync(probe.workspaceRoot), probe.workspaceRoot);
+    add("端口记忆已落盘", config.read().apiPort === backend?.port, `${config.read().apiPort} vs ${backend?.port}`);
+    steps.push(...probe.steps);
+
+    const folderSteps = await runFolderFlow(probe.apiBaseUrl);
+    steps.push(...folderSteps);
   } catch (failure) {
     error = describe(failure);
   }
-  const pass = Boolean(result && health && result.mounted > 0 && result.bridge && !error && !lastError);
-  console.log(JSON.stringify({ smoke: "forge-electron", pass, health, error, lastError, ...result }, null, 2));
+
+  const allSteps = steps.length ? steps : [{ step: "探针未跑完", ok: false, detail: error }];
+  const pass = Boolean(probe && health && !error && !lastError && allSteps.every((step) => step.ok));
+  console.log(JSON.stringify({ smoke: "forge-electron", pass, health, error, lastError, ...probe, steps: allSteps.map((step) => `${step.ok ? "PASS" : "FAIL"} ${step.step}${step.ok ? "" : ` -> ${step.detail}`}`) }, null, 2));
   app.exit(pass ? 0 : 1);
 }
 
