@@ -3275,6 +3275,26 @@ h2 {
   padding: 28px 16px 32px;
 }
 
+/* Cowork 模式隐藏右侧滚动条（同时保持滚动功能） */
+.chat-view--cowork,
+.chat-view--cowork .chat-main,
+.chat-view--cowork .chat-transcript,
+.chat-view--cowork .chat-start {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.chat-view--cowork::-webkit-scrollbar,
+.chat-view--cowork .chat-main::-webkit-scrollbar,
+.chat-view--cowork .chat-transcript::-webkit-scrollbar,
+.chat-view--cowork .chat-start::-webkit-scrollbar,
+.chat-view--cowork *::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+
 .chat-turn {
   width: 100%;
   max-width: 768px;

@@ -79,8 +79,12 @@ pnpm dev            # 只启动 Desktop：http://127.0.0.1:5173
 ```bash
 pnpm desktop:electron        # 构建产物 + 托管 API + 打开窗口
 pnpm desktop:electron:dev    # 连同 vite 开发服务器启动（HMR，默认 5173）
-pnpm desktop:electron:smoke  # 隐藏窗口自检：DOM 已挂载、桥可用、/health 通过
+pnpm desktop:electron:smoke  # 隐藏窗口交互自检：14 条断言，全过才退出码 0
 ```
+
+自检覆盖的是**真窗口里才成立**的那些事，而不是静态检查：窗口加载地址与 `location.origin` 都是 `forge-app://desktop`、CSS 子资源也经协议 handler 取到、渲染进程直接 `fetch` 壳托管的 API（这才是那条 CORS 边界的实证）、React 受控输入写进目标框后「发送」由 disabled 变可用、端口记忆已落盘、以及选择器之后的完整链路——侧栏登记文件夹 → 选中 → 文件树 → 读到正文标记串。
+
+自检模式使用**可丢弃的根**（`userData/state-smoke` 与 `~/forge-workspace-acceptance`，每次启动先清空），因为 API 没有注销仓库的接口，测试数据必须与真实桌面状态隔离。原生目录选择器会弹模态框、把自动检查死锁住，所以这三项仍需人工：原生选择器、「换工作区」确认框、深色主题对比度。
 
 壳负责的事情：
 
@@ -100,7 +104,11 @@ pnpm desktop:electron:smoke  # 隐藏窗口自检：DOM 已挂载、桥可用、
 > **Windows 上的一个已知前置条件**：Electron 启动时会检查 `node_modules/.../electron/dist` 是否允许 AppContainer 读取。若工作区处于受限账户 ACL 之下（本仓开发环境就是这样），会看到
 > `FATAL:install_dir_access.cc ... none for ALL APPLICATION PACKAGES`，此时任何 Electron 应用（包括空应用）都起不来，与本项目代码无关。在**你自己的终端**里执行一次即可：
 > `icacls "node_modules\.pnpm\electron@<版本>\node_modules\electron\dist" /grant *S-1-15-2-1:(OI)(CI)(RX)`
-> 或者把仓库放在正常 ACL 路径下。当前分支的桌面壳就是在受限工作区里完成实现的，窗口层尚未真机验证。
+> 补上这条 ACE 后桌面壳即可正常启动——本仓开发环境就是这样：`icacls` 由操作者在自己的终端执行一次，之后 `pnpm desktop:electron:smoke` 退出码 0。窗口层已按上面的 14 条断言真机验收过。
+>
+> 关于这道检查，实测过两件事，别再花时间试第三条路：
+> - **`--no-sandbox` 在 Electron 44 上无效**。这个 FATAL 来自 Electron 自己的 `install_dir_access.cc`，与渲染进程是否沙箱化无关（`--no-sandbox`、`--disable-gpu`、`ELECTRON_DISABLE_SANDBOX=1` 全部实测照旧）。
+> - **降级到没有这道检查的旧版（如 31.x）确实能开窗口**，但要同时带 `--no-sandbox`——旧版没检查，沙箱子进程照样读不到 `dist`，只是换成 GPU 进程 `0xC0000135`（STATUS_DLL_NOT_FOUND）后 FATAL。也就是说代价是**放弃渲染进程沙箱**加上一个落后的 Chromium，不是免费的绕行。补那条 ACE 才是恢复配置，而不是削弱它。
 
 ## 打开文件夹
 
@@ -197,7 +205,7 @@ Phase 2 的本地部分与远程代码路径均已完成：多轮编码、验证
 - 任务预算熔断已接入：最大轮次、总耗时、远程调用次数、连续失败阈值（`FORGE_TASK_MAX_*`），任一触顶即锁定并转人工复核。
 - 已有本地 Agent 单步编排和后台循环；计划由规则/模板生成，模型通过 Anthropic 或 OpenAI 兼容接口起草。实际写入权限取决于上述模式。无沙箱容器，命令在主机上以受控白名单方式执行。
 - 审批中心的拒绝、要求修改、过期列表与预算视图已接入。产物冒烟与组件渲染检查不能替代浏览器交互；设置等扩展入口仍未完成。
-- 桌面壳（Electron）已接入并与浏览器路径并存：壳托管本地 API、状态落在 `userData`、原生目录选择器。窗口层在本受限工作区未真机验证（Windows ACL，见上面的前置条件）；没有打包分发配置，`apps/api` 仍以源码方式运行。
+- 桌面壳（Electron）已接入并与浏览器路径并存：壳托管本地 API、状态落在 `userData`、原生目录选择器。窗口层已真机验收（`pnpm desktop:electron:smoke` 14 条断言全过，见上面的桌面壳小节）；没有打包分发配置，`apps/api` 仍以源码方式运行。
 - 单一工作区根目录、单文件夹任务；Git 子目录保留所选范围并使用本地流程。多仓库、CI 交互、Review 评论、冲突处理与自动合并属于后续阶段。
 
 各阶段勾选与验收口径以 `docs/phase-1-todolist.md`、`docs/phase-2-todolist.md` 为准；Phase 3（CI 交互、自动修复、冲突处理与治理）的范围见 `docs/phase-3-todolist.md`，其第 0 节列出了开工前必须先收口的 Phase 2 遗留项。

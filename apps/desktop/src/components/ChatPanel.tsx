@@ -127,12 +127,29 @@ export function ChatPanel(props: ChatPanelProps) {
   const readyToPublish = repository?.has_git === true && (props.status === "ready_for_pr" || props.status === "pr_created");
   const localReady = repository?.has_git === false && props.status === "ready_for_pr";
   const busy = props.loopRunning || props.sending;
+  const pendingClearRef = useRef(false);
+  const prevBusyRef = useRef(busy);
+
+  useEffect(() => {
+    if (prevBusyRef.current && !busy && pendingClearRef.current) {
+      setDraft("");
+      if (inputRef.current) inputRef.current.style.height = "auto";
+      pendingClearRef.current = false;
+    }
+    prevBusyRef.current = busy;
+  }, [busy]);
+
   const send = async () => {
     const message = draft.trim();
     if (!message || busy) return;
-    if (await props.onSend(message)) {
+    pendingClearRef.current = true;
+    const ok = await props.onSend(message);
+    if (!ok) {
+      pendingClearRef.current = false;
+    } else if (props.track === "cowork") {
       setDraft("");
       if (inputRef.current) inputRef.current.style.height = "auto";
+      pendingClearRef.current = false;
     }
   };
 

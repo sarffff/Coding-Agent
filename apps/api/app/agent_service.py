@@ -94,6 +94,12 @@ class AgentService:
         self.patch = patch
         self.models = models
 
+    def validation_hash(self, task: TaskSummary) -> str:
+        if task.validation_checks:
+            # Required checks validate all readable inputs; committing the same bytes keeps the evidence valid.
+            return self.tests.input_hash(task.repository_id)
+        return self.git.validation_hash(task.repository_id, self.tasks.changed_files(task.id))
+
     def inspect(self, task_id: str) -> AgentStateResponse:
         task = self.tasks.get(task_id)
         iterations = self.tasks.list_iterations(task_id)
@@ -112,6 +118,7 @@ class AgentService:
             pending_approval=approval if approval and approval.status == "pending" else None,
             last_test=iteration.test_result if iteration else None,
             loop_running=self._loop_running(task_id),
+            validation_status=self.tasks.validation_status(task_id, self.validation_hash(task)) if task.validation_checks and task.repository_id else [],
         )
 
     async def advance(self, task_id: str, request: AgentAdvanceRequest) -> AgentAdvanceResponse:
@@ -309,7 +316,7 @@ class AgentService:
                 return AgentDecision("manual_review", "Resolve the validation environment, timeout or cancellation before retrying tests.")
             if result.validation_hash is None:
                 return AgentDecision("run_tests", "Task files changed during validation. Rerun tests before repairing.", can_advance=True)
-            current_hash = self.git.validation_hash(task.repository_id, self.tasks.changed_files(task.id))
+            current_hash = self.validation_hash(task)
             if current_hash != result.validation_hash:
                 return AgentDecision("run_tests", "Task files changed after the failure. Rerun tests before creating a repair iteration.", can_advance=True)
             return AgentDecision("start_repair", "Start a repair iteration using the latest test failure.", can_advance=True)
@@ -328,8 +335,8 @@ class AgentService:
                     requires_approval=not self.approvals.has_approved(task.id, kind), approval_type=kind,
                 )
         result = iteration.test_result
-        validation_hash = self.git.validation_hash(task.repository_id, self.tasks.changed_files(task.id))
-        verified = any(run.kind != "static" and run.status == "passed" and run.validation_hash == validation_hash for run in iteration.test_runs)
+        validation_hash = self.validation_hash(task)
+        verified = self.tasks.validation_passed(task.id, validation_hash)
         if not result or result.status != "passed" or result.validation_hash != validation_hash or not verified:
             return AgentDecision("run_tests", "Run project or selected tests for the current changes before final review.", can_advance=True)
         if not has_git:
@@ -345,17 +352,29 @@ class AgentService:
         self.tasks.assert_budget_available(task.id)
         if not task.repository_id:
             raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Task must be connected to a repository before running tests.")
-        files = self.tasks.changed_files(task.id)
-        before = self.git.validation_hash(task.repository_id, files)
+        before = self.validation_hash(task)
+        check = None
+        if request.check_id:
+            check = next((item for item in task.validation_checks if item.id == request.check_id), None)
+            if check is None:
+                raise RepositoryError("INVALID_TEST_TARGET", "Choose a validation check belonging to this task.")
+        elif task.validation_checks and request.kind == "auto" and not request.target and request.workdir == "." and not request.script:
+            statuses = self.tasks.validation_status(task.id, before)
+            check = next((item.check for item in statuses if item.status != "passed"), task.validation_checks[0])
+        if check:
+            request = TestRunRequest(**check.model_dump(exclude={"id", "label"}), check_id=check.id)
         self.tests.reserve(run_id)
         try:
             self.tasks.begin_test_run(run_id)
         except Exception:
             self.tests.release(run_id)
             raise
-        result = await run_in_threadpool(self.tests.run, run_id, task.repository_id, request.kind, request.timeout_seconds, request.target)
+        options = {"workdir": request.workdir, "script": request.script} if request.workdir != "." or request.script else {}
+        result = await run_in_threadpool(self.tests.run, run_id, task.repository_id, request.kind, request.timeout_seconds, request.target, **options)
+        result.check_id = check.id if check else None
+        result.workdir, result.target, result.script = request.workdir, request.target, request.script
         try:
-            after = self.git.validation_hash(task.repository_id, files)
+            after = self.validation_hash(task)
         except RepositoryError:
             after = None
         if before == after:
@@ -366,6 +385,7 @@ class AgentService:
         self.tasks.record_test_result(run_id, result)
         self.audit.record("tests.run", "succeeded" if result.status == "passed" else "failed", f"Test run {result.status}", task_id=task.id, run_id=run_id,
                           details={"test_id": result.id, "kind": result.kind, "command": result.command, "exit_code": result.exit_code,
+                                   "check_id": result.check_id, "workdir": result.workdir,
                                    "failed_tests": [failure.model_dump() for failure in result.failed_tests]})
         return result
 
@@ -580,6 +600,8 @@ class AgentService:
         body = (task.goal.strip().splitlines()[0] if task.goal.strip() else "agent change")[:180]
         message = f"{task.id}: {body}"  # ponytail: templated from the goal; a model-drafted commit message can replace this later
         prepared = self.git.preview(repository_id, files, message)
+        if not self.tasks.validation_passed(task.id, self.validation_hash(task)):
+            raise RepositoryError("TEST_RESULTS_STALE", "Run all required validation checks before committing.")
         if not self._gate(task, "write", prepared.scope_hash):
             return False
         head = self.git.commit(repository_id, files, message, prepared.scope_hash, task.task_branch or "")

@@ -53,7 +53,13 @@ apps/api/app/
 
 ## Desktop shell
 
-`apps/desktop/electron/` 是可选项：`pnpm start` 的浏览器路径完全不依赖它。壳启动顺序固定为「解析解释器 → 选端口 → 起 uvicorn → 轮询 `/health` → 建窗口」，因此渲染进程可以在模块顶层同步读到 `window.forge.status.apiBaseUrl`；后端起不来时窗口显示一份自解释的错误页（含日志路径），而不是一个空白工作台。配置（工作区根目录、记住的端口）写在 `userData/forge-desktop.json`，状态与日志在 `userData/state`、`userData/logs`。窗口层在本仓库的受限工作区里无法真机验证（见 README 的 Windows ACL 前置条件），但 `backend.cjs` 的解释器解析、端口避让、健康等待、`forge-app://desktop` 的 CORS 预检与终止清理已用真实 uvicorn 进程验证过。
+`apps/desktop/electron/` 是可选项：`pnpm start` 的浏览器路径完全不依赖它。壳启动顺序固定为「解析解释器 → 选端口 → 起 uvicorn → 轮询 `/health` → 建窗口」，因此渲染进程可以在模块顶层同步读到 `window.forge.status.apiBaseUrl`；后端起不来时窗口显示一份自解释的错误页（含日志路径），而不是一个空白工作台。配置（工作区根目录、记住的端口）写在 `userData/forge-desktop.json`，状态与日志在 `userData/state`、`userData/logs`。
+
+窗口层已真机验收（`pnpm desktop:electron:smoke`，14 条断言全过）：加载地址与 `location.origin` 同为 `forge-app://desktop`、CSS 子资源经协议 handler 取到、渲染进程直接 `fetch` 壳托管 API 拿到 200（特权 scheme 的 CORS 边界由此从推断变成实证）、受控输入使「发送」退出 disabled、端口记忆落盘，以及选择器之后的完整链路（登记 → 侧栏 → 选中 → 文件树 → 读正文）。自检窗口是 `show:false`，因此**不能拿 `innerText` 当可见性判据**（侧栏条目存在于 DOM 却不计入 innerText），改用 `textContent` 或以点击是否成功来断言。原生目录选择器会模态阻塞，自动化不点它。
+
+壳里不依赖窗口的两层同样钉着：`pnpm desktop:backend-test` 用临时根目录真的起一个 uvicorn 子进程，验证注入的 `FORGE_WORKSPACE_ROOT`/`FORGE_STATE_DIR` 压过 `apps/api/.env`、`forge-app://desktop` 在 CORS 白名单内而别的来源不在、端口记忆只沿用无人应答的端口、`stop()` 之后端口真的释放，以及三类启动失败各说各的话（解释器缺失 / 进程提前退出 / 30 秒没就绪——子进程的 `error` 与 `close` 事件分开记，否则“没装 Python”会被误报成超时）。`pnpm desktop:unit` 覆盖 `folders.cjs` 的 Windows 路径事实与 `dist-file.cjs` 的协议路径解析：特权 scheme 只能读到 `dist/` 内的文件，穿越要么被 URL 解析折叠、要么被前缀检查拒掉，畸形的百分号编码不会在 handler 里抛异常。
+
+自检模式把状态与工作区根指向可丢弃的位置（`userData/state-smoke`、`~/forge-workspace-acceptance`，启动即清空）。这不是偷懒：API 没有注销仓库的接口，注册进去的测试文件夹会永久留在操作者的真实 `state.db` 里。
 
 ## Persistence
 

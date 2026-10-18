@@ -21,7 +21,9 @@
 - [x] API 全量回归：109 passed、1 skipped（主机不能创建测试符号链接）；后续检查点差异持久化专项 10 passed，模型并发保护、编码循环与模式专项 26 passed（专项与全量有重叠，不累加）。
 - [x] `pnpm build`（包含 TypeScript 检查）、`pnpm desktop:chat-check`、`pnpm desktop:smoke` 通过。
 - [ ] 浏览器完整点击验收：本轮打开本地验收页面被自动审批服务 503 阻断，未执行；组件检查不能替代点击回放。
-- [ ] 正常 Windows 环境下的 Electron 原生目录选择、窗口、工作区切换验收。
+- [x] 桌面壳真机启动与交互自检：`pnpm desktop:electron:smoke` 退出码 0、14 条断言全过——协议来源与 CSS 子资源都走 `forge-app://desktop`、渲染进程直接 `fetch` 壳托管的 API（特权 scheme 的 CORS 边界由此从推断变成实证）、受控输入使「发送」退出 disabled、端口记忆落盘、以及选择器之后的完整链路（登记 → 侧栏 → 选中 → 文件树 → 读到正文标记串）。前提是 `electron/dist` 拿到 `ALL APPLICATION PACKAGES` 只读授权。
+- [ ] 桌面仍需人工的三项：原生目录选择器、更换工作区根的确认框、深色主题对比度。前两项会弹模态对话框、把自动检查死锁，不能进自检；第三项是纯视觉判断。
+- [ ] `scripts/electron.js` 里 `ensureWindowsSandboxAcl()` 每次启动都静默执行 `icacls /grant *S-1-15-2-1:(OI)(CI)(RX)`（输出与异常都吞掉）。它是能跑起来的原因之一，但也意味着启动器会反复改动仓库之外的文件权限、并把人为撤销的授权悄悄补回。待决定：改成「检测到缺就打印该执行的那条命令」，由人显式授权。
 
 ## 后续优先级
 

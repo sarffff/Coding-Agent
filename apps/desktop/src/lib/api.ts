@@ -1,5 +1,5 @@
-import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
-export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
+import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
+export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, ValidationCheckStatus, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
 
 import { desktopBridge } from "./desktop";
 
@@ -66,10 +66,10 @@ export function getRepositoryTree(repositoryId: string, signal?: AbortSignal): P
   return request<{ items: TreeEntry[]; truncated: boolean }>(`/api/v1/repositories/${repositoryId}/tree?max_depth=6`, { signal });
 }
 
-export function createTask(goal: string, repositoryId?: string, mode?: AgentMode, track?: TaskTrack): Promise<AgentTask> {
+export function createTask(goal: string, repositoryId?: string, mode?: AgentMode, track?: TaskTrack, validationChecks?: ValidationCheck[]): Promise<AgentTask> {
   return request<AgentTask>("/api/v1/tasks", {
     method: "POST",
-    body: JSON.stringify({ goal, repository_id: repositoryId, mode, track }),
+    body: JSON.stringify({ goal, repository_id: repositoryId, mode, track, validation_checks: validationChecks }),
   });
 }
 
@@ -177,6 +177,13 @@ export function getAgentState(taskId: string, signal?: AbortSignal): Promise<Age
   return request<AgentState>(`/api/v1/tasks/${taskId}/agent`, { signal });
 }
 
+export function saveValidationChecks(taskId: string, checks: ValidationCheck[]): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/tasks/${taskId}/validation-checks`, {
+    method: "PUT",
+    body: JSON.stringify({ checks }),
+  });
+}
+
 export function advanceAgent(taskId: string, payload: AgentAdvanceRequest = {}, idempotencyKey?: string, signal?: AbortSignal): Promise<AgentAdvanceResponse> {
   return request<AgentAdvanceResponse>(`/api/v1/tasks/${taskId}/agent/advance`, {
     method: "POST",
@@ -190,10 +197,10 @@ export function listRunEvents(runId: string, signal?: AbortSignal): Promise<{ it
   return request<{ items: AuditEvent[]; total: number }>(`/api/v1/runs/${runId}/events`, { signal });
 }
 
-export function runTests(runId: string, kind: TestKind = "auto", target?: string): Promise<TestRunResult> {
+export function runTests(runId: string, kind: TestKind = "auto", target?: string, options: { check_id?: string; workdir?: string; script?: string; timeout_seconds?: number } = {}): Promise<TestRunResult> {
   return request<TestRunResult>(`/api/v1/runs/${runId}/tests`, {
     method: "POST",
-    body: JSON.stringify({ kind, target: target || undefined }),
+    body: JSON.stringify({ kind, target: target || undefined, ...options }),
   });
 }
 

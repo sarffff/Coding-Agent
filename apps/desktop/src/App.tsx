@@ -103,6 +103,7 @@ import { RunHistory } from "./components/RunHistory";
 import { AgentPanel } from "./components/AgentPanel";
 import { ApprovalPanel } from "./components/ApprovalPanel";
 import { ChatPanel } from "./components/ChatPanel";
+import { ValidationChecklist } from "./components/ValidationChecklist";
 
 type NavKey = "chat" | "overview" | "tasks" | "repositories" | "runs" | "approvals";
 
@@ -126,6 +127,7 @@ type Task = {
   plan?: AgentTask["plan"];
   mode: AgentMode;
   track: TaskTrack;
+  validationChecks: AgentTask["validation_checks"];
 };
 
 type StreamEvent = {
@@ -160,6 +162,7 @@ function taskFromApi(task: AgentTask): Task {
     plan: task.plan,
     mode: task.mode,
     track: task.track,
+    validationChecks: task.validation_checks ?? [],
   };
 }
 
@@ -223,6 +226,7 @@ function App() {
   const [testResult, setTestResult] = useState<TestRunResult | null>(null);
   const [testRunning, setTestRunning] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
+  const [validationSaving, setValidationSaving] = useState(false);
   const [patchPath, setPatchPath] = useState("");
   const [patchContent, setPatchContent] = useState("");
   const [patchPreviewResult, setPatchPreviewResult] = useState<PatchPreview | null>(null);
@@ -694,7 +698,9 @@ function App() {
     setTestRunning(true);
     setTestError(null);
     try {
-      const result = await runTests(activeTask.runId, testKind, testTarget.trim());
+      const result = activeTask.validationChecks.length
+        ? await runTests(activeTask.runId)
+        : await runTests(activeTask.runId, testKind, testTarget.trim());
       if (taskRef.current !== activeTask.id) return;
       setTestResult(result);
       const [events, nextIterations, task] = await Promise.all([
@@ -1077,7 +1083,7 @@ function App() {
   };
 
   const agentRevision = [activeTask?.updatedAt, iterations.map(item => item.updated_at + String(item.rolled_back)).join(), approvals.map(item => item.id + item.status).join(), publishState?.pull_request?.updated_at].join(":");
-  const operationBusy = Boolean(isRunning || testRunning || patchRunning || gitRunning || iterationRunning || publishRunning || repositorySaving || confirmAction || agentBusyAction || approvalRunning);
+  const operationBusy = Boolean(isRunning || testRunning || validationSaving || patchRunning || gitRunning || iterationRunning || publishRunning || repositorySaving || confirmAction || agentBusyAction || approvalRunning);
   const filteredTasks = tasks.filter(task => taskFilter === "all" || task.status === taskFilter);
   const chatTrack: TaskTrack = chatComposingNew ? railTab : (activeTask?.track ?? railTab);
   const chatRepositoryId = !chatComposingNew && activeTask && !["done", "completed", "cancelled"].includes(activeTask.lifecycleStatus) ? activeTask.repositoryId ?? "" : selectedRepositoryId;
@@ -1307,12 +1313,13 @@ function App() {
             </section>
           </div>
 
-          {activeTask?.runId ? <AgentPanel key={activeTask.id} taskId={activeTask.id} revision={agentRevision} testKind={testKind} testTarget={testTarget} disabled={operationBusy} hidden={activeNav !== "runs"} onAdvanced={refreshActiveTask} onBusyChange={setAgentBusyAction} /> : null}
+          {activeTask?.runId ? <AgentPanel key={activeTask.id} taskId={activeTask.id} revision={agentRevision} testKind={activeTask.validationChecks.length ? "auto" : testKind} testTarget={activeTask.validationChecks.length ? "" : testTarget} disabled={operationBusy} hidden={activeNav !== "runs"} onAdvanced={refreshActiveTask} onBusyChange={setAgentBusyAction} /> : null}
 
           <section className="operations-grid" inert={Boolean(agentBusyAction) || approvalRunning}>
             <section className="panel test-panel">
-              <div className="panel-header"><div><div className="section-kicker"><PackageCheck size={13} /> {t("validation")}</div><h2>{t("testConsole")}</h2></div><button className="small-action" onClick={() => void executeTests()} disabled={!activeTask?.runId || testRunning || !iterations.length || Boolean(iterations.at(-1)?.rolled_back) || ["paused", "cancelled", "done"].includes(activeTask.status)}>{testRunning ? <><Activity size={13} className="spin" /> {t("running")}</> : <><TerminalSquare size={13} /> {t("runTests")}</>}</button></div>
-              <div className="validation-options"><label>{t("validation.kind")}<select value={testKind} onChange={event => setTestKind(event.target.value as TestKind)} disabled={testRunning}>{["auto", "pytest", "frontend", "static"].map(kind => <option value={kind} key={kind}>{t("validation." + kind)}</option>)}</select></label><input value={testTarget} onChange={event => setTestTarget(event.target.value)} aria-label={t("validation.target")} placeholder={t("validation.target")} disabled={testRunning} /></div>
+              <div className="panel-header"><div><div className="section-kicker"><PackageCheck size={13} /> {t("validation")}</div><h2>{t("testConsole")}</h2></div><button className="small-action" onClick={() => void executeTests()} disabled={!activeTask?.runId || operationBusy || !iterations.length || Boolean(iterations.at(-1)?.rolled_back) || ["paused", "cancelled", "done"].includes(activeTask.status)}>{testRunning ? <><Activity size={13} className="spin" /> {t("running")}</> : <><TerminalSquare size={13} /> {t(activeTask?.validationChecks.length ? "validation.next" : "runTests")}</>}</button></div>
+              {activeTask?.runId ? <ValidationChecklist key={activeTask.id} taskId={activeTask.id} checks={activeTask.validationChecks} currentIteration={activeTask.currentIteration} revision={agentRevision} hidden={activeNav !== "runs"} disabled={operationBusy || ["paused", "cancelled", "done"].includes(activeTask.status)} onSaved={updateTaskFromApi} onBusyChange={setValidationSaving} /> : null}
+              {!activeTask?.validationChecks.length ? <div className="validation-options"><label>{t("validation.kind")}<select value={testKind} onChange={event => setTestKind(event.target.value as TestKind)} disabled={testRunning}>{["auto", "pytest", "frontend", "static"].map(kind => <option value={kind} key={kind}>{t("validation." + kind)}</option>)}</select></label><input value={testTarget} onChange={event => setTestTarget(event.target.value)} aria-label={t("validation.target")} placeholder={t("validation.target")} disabled={testRunning} /></div> : null}
               {testResult ? <div className="test-result">
                 <div className="test-result-top"><span className={`result-badge result-badge--${testResult.status}`}>{t("validation." + testResult.status)}</span><span>{testResult.duration_ms} ms · exit {testResult.exit_code ?? "—"}</span></div>
                 <code className="test-command">{testResult.command.length ? testResult.command.join(" ") : t("noCommandDetected")}</code>

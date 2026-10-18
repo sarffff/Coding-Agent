@@ -27,6 +27,7 @@ from .models import (
     RollbackResponse,
     TestRunRequest,
     TestRunResponse,
+    ValidationChecksRequest,
     SearchRequest,
     SearchResponse,
     TreeResponse,
@@ -265,7 +266,10 @@ async def search_repository(repository_id: str, payload: SearchRequest) -> Searc
 
 @app.post("/api/v1/tasks", response_model=TaskSummary, status_code=201)
 async def create_task(payload: TaskCreateRequest) -> TaskSummary:
-    task = task_service.create(payload.goal, payload.repository_id, payload.mode, payload.track)
+    checks = payload.validation_checks
+    if "validation_checks" not in payload.model_fields_set and payload.track == "code" and payload.repository_id:
+        checks = test_service.default_checks(payload.repository_id)
+    task = task_service.create(payload.goal, payload.repository_id, payload.mode, payload.track, checks)
     if payload.track == "code" and payload.repository_id and repository_service.get(payload.repository_id).has_git:
         snapshot = git_service.snapshot(payload.repository_id)
         task_service.update_git_snapshot(task.id, snapshot.branch, snapshot.head, snapshot.changed_files)
@@ -288,6 +292,17 @@ async def list_tasks() -> TaskListResponse:
 @app.get("/api/v1/tasks/{task_id}", response_model=TaskSummary)
 async def get_task(task_id: str) -> TaskSummary:
     return task_service.get(task_id)
+
+
+@app.put("/api/v1/tasks/{task_id}/validation-checks", response_model=TaskSummary)
+async def set_validation_checks(task_id: str, payload: ValidationChecksRequest) -> TaskSummary:
+    agent_service.assert_workspace_available(task_id)
+    if agent_service._loop_running(task_id) or test_service.is_running(task_service.get(task_id).run_id):
+        raise RepositoryError("WORKSPACE_BUSY", "Stop execution before configuring validation checks.")
+    task = task_service.set_validation_checks(task_id, payload.checks)
+    audit_service.record("validation.configure", "succeeded", "Updated required validation checks", task_id=task.id, run_id=task.run_id,
+                         details={"checks": [check.model_dump() for check in task.validation_checks]})
+    return task
 
 
 @app.post("/api/v1/tasks/{task_id}/iterations", response_model=TaskIteration, status_code=201)
@@ -485,10 +500,10 @@ async def create_task_commit(task_id: str, payload: CommitCreateRequest) -> GitS
         prepared = git_service.preview(repository_id, files, message)
         if prepared.scope_hash != payload.scope_hash:
             raise RepositoryError("COMMIT_PREVIEW_STALE", "Changes or commit message no longer match the preview. Preview and approve again.")
-        verified_tests = [result for result in iterations[-1].test_runs if result.kind != "static" and result.status == "passed" and result.validation_hash == prepared.validation_hash]
-        if not verified_tests:
-            raise RepositoryError("TEST_RESULTS_STALE", "Run project or selected tests for the current task files before committing.")
-        if prepared.validation_hash != iterations[-1].test_result.validation_hash:
+        validation_hash = agent_service.validation_hash(task)
+        if not task_service.validation_passed(task_id, validation_hash):
+            raise RepositoryError("TEST_RESULTS_STALE", "Run all required validation checks for the current task files before committing.")
+        if validation_hash != iterations[-1].test_result.validation_hash:
             raise RepositoryError("TEST_RESULTS_STALE", "Task files or HEAD changed since validation. Run tests again.")
         if not approval_service.has_approved(task_id, "write", payload.scope_hash):
             raise RepositoryError("APPROVAL_REQUIRED", "A current write approval is required for this exact commit.", {"type": "write"})

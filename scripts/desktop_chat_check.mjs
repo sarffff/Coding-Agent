@@ -12,6 +12,16 @@ const folder = { id: "plain", name: "Notes", path: "D:/work/Notes", has_git: fal
   package_manager: null, registered_at: "2026-10-12T00:00:00Z" };
 const checkpoint = { id: "saved-change", files: ["note.txt"], created_at: "2026-10-12T00:00:00Z",
   restored: false, diff: "--- a/note.txt\n+++ b/note.txt\n-old\n+new <note>" };
+const validationChecks = [
+  { id: "api", label: "API tests", kind: "pytest", workdir: "apps/api", target: "tests", script: null, timeout_seconds: 120 },
+  { id: "types", label: "Type check", kind: "script", workdir: ".", target: null, script: "check", timeout_seconds: 60 },
+  { id: "build", label: "Build", kind: "script", workdir: ".", target: null, script: "build", timeout_seconds: 120 },
+];
+const validationState = {
+  task: { current_iteration: 0, validation_checks: validationChecks },
+  validation_status: validationChecks.map((check, index) => ({ check, status: ["passed", "stale", "pending"][index],
+    result: index === 1 ? { command: ["pnpm", "run", "check"] } : null })),
+};
 const server = await createServer({
   root: fileURLToPath(new URL("../apps/desktop", import.meta.url)),
   configFile: false,
@@ -30,6 +40,12 @@ const server = await createServer({
         assert.notEqual(withCodeTab, withFolder, "The app fixture must select the Code tab");
         return withCodeTab;
       }
+      if (/[\\/]ValidationChecklist\.tsx$/.test(id)) {
+        const seeded = source.replace("useState<AgentState | null>(null)",
+          `useState<AgentState | null>(${JSON.stringify(validationState)})`);
+        assert.notEqual(seeded, source, "The checklist fixture must include server validation status");
+        return seeded;
+      }
       if (!/[\\/]RunHistory\.tsx$/.test(id)) return;
       // Seed the initial SSR state; production still loads the records through its effect.
       const seeded = source.replace("useState<RunCheckpoint[]>([])",
@@ -43,6 +59,25 @@ const server = await createServer({
 try {
   const { ChatPanel } = await server.ssrLoadModule("/src/components/ChatPanel.tsx");
   const { PreferencesProvider } = await server.ssrLoadModule("/src/lib/preferences.tsx");
+  const { ValidationChecklist } = await server.ssrLoadModule("/src/components/ValidationChecklist.tsx");
+  const renderChecklist = (overrides = {}) => renderToStaticMarkup(React.createElement(PreferencesProvider, null,
+    React.createElement(ValidationChecklist, { taskId: "task", checks: validationChecks, currentIteration: 0,
+      revision: "1", hidden: false, disabled: false, onSaved() {}, onBusyChange() {}, ...overrides })));
+  const editableChecks = renderChecklist();
+  assert.match(editableChecks, /Required validation checks/);
+  assert.match(editableChecks, /Relative working directory/);
+  assert.match(editableChecks, /package.json script name/);
+  assert.match(editableChecks, /type="number" min="1" max="300"/);
+  assert.match(editableChecks, /Add check/);
+  assert.match(editableChecks, /Save checklist/);
+  const lockedChecks = renderChecklist({ currentIteration: 1 });
+  assert.match(lockedChecks, /first iteration has started/);
+  assert.doesNotMatch(lockedChecks, /<input|<select|Add check|Save checklist/);
+  assert.match(lockedChecks, /API tests/);
+  assert.match(lockedChecks, /Needs revalidation/);
+  assert.match(lockedChecks, /pnpm run check/);
+  assert.match(lockedChecks, /Pending/);
+  assert.match(renderChecklist({ checks: [] }), /No checklist configured/);
   const props = {
     goal: null, plan: undefined, events: [], loopRunning: false, sending: false,
     status: null, hasActiveRun: false, track: "code", repositories: [folder],
@@ -100,7 +135,7 @@ try {
   const handlers = code.slice(code.indexOf("const sendChatMessage ="), code.indexOf("const decideChatApproval ="));
   const apiName = handlers.match(/([\w$]+)\.createTask/)[1];
   const newSession = code.slice(code.indexOf("const startNewChatSession ="), code.indexOf("const selectChatSession ="));
-  const folderHandlers = code.slice(code.indexOf("const openRegisteredFolder ="), code.indexOf("const changeWorkspaceRoot ="));
+  const folderHandlers = code.slice(code.indexOf("const openRegisteredFolder ="), code.indexOf("const requestWorkspaceChange ="));
   const folderApiName = folderHandlers.match(/([\w$]+)\.registerRepository/)[1];
   const bridgeName = folderHandlers.match(/([\w$]+)\.desktopBridge/)[1];
   const checkFolderCallbacks = ({ desktop = true, picked = folder.path, error = null } = {}) => {
@@ -111,6 +146,7 @@ try {
       loopRunning: false, sourceLocation: { path: "old-folder.py", line: 3 }, registered: [], picked: [] };
     const context = {
       [folderApiName]: {
+        validateRepository: async path => error ? { valid: false, reason: error.message, reason_code: "PATH_OUTSIDE_WORKSPACE" } : { valid: true },
         registerRepository: async path => {
           saved.registered.push(path);
           if (error) throw error;
@@ -122,7 +158,7 @@ try {
         pickDirectory: async options => { saved.picked.push(options); return picked; },
       } : undefined },
       desktopRuntime: { workspaceRoot: "D:/work" }, repositoryOpeningRef: { current: false },
-      repositoryPathInput: "", setWorkspaceSummary() {}, t: key => key, Error,
+      repositoryPathInput: "", setWorkspaceSummary() {}, t: key => key, Error, console,
     };
     for (const key of Object.keys(saved).filter(key => !["registered", "picked"].includes(key))) {
       context[`set${key[0].toUpperCase()}${key.slice(1)}`] = value => {
@@ -135,7 +171,7 @@ try {
   const desktopFolder = checkFolderCallbacks();
   desktopFolder.addRepository();
   desktopFolder.addRepository();
-  await new Promise(setImmediate);
+  await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(desktopFolder.saved.picked.length, 1, "Repeated clicks must not open multiple native choosers");
   assert.equal(desktopFolder.saved.picked[0].fallbackPath, "D:/work");
   assert.deepEqual(desktopFolder.saved.registered, [folder.path]);
@@ -175,6 +211,53 @@ try {
   assert.equal(rejectedFolder.saved.repositoryDialogOpen, true);
   assert.equal(rejectedFolder.saved.chatComposingNew, false);
 
+  const workspaceHandlers = code.slice(code.indexOf("const applyWorkspaceChange ="), code.indexOf("const executeTests ="));
+  const stopLoopName = workspaceHandlers.match(/([\w$]+)\.stopAgentLoop/)[1];
+  const checkWorkspace = ({ canceled = false, error = "" } = {}) => {
+    const saved = { selectedRepositoryId: "old-folder", sourceLocation: { path: "a.py", line: 1 },
+      desktopRuntime: { workspaceRoot: "D:/old" }, repositoryError: null, repositorySaving: false,
+      workspaceConfirmOpen: true, outsideRepositoryPath: null,
+      loaded: 0, stopped: [], activeNav: "runs", chatComposingNew: false, activeTaskId: "old-task",
+      loopRunning: true, runEvents: ["old"], chatPending: {}, chatBudget: {}, chatAction: "working", chatError: "old" };
+    const context = {
+      [bridgeName]: { desktopBridge: {
+        pickWorkspaceRoot: async () => canceled ? { canceled: true } : { canceled: false, workspaceRoot: "D:/new", error },
+      } },
+      desktopBridge: {
+        pickWorkspaceRoot: async () => canceled ? { canceled: true } : { canceled: false, workspaceRoot: "D:/new", error },
+      },
+      [stopLoopName]: { stopAgentLoop: async runId => saved.stopped.push(runId) },
+      activeTask: { runId: "run-1" },
+      loadOverviewData: async () => { saved.loaded += 1; },
+      t: key => key, Error, workspaceSuggestPath: undefined,
+    };
+    for (const key of Object.keys(saved).filter(key => !["loaded", "stopped"].includes(key))) {
+      context[`set${key[0].toUpperCase()}${key.slice(1)}`] = value => {
+        saved[key] = typeof value === "function" ? value(saved[key]) : value;
+      };
+    }
+    const callbacks = runInNewContext(`${newSession}\n${workspaceHandlers}; ({ changeWorkspaceRoot: applyWorkspaceChange });`, context);
+    return { ...callbacks, saved };
+  };
+  const switched = checkWorkspace();
+  await switched.changeWorkspaceRoot();
+  assert.equal(switched.saved.desktopRuntime.workspaceRoot, "D:/new");
+  assert.deepEqual(switched.saved.stopped, ["run-1"]);
+  assert.equal(switched.saved.selectedRepositoryId, "");
+  assert.equal(switched.saved.sourceLocation, null);
+  assert.equal(switched.saved.chatComposingNew, true);
+  assert.equal(switched.saved.activeTaskId, "");
+  assert.equal(switched.saved.loaded, 1);
+  assert.equal(switched.saved.repositorySaving, false);
+  const canceledWorkspace = checkWorkspace({ canceled: true });
+  await canceledWorkspace.changeWorkspaceRoot();
+  assert.equal(canceledWorkspace.saved.loaded, 0);
+  assert.equal(canceledWorkspace.saved.selectedRepositoryId, "old-folder");
+  const failedWorkspace = checkWorkspace({ error: "backend down" });
+  await failedWorkspace.changeWorkspaceRoot();
+  assert.equal(failedWorkspace.saved.repositoryError, "backend down");
+  assert.equal(failedWorkspace.saved.loaded, 0);
+
   const checkCallbacks = (hasGit) => {
     const original = { id: "old-task", runId: "old-run", repositoryId: "original-folder",
       lifecycleStatus: "ready_for_pr", status: "review", mode: "conservative", track: "code" };
@@ -213,7 +296,7 @@ try {
   gitChat.saved.loopRunning = false;
   await gitChat.stopChatLoop();
   assert.equal(gitChat.saved.loopRunning, true, "A stopping backend keeps the composer locked");
-  console.log("Desktop chat checks passed: folder opening and cancellation, empty-folder sidebar, rendering, checkpoint diffs, folder follow-up isolation, and stop-state handling.");
+  console.log("Desktop chat checks passed: folder opening and cancellation, empty-folder sidebar, rendering, checkpoint diffs, folder follow-up isolation, stop-state handling, and validation checklist editing/locking/status.");
 } finally {
   await server.close();
 }

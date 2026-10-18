@@ -96,6 +96,7 @@ export type AgentTask = {
   budget: TaskBudget;
   mode: AgentMode;
   track: TaskTrack;
+  validation_checks: ValidationCheck[];
 };
 
 export type AgentAdvanceAction = "request_plan_approval" | "start_iteration" | "start_repair" | "run_tests";
@@ -113,6 +114,7 @@ export type AgentState = {
   pending_approval: Approval | null;
   last_test: TestRunResult | null;
   loop_running: boolean;
+  validation_status: ValidationCheckStatus[];
 };
 
 export type AgentLoopRequest = {
@@ -158,12 +160,32 @@ export type TaskIteration = {
   updated_at: string;
 };
 
-export type TestKind = "auto" | "pytest" | "frontend" | "static";
+export type TestKind = "auto" | "pytest" | "frontend" | "static" | "script";
+
+export type ValidationCheck = {
+  id: string;
+  label: string;
+  kind: TestKind;
+  workdir: string;
+  target: string | null;
+  script: string | null;
+  timeout_seconds: number;
+};
+
+export type ValidationCheckStatus = {
+  check: ValidationCheck;
+  status: TestRunResult["status"] | "pending" | "stale";
+  result: TestRunResult | null;
+};
 
 export type TestRunResult = {
   id: string;
   created_at: string;
   validation_hash: string | null;
+  check_id: string | null;
+  workdir: string;
+  target: string | null;
+  script: string | null;
   run_id: string;
   kind: TestKind;
   command: string[];
