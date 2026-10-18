@@ -10,7 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from .approval_service import ApprovalService, plan_scope_hash
 from .audit_service import AuditService
 from .git_service import GitService
-from .model_provider import ModelProvider
+from .model_provider import ContextRequest, ModelProvider
 from .models import (
     AgentAction,
     AgentAdvanceRequest,
@@ -34,7 +34,7 @@ from .models import (
 from .patch_service import PatchService
 from .remote_service import RemoteService
 from .repository_service import RepositoryError
-from .task_service import TaskService
+from .task_service import TaskService, TaskStateError
 from .test_service import TestService
 
 
@@ -73,6 +73,9 @@ AUTO_GRANT: dict[AgentMode, frozenset[ApprovalType]] = {
 
 class AgentService:
     """Advance one local step, yielding to the existing patch and approval UI."""
+
+    # Model turns spent only on search/read before the run is declared stuck.
+    CONTEXT_ROUNDS = 4
 
     def __init__(
         self,
@@ -408,15 +411,22 @@ class AgentService:
         goal = request.feedback or iteration.goal
         context_files = self._gather_context(task.repository_id, request.context_paths, task.id, goal, failed_test)
         repository = self.tasks.repositories.get(task.repository_id)
+        rounds = 0
+        while True:
+            proposal = await self._propose(task, goal, context_files, failure)
+            if not proposal.context_requests:
+                break
+            # Bounded on purpose: a model that keeps asking for context must stop, not loop.
+            if rounds >= self.CONTEXT_ROUNDS:
+                raise RepositoryError(
+                    "MODEL_CONTEXT_LIMIT",
+                    "The model kept requesting context without proposing edits. Narrow the goal or add the files to context_paths.",
+                    {"requests": [item.model_dump(exclude_none=True) for item in proposal.context_requests]},
+                )
+            rounds += 1
+            goal, context_files = self._resolve_context_requests(task, goal, context_files, proposal.context_requests)
+        # Edits are applied against the content the model actually saw, so hashes come from the final context.
         baselines = {repository.path / path: self.patch._content_hash(content) for path, content in context_files}
-        # ponytail: model calls share the task's remote-call budget (one counter with git-host calls); split if it ever matters.
-        self.tasks.consume_remote_call(task.id)
-        succeeded = False
-        try:
-            proposal = await self.models.propose_patch(goal, context_files, failure)
-            succeeded = True
-        finally:
-            self.tasks.record_remote_result(task.id, succeeded)
         files = []
         for proposed in proposal.files:
             target = self.tasks.repositories._safe_repo_path(repository, proposed.path.replace("\\", "/"))
@@ -478,6 +488,72 @@ class AgentService:
             f"- languages: {languages}\n- package manager: {ctx.package_manager or 'none'}\n"
             f"- entry files: {entries}\n- file count: {ctx.file_count}"
         )
+
+    async def _propose(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], failure: str | None):
+        """One model turn; a stop or pause while it runs discards the reply instead of applying it."""
+        # ponytail: model calls share the task's remote-call budget (one counter with git-host calls); split if it ever matters.
+        self.tasks.consume_remote_call(task.id)
+        succeeded = False
+        try:
+            proposal = await self.models.propose_patch(goal, context_files, failure)
+            succeeded = True
+        finally:
+            self.tasks.record_remote_result(task.id, succeeded)
+        current = self.tasks.get(task.id)
+        if current.status in {"paused", "cancelled", "done"}:
+            raise TaskStateError("The task stopped while the model was drafting; the reply was discarded.", {"status": current.status})
+        return proposal
+
+    def _resolve_context_requests(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], requests: list[ContextRequest]) -> tuple[str, list[tuple[str, str]]]:
+        """Run the model's search/read requests and fold the results into the next prompt.
+
+        A request that cannot be served (protected, missing, binary) is reported back to the
+        model as a failed note; it never turns into file content, and the caller's round cap
+        stops a model that keeps asking for the same thing.
+        """
+        notes: list[str] = []
+        for request in requests:
+            if request.action == "search":
+                try:
+                    matches, _ = self.tasks.repositories.search(task.repository_id, SearchRequest(query=request.query, max_results=10))
+                except RepositoryError as exc:
+                    notes.append(f"Search {request.query!r} failed: {exc.message}")
+                    self.audit.record("context.request", "failed", f"Search failed: {request.query}", task_id=task.id, run_id=task.run_id,
+                                      details={"action": "search", "query": request.query, "error": exc.code})
+                    continue
+                paths = list(dict.fromkeys(match.path for match in matches))
+                notes.append(f"Search {request.query!r} matched: " + (", ".join(paths) if paths else "nothing"))
+                self.audit.record("context.request", "succeeded", f"Searched for {request.query}", task_id=task.id, run_id=task.run_id,
+                                  details={"action": "search", "query": request.query, "paths": paths[:10]})
+                continue
+            try:
+                source = self.tasks.repositories.read_file(task.repository_id, request.path)
+            except RepositoryError as exc:
+                notes.append(f"Read {request.path} failed: {exc.message}")
+                self.audit.record("context.request", "failed", f"Could not read {request.path}", task_id=task.id, run_id=task.run_id,
+                                  details={"action": "read", "path": request.path, "error": exc.code})
+                continue
+            if source.path not in {path for path, _ in context_files}:
+                context_files = [*context_files, (source.path, source.content)]
+            notes.append(f"Read {source.path}.")
+            self.audit.record("context.request", "succeeded", f"Read {source.path}", task_id=task.id, run_id=task.run_id,
+                              details={"action": "read", "path": source.path})
+        if notes:
+            goal = goal + "\n\n# Context results\n" + "\n".join(notes)
+        return goal, self._trim_context(context_files)
+
+    def _trim_context(self, context_files: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Keep the newest files within the configured count and byte budget."""
+        limit = self.tasks.settings.llm_max_context_files
+        budget = self.tasks.settings.llm_max_context_bytes
+        kept: list[tuple[str, str]] = []
+        for path, content in reversed(context_files):
+            size = len(content.encode("utf-8"))
+            if len(kept) >= limit or size > budget:
+                continue
+            kept.append((path, content))
+            budget -= size
+        return list(reversed(kept))
 
     def _gather_context(self, repository_id: str, context_paths: list[str], task_id: str, goal: str, failure: TestRunResponse | None) -> list[tuple[str, str]]:
         repositories = self.tasks.repositories

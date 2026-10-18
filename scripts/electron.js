@@ -25,9 +25,12 @@ function localBin(packageName, entry) {
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    // A value of undefined removes the inherited variable; see launchElectron.
+    const env = { ...process.env, ...options.env };
+    for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
     const child = spawn(command, args, {
       cwd: options.cwd || root,
-      env: { ...process.env, ...options.env },
+      env,
       stdio: options.stdio || "inherit",
       shell: false,
       windowsHide: Boolean(options.windowsHide),
@@ -91,7 +94,10 @@ function ping(port) {
 async function launchElectron(env) {
   const electronCli = localBin("electron", "cli.js");
   if (!isFile(electronCli)) throw new Error("找不到 apps/desktop/node_modules/electron，请先 pnpm install");
-  return run(process.execPath, [electronCli, "."], { cwd: desktopDir, env, windowsHide: true });
+  // Terminals hosted by an Electron app (IDEs, WorkBuddy, VS Code) export ELECTRON_RUN_AS_NODE=1.
+  // Inherited, it turns electron.exe into plain Node: `require("electron").app` is then undefined
+  // and main.cjs dies on app.setName. Strip it so the shell really starts as a browser process.
+  return run(process.execPath, [electronCli, "."], { cwd: desktopDir, env: { ...env, ELECTRON_RUN_AS_NODE: undefined }, windowsHide: true });
 }
 
 async function main() {

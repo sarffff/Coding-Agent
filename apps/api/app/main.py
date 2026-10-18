@@ -296,7 +296,7 @@ async def get_task(task_id: str) -> TaskSummary:
 
 @app.put("/api/v1/tasks/{task_id}/validation-checks", response_model=TaskSummary)
 async def set_validation_checks(task_id: str, payload: ValidationChecksRequest) -> TaskSummary:
-    agent_service.assert_workspace_available(task_id)
+    task_service.assert_recovered(task_id)
     if agent_service._loop_running(task_id) or test_service.is_running(task_service.get(task_id).run_id):
         raise RepositoryError("WORKSPACE_BUSY", "Stop execution before configuring validation checks.")
     task = task_service.set_validation_checks(task_id, payload.checks)

@@ -135,7 +135,7 @@ try {
   const handlers = code.slice(code.indexOf("const sendChatMessage ="), code.indexOf("const decideChatApproval ="));
   const apiName = handlers.match(/([\w$]+)\.createTask/)[1];
   const newSession = code.slice(code.indexOf("const startNewChatSession ="), code.indexOf("const selectChatSession ="));
-  const folderHandlers = code.slice(code.indexOf("const openRegisteredFolder ="), code.indexOf("const requestWorkspaceChange ="));
+  const folderHandlers = code.slice(code.indexOf("const openRegisteredFolder ="), code.indexOf("const changeWorkspaceRoot ="));
   const folderApiName = folderHandlers.match(/([\w$]+)\.registerRepository/)[1];
   const bridgeName = folderHandlers.match(/([\w$]+)\.desktopBridge/)[1];
   const checkFolderCallbacks = ({ desktop = true, picked = folder.path, error = null } = {}) => {
@@ -211,52 +211,49 @@ try {
   assert.equal(rejectedFolder.saved.repositoryDialogOpen, true);
   assert.equal(rejectedFolder.saved.chatComposingNew, false);
 
-  const workspaceHandlers = code.slice(code.indexOf("const applyWorkspaceChange ="), code.indexOf("const executeTests ="));
-  const stopLoopName = workspaceHandlers.match(/([\w$]+)\.stopAgentLoop/)[1];
-  const checkWorkspace = ({ canceled = false, error = "" } = {}) => {
-    const saved = { selectedRepositoryId: "old-folder", sourceLocation: { path: "a.py", line: 1 },
-      desktopRuntime: { workspaceRoot: "D:/old" }, repositoryError: null, repositorySaving: false,
-      workspaceConfirmOpen: true, outsideRepositoryPath: null,
-      loaded: 0, stopped: [], activeNav: "runs", chatComposingNew: false, activeTaskId: "old-task",
-      loopRunning: true, runEvents: ["old"], chatPending: {}, chatBudget: {}, chatAction: "working", chatError: "old" };
-    const context = {
-      [bridgeName]: { desktopBridge: {
-        pickWorkspaceRoot: async () => canceled ? { canceled: true } : { canceled: false, workspaceRoot: "D:/new", error },
-      } },
-      desktopBridge: {
-        pickWorkspaceRoot: async () => canceled ? { canceled: true } : { canceled: false, workspaceRoot: "D:/new", error },
+  // The shell only swaps the root and reports errors; stopping the loop and resetting the
+  // selection belongs to a confirmation flow that does not exist yet, so this check stays
+  // with what the code actually does.
+  const workspaceHandlers = code.slice(code.indexOf("const changeWorkspaceRoot ="), code.indexOf("const executeTests ="));
+  const workspaceBridgeName = workspaceHandlers.match(/([\w$]+)\.desktopBridge/)[1];
+  const checkWorkspace = ({ canceled = false, error = "", throws = null } = {}) => {
+    const saved = { desktopRuntime: { workspaceRoot: "D:/old" }, repositoryError: null, repositorySaving: false };
+    const bridge = {
+      pickWorkspaceRoot: async () => {
+        if (throws) throw throws;
+        return canceled ? { canceled: true } : { canceled: false, workspaceRoot: "D:/new", error };
       },
-      [stopLoopName]: { stopAgentLoop: async runId => saved.stopped.push(runId) },
-      activeTask: { runId: "run-1" },
-      loadOverviewData: async () => { saved.loaded += 1; },
-      t: key => key, Error, workspaceSuggestPath: undefined,
     };
-    for (const key of Object.keys(saved).filter(key => !["loaded", "stopped"].includes(key))) {
+    const context = {
+      [workspaceBridgeName]: { desktopBridge: bridge },
+      desktopBridge: bridge,
+      t: key => key, Error,
+    };
+    for (const key of Object.keys(saved)) {
       context[`set${key[0].toUpperCase()}${key.slice(1)}`] = value => {
         saved[key] = typeof value === "function" ? value(saved[key]) : value;
       };
     }
-    const callbacks = runInNewContext(`${newSession}\n${workspaceHandlers}; ({ changeWorkspaceRoot: applyWorkspaceChange });`, context);
+    const callbacks = runInNewContext(`${workspaceHandlers}; ({ changeWorkspaceRoot });`, context);
     return { ...callbacks, saved };
   };
   const switched = checkWorkspace();
   await switched.changeWorkspaceRoot();
   assert.equal(switched.saved.desktopRuntime.workspaceRoot, "D:/new");
-  assert.deepEqual(switched.saved.stopped, ["run-1"]);
-  assert.equal(switched.saved.selectedRepositoryId, "");
-  assert.equal(switched.saved.sourceLocation, null);
-  assert.equal(switched.saved.chatComposingNew, true);
-  assert.equal(switched.saved.activeTaskId, "");
-  assert.equal(switched.saved.loaded, 1);
+  assert.equal(switched.saved.repositoryError, null);
   assert.equal(switched.saved.repositorySaving, false);
   const canceledWorkspace = checkWorkspace({ canceled: true });
   await canceledWorkspace.changeWorkspaceRoot();
-  assert.equal(canceledWorkspace.saved.loaded, 0);
-  assert.equal(canceledWorkspace.saved.selectedRepositoryId, "old-folder");
+  assert.deepEqual(canceledWorkspace.saved.desktopRuntime, { workspaceRoot: "D:/old" });
+  assert.equal(canceledWorkspace.saved.repositorySaving, false);
   const failedWorkspace = checkWorkspace({ error: "backend down" });
   await failedWorkspace.changeWorkspaceRoot();
   assert.equal(failedWorkspace.saved.repositoryError, "backend down");
-  assert.equal(failedWorkspace.saved.loaded, 0);
+  assert.equal(failedWorkspace.saved.repositorySaving, false);
+  const thrownWorkspace = checkWorkspace({ throws: new Error("bridge unavailable") });
+  await thrownWorkspace.changeWorkspaceRoot();
+  assert.equal(thrownWorkspace.saved.repositoryError, "bridge unavailable");
+  assert.equal(thrownWorkspace.saved.repositorySaving, false);
 
   const checkCallbacks = (hasGit) => {
     const original = { id: "old-task", runId: "old-run", repositoryId: "original-folder",

@@ -78,9 +78,6 @@ class RepositoryService:
         key = self._keys.setdefault(record.id, self.store.next_key("repositories"))
         self.store.put("repositories", key, record, record.registered_at.isoformat())
 
-    def _workspace_root(self) -> Path:
-        return self.settings.workspace_root.expanduser().resolve()
-
     def _resolve_allowed_path(self, raw_path: str | Path) -> Path:
         path = Path(raw_path).expanduser().resolve(strict=False)
         if path.parent == path:
@@ -90,16 +87,6 @@ class RepositoryService:
                 {"path": str(path)},
             )
         return path
-
-    def _assert_still_allowed(self, record: RepositoryRecord) -> None:
-        """Ensure the repository path is not a filesystem root."""
-        path = record.path.expanduser().resolve(strict=False)
-        if path.parent == path:
-            raise RepositoryError(
-                "PATH_IS_FILESYSTEM_ROOT",
-                "Choose a repository folder, not a drive or filesystem root.",
-                {"repository_id": record.id, "path": str(path)},
-            )
 
     def _run_git(self, repo_path: Path, *args: str) -> str:
         try:
