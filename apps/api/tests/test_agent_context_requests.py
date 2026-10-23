@@ -147,3 +147,42 @@ def test_model_run_requests_return_output_except_in_conservative_mode(model_api,
     assert [event["details"]["action"] for event in runs] == ["run", "run"]
     if mode == "standard":
         assert "probe-output" in runs[0]["details"]["output"]  # shown in the chat transcript
+
+
+def _run_then_edit(model_api, command):
+    """Shared setup: one model-chosen program, then read the nested file and edit it."""
+    client, directory = model_api
+    task = create_task(client, directory)
+    nested = directory / "src/internal/domain"
+    nested.mkdir(parents=True)
+    (nested / "rules.py").write_text("def charge():\n    return 9\n", encoding="utf-8")
+    calls = []
+
+    async def model(goal, context, failure):
+        calls.append(goal)
+        if len(calls) == 1:
+            return PatchProposal(context_requests=[ContextRequest(action="run", command=command)])
+        if len(calls) == 2:
+            return PatchProposal(context_requests=[ContextRequest(action="read", path="src/internal/domain/rules.py")])
+        return _proposal_from_payload(
+            {"files": [{"path": "src/internal/domain/rules.py", "edits": [{"old_text": "return 9", "new_text": "return 10"}]}]},
+            context,
+        )
+
+    return client, task, model
+
+
+def test_model_command_is_charged_to_the_task_budget(model_api, monkeypatch):
+    client, task, model = _run_then_edit(model_api, ["python", "-c", "print('hi')"])
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    post(client, f"/api/v1/runs/{task['run_id']}/patches/draft")
+    # Three model turns plus the one program the model ran: commands share the same counter.
+    assert client.get(f"/api/v1/tasks/{task['id']}").json()["budget"]["remote_calls"] == 4
+
+
+def test_blocked_program_is_not_charged(model_api, monkeypatch):
+    client, task, model = _run_then_edit(model_api, ["cat", "app.py"])
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    post(client, f"/api/v1/runs/{task['run_id']}/patches/draft")
+    # The program never ran, so only the three model turns are charged.
+    assert client.get(f"/api/v1/tasks/{task['id']}").json()["budget"]["remote_calls"] == 3

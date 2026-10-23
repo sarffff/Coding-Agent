@@ -11,6 +11,7 @@ from .approval_service import ApprovalService, plan_scope_hash
 from .audit_service import AuditService
 from .git_service import GitService
 from .model_provider import ContextRequest, ModelProvider
+from .test_service import COMMAND_EXECUTABLES
 from .models import (
     AgentAction,
     AgentAdvanceRequest,
@@ -583,6 +584,10 @@ class AgentService:
             self.audit.record("context.request", "failed", f"Command refused (conservative): {shown}", task_id=task.id, run_id=task.run_id,
                               details={"action": "run", "command": command, "error": "COMMAND_NOT_ALLOWED"})
             return f"Run {shown} refused: commands are disabled in conservative mode."
+        # A model-chosen program is unbounded work like a model call, so it shares that budget counter.
+        # A program outside the allowlist never runs, so it is not charged: the model only wasted a turn.
+        if command[0].lower().removesuffix(".exe") in COMMAND_EXECUTABLES:
+            self.tasks.consume_remote_call(task.id)
         result = await run_in_threadpool(self.tests.run_command, task.run_id, task.repository_id, command)
         self.audit.record("context.request", "succeeded" if result.status in {"passed", "failed"} else "failed", f"Ran {shown}",
                           task_id=task.id, run_id=task.run_id,
