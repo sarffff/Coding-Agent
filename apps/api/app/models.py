@@ -557,6 +557,8 @@ class CheckpointSummary(BaseModel):
     id: str
     run_id: str | None = None
     restored: bool = False
+    # Backups were dropped to stay within the per-task limit; the record stays for history.
+    pruned: bool = False
     repository_id: str
     files: list[str]
     diff: str = ""

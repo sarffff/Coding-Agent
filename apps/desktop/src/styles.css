@@ -4910,3 +4910,13 @@ dialog::backdrop {
   border-style: dashed;
   font-size: 12px;
 }
+
+.checkpoint-pruned {
+  padding: 1px 6px;
+  color: var(--text-faint);
+  background: var(--surface-button-muted);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: .04em;
+}

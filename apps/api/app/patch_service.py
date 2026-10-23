@@ -67,6 +67,13 @@ class PatchService:
         if store:
             for key, persisted in store.models("checkpoints", PersistedCheckpoint):
                 backup_dir = self.checkpoint_dir / persisted.summary.id
+                if persisted.summary.pruned:
+                    # The record survives for history; the backups are gone on purpose.
+                    self._checkpoints[persisted.summary.id] = Checkpoint(
+                        summary=persisted.summary, backup_dir=backup_dir, snapshots={}, applied_hashes=persisted.applied_hashes
+                    )
+                    self._keys[persisted.summary.id] = key
+                    continue
                 if not backup_dir.is_dir():
                     continue
                 snapshots: dict[str, bytes | None] = {}
@@ -239,6 +246,7 @@ class PatchService:
         except OSError as exc:
             self._restore_checkpoint(checkpoint)
             raise RepositoryError("PATCH_APPLY_FAILED", "Patch application failed and was rolled back.") from exc
+        self._prune(checkpoint.summary.run_id)
         return PatchApplyResponse(
             patch_id=patch.id,
             checkpoint=checkpoint.summary,
@@ -251,9 +259,14 @@ class PatchService:
             raise RepositoryError("CHECKPOINT_NOT_FOUND", "Checkpoint was not found.")
         if checkpoint.summary.restored:
             raise RepositoryError("CHECKPOINT_ALREADY_RESTORED", "This checkpoint has already been restored.")
+        if checkpoint.summary.pruned:
+            raise RepositoryError(
+                "CHECKPOINT_PRUNED", "This checkpoint was pruned to stay within the per-task limit; roll back to a newer one.",
+                {"checkpoint_id": checkpoint_id},
+            )
         ordered = list(self._checkpoints.values())
         start = next(index for index, item in enumerate(ordered) if item is checkpoint)
-        chain = [item for item in reversed(ordered[start:]) if not item.summary.restored and (item is checkpoint or (checkpoint.summary.run_id and item.summary.run_id == checkpoint.summary.run_id))]
+        chain = [item for item in reversed(ordered[start:]) if not item.summary.restored and not item.summary.pruned and (item is checkpoint or (checkpoint.summary.run_id and item.summary.run_id == checkpoint.summary.run_id))]
         repository = self.repositories.get(checkpoint.summary.repository_id)
         simulated: dict[str, bytes | None] = {}
         original: dict[str, bytes | None] = {}
@@ -306,6 +319,32 @@ class PatchService:
         self._checkpoints[checkpoint_id] = checkpoint
         self._persist(checkpoint)
         return checkpoint
+
+    def _prune(self, run_id: str | None) -> int:
+        """Keep the newest N checkpoints of a task; the rest lose their backups but keep their record.
+
+        Pruning is by count, per task (= per run), and never protects a checkpoint that was already
+        rolled back: an old checkpoint that still had its backups would just be pruned next time.
+        """
+        if not run_id:
+            return 0
+        limit = self.settings.checkpoint_max_per_task
+        owned = sorted(
+            (item for item in self._checkpoints.values() if item.summary.run_id == run_id),
+            key=lambda item: item.summary.created_at,
+        )
+        excess = len(owned) - limit
+        pruned = 0
+        for checkpoint in owned[: max(0, excess)]:
+            if checkpoint.summary.pruned:
+                continue
+            shutil.rmtree(checkpoint.backup_dir, ignore_errors=True)
+            checkpoint.snapshots = {}
+            checkpoint.summary.pruned = True
+            checkpoint.summary.diff = ""
+            self._persist(checkpoint)
+            pruned += 1
+        return pruned
 
     def _restore_checkpoint(self, checkpoint: Checkpoint) -> None:
         repository = self.repositories.get(checkpoint.summary.repository_id)

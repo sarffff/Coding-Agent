@@ -292,6 +292,8 @@ export type RunCheckpoint = {
   diff: string;
   created_at: string;
   restored: boolean;
+  /** Backups were dropped to stay within the per-task limit; the record stays for history. */
+  pruned: boolean;
 };
 
 export type TestHistoryItem = { iteration_id: string; iteration_number: number; result: TestRunResult };

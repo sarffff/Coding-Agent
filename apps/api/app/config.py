@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = Field(default=300, ge=1)
     llm_max_context_files: int = Field(default=12, ge=1)
     llm_max_context_bytes: int = Field(default=120_000, ge=1_000)
+    checkpoint_max_per_task: int = Field(default=20, ge=1)
     task_max_iterations: int = Field(default=8, ge=1)
     task_max_wall_time_seconds: int = Field(default=3_600, ge=1)
     task_max_remote_calls: int = Field(default=50, ge=1)

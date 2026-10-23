@@ -62,6 +62,7 @@ pnpm dev            # 只启动 Desktop：http://127.0.0.1:5173
 | `FORGE_ALLOWED_REPOSITORIES` | 同上 | `owner/repo` 白名单（JSON 数组），为空表示不额外限制 | `[]` |
 | `FORGE_REMOTE_TIMEOUT_SECONDS` | 同上 | 远程 REST 调用与推送超时 | 30 |
 | `FORGE_IDEMPOTENCY_TTL_HOURS` | 同上 | `Idempotency-Key` 记录保留时长 | 24 |
+| `FORGE_CHECKPOINT_MAX_PER_TASK` | 同上 | 每个任务保留的检查点数；超出的最旧检查点删除备份、保留记录并标记「已清理」，不可再回滚 | 20 |
 | `FORGE_LLM_PROVIDER` | 同上 | 补丁起草 Provider：`anthropic` / `openai` / 离线 `fake`（仅测试，需显式 seed） | `anthropic` |
 | `FORGE_ANTHROPIC_API_KEY` / `FORGE_OPENAI_API_KEY` | 同上 | 对应 Provider 的 API key，用于补丁起草；只进请求头 | 空 |
 | `FORGE_LLM_MODEL` | 同上 | 起草模型，须与 provider 匹配（anthropic 可设 `claude-opus-5-5`，openai 设 gpt 模型；其余 `FORGE_LLM_*`/`FORGE_OPENAI_API_URL` 见 `.env.example`） | `claude-sonnet-5-5` |
