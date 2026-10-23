@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -26,12 +27,21 @@ def _relative_path(value: str) -> str:
 class ContextRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["search", "read"]
+    action: Literal["search", "read", "run"]
     query: str | None = Field(default=None, min_length=1, max_length=500)
     path: str | None = Field(default=None, min_length=1, max_length=4_096)
+    command: list[str] | None = Field(default=None, min_length=1, max_length=32)
 
     @model_validator(mode="after")
     def validate_action(self) -> ContextRequest:
+        if self.action == "run":
+            if not self.command or self.query is not None or self.path is not None:
+                raise ValueError("A run request requires a command and cannot include a query or path.")
+            if not self.command[0].strip() or any(len(arg) > 1_000 or "\x00" in arg for arg in self.command):
+                raise ValueError("Command arguments must be strings of at most 1000 characters with a nonempty program.")
+            return self
+        if self.command is not None:
+            raise ValueError("Only run requests can include a command.")
         if self.action == "search":
             if not self.query or not self.query.strip() or self.path is not None:
                 raise ValueError("A search request requires a query and cannot include a path.")
@@ -57,7 +67,11 @@ _SYSTEM_PROMPT = (
     "Respond with ONLY one JSON object: request context OR propose edits, never both. "
     "To request context (at most 8 requests per response):\n"
     '{"context_requests": [{"action": "search", "query": "<literal text or filename>"}, '
-    '{"action": "read", "path": "<repo-relative path>"}]}\n'
+    '{"action": "read", "path": "<repo-relative path>"}, '
+    '{"action": "run", "command": ["<program>", "<arg>"]}]}\n'
+    "`run` executes one program (no shell, repository root, time-limited) and returns its exit code and output; "
+    "use it to reproduce a failure or run a single test. It may be unavailable. "
+    "Commands you run do not count as validation; the required checks still run after your edits.\n"
     "To propose edits, no prose and no markdown fences:\n"
     '{"rationale": "<one short paragraph>", "files": [{"path": "<repo-relative path>", '
     '"operation": "create|update|delete", "content": "<COMPLETE new file content; omit for delete>"}]}\n'
@@ -172,6 +186,13 @@ def _build_prompt(goal: str, context_files: list[tuple[str, str]], failure: str 
     return "\n\n".join(parts)
 
 
+def _truncated() -> RepositoryError:
+    return RepositoryError(
+        "MODEL_OUTPUT_TRUNCATED",
+        "The reply hit the output token limit. Use `edits` instead of whole-file `content`, or change fewer files at once.",
+    )
+
+
 class ModelProvider(ABC):
     """Abstract interface for the code-drafting model backend."""
 
@@ -188,15 +209,28 @@ class ModelProvider(ABC):
         ...
 
 
+# Backoff before the 2nd and 3rd attempts on 429/5xx (incl. 529 overloaded) or a dropped connection.
+_RETRY_DELAYS: tuple[float, ...] = (2.0, 8.0)
+
+
 async def _post_json(settings: Settings, url: str, headers: dict[str, str], payload: dict) -> dict:
-    """One HTTP round-trip to a model API, with the error mapping both real providers share."""
+    """One HTTP round-trip to a model API, with the retry and error mapping both real providers share."""
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
-        try:
-            resp = await client.post(url, headers=headers, json=payload)
-        except httpx.TimeoutException as exc:
-            raise RepositoryError("MODEL_TIMEOUT", "The model request did not finish in time.") from exc
-        except httpx.RequestError as exc:
-            raise RepositoryError("MODEL_NETWORK_ERROR", f"Failed to reach the model API: {exc}") from exc
+        for delay in (*_RETRY_DELAYS, None):
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+            except httpx.TimeoutException as exc:
+                # Not retried: a long generation that timed out would just time out again.
+                raise RepositoryError("MODEL_TIMEOUT", "The model request did not finish in time.") from exc
+            except httpx.RequestError as exc:
+                if delay is None:
+                    raise RepositoryError("MODEL_NETWORK_ERROR", f"Failed to reach the model API: {exc}") from exc
+                await asyncio.sleep(delay)
+                continue
+            if delay is not None and (resp.status_code == 429 or resp.status_code >= 500):
+                await asyncio.sleep(delay)
+                continue
+            break
     if resp.status_code == 401:
         raise RepositoryError("MODEL_AUTH_FAILED", "The model API key is invalid or missing.")
     if resp.status_code == 429:
@@ -219,6 +253,8 @@ class AnthropicModelProvider(ModelProvider):
             {"model": self.settings.llm_model, "max_tokens": self.settings.llm_max_tokens, "system": _SYSTEM_PROMPT,
              "messages": [{"role": "user", "content": _build_prompt(goal, context_files, failure)}]},
         )
+        if data.get("stop_reason") == "max_tokens":
+            raise _truncated()
         blocks = data.get("content") or []
         text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text")
         return _proposal_from_payload(extract_proposal_json(text), context_files)
@@ -257,6 +293,8 @@ class OpenAIModelProvider(ModelProvider):
                           {"role": "user", "content": _build_prompt(goal, context_files, failure)}]},
         )
         choices = data.get("choices") or []
+        if choices and isinstance(choices[0], dict) and choices[0].get("finish_reason") == "length":
+            raise _truncated()
         text = choices[0].get("message", {}).get("content", "") if choices and isinstance(choices[0], dict) else ""
         return _proposal_from_payload(extract_proposal_json(text), context_files)
 

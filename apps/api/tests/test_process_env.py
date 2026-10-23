@@ -24,3 +24,15 @@ def test_windows_ntstatus_exit_codes_read_as_startup_failures():
     assert not is_process_startup_failure(0)
     assert not is_process_startup_failure(1)
     assert not is_process_startup_failure(None)
+
+
+def test_scrubbed_child_env_drops_credentials_but_keeps_ordinary_variables(monkeypatch):
+    monkeypatch.setenv("FORGE_ANTHROPIC_API_KEY", "k1")
+    monkeypatch.setenv("GITHUB_TOKEN", "k2")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "k3")
+    monkeypatch.setenv("PATH_HINT_FOR_TEST", "kept")
+
+    scrubbed = child_env(scrub_secrets=True)
+    assert not {"FORGE_ANTHROPIC_API_KEY", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"} & set(scrubbed)
+    assert scrubbed["PATH_HINT_FOR_TEST"] == "kept"
+    assert child_env()["GITHUB_TOKEN"] == "k2"  # git push still uses the operator's environment

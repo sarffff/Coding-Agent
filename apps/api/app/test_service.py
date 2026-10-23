@@ -20,8 +20,26 @@ from .process_env import child_env, is_process_startup_failure
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
 
 
+# Test/build by-products that validation itself rewrites; hashing them would turn every pass into
+# "files changed during testing". Only used for the validation hash, never for read/edit policy.
+_GENERATED_NAMES = {"coverage", "htmlcov", ".nyc_output", ".mypy_cache", ".tox", ".nox", ".hypothesis", ".gradle", "target", ".coverage", ".eslintcache"}
+_GENERATED_SUFFIXES = (".egg-info", ".tsbuildinfo", ".pyc")
+
+
+# Programs the drafting model may run (argv, no shell). ponytail: program allowlist only — arguments
+# are free (python -c can do anything), so commands run with the API user's rights on the host and
+# are offered only outside conservative mode; move to a container when untrusted repos matter.
+COMMAND_EXECUTABLES = frozenset({"python", "python3", "pytest", "node", "npm", "pnpm", "yarn", "go", "cargo", "ruff", "mypy", "tsc", "eslint"})
+
+
+def _generated(name: str) -> bool:
+    lower = name.lower()
+    return lower in _GENERATED_NAMES or lower.endswith(_GENERATED_SUFFIXES) or lower.startswith(".coverage.")
+
+
 class TestService:
     OUTPUT_LIMIT = 20_000
+    COMMAND_SUFFIX = ":command"  # model commands get their own slot so is_running(run_id) stays validation-only
 
     def __init__(self, repositories: RepositoryService, settings: Settings):
         self.repositories = repositories
@@ -41,9 +59,10 @@ class TestService:
 
     def cancel(self, run_id: str) -> None:
         with self._lock:
-            event = self._active.get(run_id)
-            if event:
-                event.set()
+            for key in (run_id, run_id + self.COMMAND_SUFFIX):
+                event = self._active.get(key)
+                if event:
+                    event.set()
 
     def release(self, run_id: str) -> None:
         with self._lock:
@@ -74,39 +93,63 @@ class TestService:
     def input_hash(self, repository_id: str) -> str:
         repository = self.repositories.get(repository_id)
         digest = hashlib.sha256()
-        entries = 0
-
-        def walk_error(error: OSError) -> None:
-            raise error
-
+        files = 0
         try:
-            for current, directories, files in os.walk(repository.path, onerror=walk_error):
-                base = Path(current)
-                relative_base = base.relative_to(repository.path)
-                directories[:] = sorted(name for name in directories if not is_protected_path(relative_base / name) and not (base / name).is_symlink())
-                for name in [*directories, *sorted(files)]:
-                    path = base / name
-                    if is_protected_path(relative_base / name) or path.is_symlink():
-                        continue
-                    entries += 1
-                    if entries > self.settings.max_tree_entries:
-                        raise RepositoryError("VALIDATION_SCOPE_TOO_LARGE", "The validation inputs exceed the repository entry limit; narrow the workspace before retrying.")
-                    relative = path.relative_to(repository.path).as_posix()
+            entries = self._git_inputs(repository) if repository.has_git else self._walk_inputs(repository)
+            for relative, is_directory in entries:
+                digest.update((relative + "\0").encode("utf-8"))
+                if is_directory:
+                    digest.update(b"directory\0")
+                    continue
+                files += 1
+                if files > self.settings.max_tree_entries:
+                    raise RepositoryError("VALIDATION_SCOPE_TOO_LARGE", "The validation inputs exceed the repository entry limit; narrow the workspace before retrying.")
+                try:
                     path = self.repositories._safe_repo_path(repository, relative)
-                    digest.update((relative + "\0").encode("utf-8"))
-                    if name in directories:
-                        digest.update(b"directory\0")
+                except RepositoryError as exc:
+                    if exc.code == "SYMLINK_NOT_ALLOWED":
                         continue
-                    if not path.is_file():
-                        raise RepositoryError("VALIDATION_INPUT_UNAVAILABLE", "Validation inputs must be readable regular files.")
-                    content = hashlib.sha256()
-                    with path.open("rb") as source:
-                        for block in iter(lambda: source.read(1024 * 1024), b""):
-                            content.update(block)
-                    digest.update(content.digest())
+                    raise
+                if not path.exists():  # a tracked file the task deleted
+                    digest.update(b"missing\0")
+                    continue
+                if not path.is_file():
+                    raise RepositoryError("VALIDATION_INPUT_UNAVAILABLE", "Validation inputs must be readable regular files.")
+                content = hashlib.sha256()
+                with path.open("rb") as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        content.update(block)
+                digest.update(content.digest())
         except OSError as exc:
             raise RepositoryError("VALIDATION_INPUT_UNAVAILABLE", "A validation input could not be read; retry after the workspace is accessible.") from exc
         return digest.hexdigest()
+
+    def _git_inputs(self, repository: RepositoryRecord):
+        """Tracked plus untracked-but-not-ignored files: .gitignore already names this project's outputs."""
+        listed = self.repositories._run_git(repository.path, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+        for relative in sorted(set(filter(None, listed.split("\0")))):
+            parts = Path(relative).parts
+            if is_protected_path(relative) or any(_generated(part) for part in parts) or (repository.path / relative).is_symlink():
+                continue
+            yield relative, False
+
+    def _walk_inputs(self, repository: RepositoryRecord):
+        def walk_error(error: OSError) -> None:
+            raise error
+
+        for current, directories, files in os.walk(repository.path, onerror=walk_error):
+            base = Path(current)
+            relative_base = base.relative_to(repository.path)
+            directories[:] = sorted(name for name in directories if not self._skip_input(base, relative_base, name))
+            for name in directories:
+                yield (relative_base / name).as_posix(), True
+            for name in sorted(files):
+                if not self._skip_input(base, relative_base, name):
+                    yield (relative_base / name).as_posix(), False
+
+    @staticmethod
+    def _skip_input(base: Path, relative_base: Path, name: str) -> bool:
+        return is_protected_path(relative_base / name) or _generated(name) or (base / name).is_symlink()
 
     def run(self, run_id: str, repository_id: str, kind: TestKind, timeout_seconds: int, target: str | None = None, *, workdir: str = ".", script: str | None = None) -> TestRunResponse:
         repository = self.repositories.get(repository_id)
@@ -126,52 +169,19 @@ class TestService:
                 return self._result(run_id, kind, command, "not_found", started, stderr="The required validation executable is not available.", **details)
             if cancel.is_set():
                 return self._result(run_id, kind, command, "cancelled", started, **details)
-            # Capture output in the state directory: an inherited TMP may point at
-            # a sandbox-owned path this process cannot write to.
-            self.settings.state_dir.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryFile(dir=self.settings.state_dir) as stdout, tempfile.TemporaryFile(dir=self.settings.state_dir) as stderr:
-                process = subprocess.Popen(
-                    [executable, *command[1:]], cwd=directory, stdout=stdout, stderr=stderr,
-                    env=child_env(),
-                    shell=False, start_new_session=os.name != "nt",
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-                )
-                limit = min(timeout_seconds, self.settings.command_timeout_seconds)
-                status = "passed"
-                while process.poll() is None:
-                    if cancel.is_set():
-                        status = "cancelled"
-                        self._stop(process)
-                        break
-                    if time.perf_counter() - started >= limit:
-                        status = "timed_out"
-                        self._stop(process)
-                        break
-                    cancel.wait(0.05)
-                process.wait()
-                if status == "passed" and process.returncode:
-                    status = "blocked" if is_process_startup_failure(process.returncode) else "failed"
-                stdout.seek(0)
-                stderr.seek(0)
-                out = stdout.read(self.OUTPUT_LIMIT + 1)
-                err = stderr.read(self.OUTPUT_LIMIT + 1)
-                result = self._result(run_id, kind, command, status, started, stdout=out[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), stderr=err[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), **details)
-                result.exit_code = process.returncode
-                result.output_truncated = len(out) > self.OUTPUT_LIMIT or len(err) > self.OUTPUT_LIMIT
-                if status == "blocked":
-                    result.stderr = (result.stderr + "\n" if result.stderr else "") + "The validation process could not be started by the API process. Restart the API from a normal shell."
-                if status == "timed_out":
-                    result.stderr += "\nValidation exceeded its time limit."
-                if status == "cancelled":
-                    result.stderr += "\nValidation was cancelled."
-                result.failed_tests = self._parse_failures(result.stdout, result.stderr) if status == "failed" else []
-                for failure in result.failed_tests:
-                    if failure.path:
-                        try:
-                            failure.path = (directory / failure.path).resolve().relative_to(repository.path).as_posix()
-                        except ValueError:
-                            failure.path = None
-                return result
+            result = self._execute(run_id, kind, [executable, *command[1:]], command, directory, cancel, min(timeout_seconds, self.settings.command_timeout_seconds), started, details)
+            if result.status == "timed_out":
+                result.stderr += "\nValidation exceeded its time limit."
+            if result.status == "cancelled":
+                result.stderr += "\nValidation was cancelled."
+            result.failed_tests = self._parse_failures(result.stdout, result.stderr) if result.status == "failed" else []
+            for failure in result.failed_tests:
+                if failure.path:
+                    try:
+                        failure.path = (directory / failure.path).resolve().relative_to(repository.path).as_posix()
+                    except ValueError:
+                        failure.path = None
+            return result
         except RepositoryError as exc:
             return self._result(run_id, kind, command, "blocked", started, stderr=exc.message, **details)
         except (ValueError, TypeError):
@@ -180,6 +190,72 @@ class TestService:
             return self._result(run_id, kind, command, "not_found", started, stderr="The validation process could not be started.", **details)
         finally:
             self.release(run_id)
+
+    def run_command(self, run_id: str, repository_id: str, argv: list[str], timeout_seconds: int = 120) -> TestRunResponse:
+        """Run one allowlisted program for the drafting model, no shell, in the repository root.
+
+        Shares the validation cancel path (cancel(run_id) also stops it) but not its reservation,
+        so the task never looks like it is "waiting for tests" while the model inspects something.
+        """
+        repository = self.repositories.get(repository_id)
+        key = f"{run_id}{self.COMMAND_SUFFIX}"
+        self.reserve(key)
+        started = time.perf_counter()
+        details = {"workdir": ".", "target": None, "script": None}
+        try:
+            name = argv[0].lower().removesuffix(".exe")
+            if name not in COMMAND_EXECUTABLES:
+                return self._result(key, "auto", argv, "blocked", started, stderr=f"{argv[0]!r} is not an allowed program. Allowed: {', '.join(sorted(COMMAND_EXECUTABLES))}.", **details)
+            if name in {"python", "python3", "pytest"}:
+                executable, args = self._python_executable(repository), ["-m", "pytest", *argv[1:]] if name == "pytest" else argv[1:]
+            else:
+                executable, args = shutil.which(name), argv[1:]
+            if not executable:
+                return self._result(key, "auto", argv, "not_found", started, stderr=f"{argv[0]} is not available on PATH.", **details)
+            limit = min(timeout_seconds, self.settings.command_timeout_seconds)
+            return self._execute(key, "auto", [executable, *args], argv, repository.path, self._active[key], limit, started, details)
+        except RepositoryError as exc:
+            return self._result(key, "auto", argv, "blocked", started, stderr=exc.message, **details)
+        except OSError:
+            return self._result(key, "auto", argv, "not_found", started, stderr="The command could not be started.", **details)
+        finally:
+            self.release(key)
+
+    def _execute(self, run_id: str, kind: TestKind, argv: list[str], command: list[str], directory: Path, cancel: Event, limit: int, started: float, details: dict) -> TestRunResponse:
+        # Capture output in the state directory: an inherited TMP may point at
+        # a sandbox-owned path this process cannot write to.
+        self.settings.state_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=self.settings.state_dir) as stdout, tempfile.TemporaryFile(dir=self.settings.state_dir) as stderr:
+            process = subprocess.Popen(
+                argv, cwd=directory, stdout=stdout, stderr=stderr,
+                env=child_env(scrub_secrets=True),  # repository and model-chosen code never sees API credentials
+                shell=False, start_new_session=os.name != "nt",
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            )
+            status = "passed"
+            while process.poll() is None:
+                if cancel.is_set():
+                    status = "cancelled"
+                    self._stop(process)
+                    break
+                if time.perf_counter() - started >= limit:
+                    status = "timed_out"
+                    self._stop(process)
+                    break
+                cancel.wait(0.05)
+            process.wait()
+            if status == "passed" and process.returncode:
+                status = "blocked" if is_process_startup_failure(process.returncode) else "failed"
+            stdout.seek(0)
+            stderr.seek(0)
+            out = stdout.read(self.OUTPUT_LIMIT + 1)
+            err = stderr.read(self.OUTPUT_LIMIT + 1)
+        result = self._result(run_id, kind, command, status, started, stdout=out[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), stderr=err[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), **details)
+        result.exit_code = process.returncode
+        result.output_truncated = len(out) > self.OUTPUT_LIMIT or len(err) > self.OUTPUT_LIMIT
+        if status == "blocked":
+            result.stderr = (result.stderr + "\n" if result.stderr else "") + "The validation process could not be started by the API process. Restart the API from a normal shell."
+        return result
 
     @staticmethod
     def _stop(process: subprocess.Popen) -> None:

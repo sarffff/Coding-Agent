@@ -145,6 +145,7 @@ def test_stop_cancels_waiting_model_and_never_applies_its_reply(model_api, monke
     final = _wait_for_loop(client, task["id"], timeout=5)
     assert cancelled.is_set()
     assert final["task"]["status"] == "coding"
+    assert final["task"]["budget"]["consecutive_failures"] == 0  # a user stop is not a model failure
     assert (directory / "app.py").read_text(encoding="utf-8") == original
     assert client.get(f"/api/v1/runs/{task['run_id']}/checkpoints").json()["total"] == 0
     events = client.get(f"/api/v1/runs/{task['run_id']}/events").json()["items"]

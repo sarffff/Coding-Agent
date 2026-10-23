@@ -5,6 +5,7 @@ import pytest
 from app import main
 from app.model_provider import ContextRequest, PatchProposal, _proposal_from_payload
 from app.models import PatchFile
+from app.repository_service import RepositoryError
 from test_api_workflow import create_task, post
 from test_model_draft import model_api
 
@@ -74,3 +75,75 @@ def test_pause_during_a_manual_context_request_discards_late_response(model_api,
     assert response.status_code == 400
     assert response.json()["code"] == "INVALID_TASK_STATE"
     assert not any(event.action == "patch.draft" for event in main.audit_service.list_for_run(task["run_id"]))
+
+
+def test_rejected_replies_are_fed_back_and_missing_files_are_read_for_the_model(model_api, monkeypatch):
+    client, directory = model_api
+    task = create_task(client, directory)
+    (directory / "extra.py").write_text("X = 1\n", encoding="utf-8")
+    monkeypatch.setattr(main.settings, "llm_max_context_files", 1)
+    calls = []
+
+    async def model(goal, context, failure):
+        calls.append((goal, dict(context)))
+        if len(calls) == 1:
+            return _proposal_from_payload({"files": [{"path": "app.py", "edits": [{"old_text": "missing", "new_text": "x"}]}]}, [("app.py", "def value():\n    return 1\n")])
+        if len(calls) == 2:
+            assert "MODEL_EDIT_CONFLICT" in goal
+            return _proposal_from_payload({"files": [{"path": "extra.py", "edits": [{"old_text": "X = 1", "new_text": "X = 2"}]}]}, [])
+        assert "MODEL_CONTEXT_REQUIRED" in goal and "extra.py" in dict(context)
+        return _proposal_from_payload({"files": [{"path": "extra.py", "edits": [{"old_text": "X = 1", "new_text": "X = 2"}]}]}, context)
+
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    draft = post(client, f"/api/v1/runs/{task['run_id']}/patches/draft")
+    assert "+X = 2" in draft["diff"] and len(calls) == 3
+    budget = client.get(f"/api/v1/tasks/{task['id']}").json()["budget"]
+    assert budget["remote_calls"] == 3 and budget["consecutive_failures"] == 0
+
+
+def test_model_that_keeps_returning_bad_replies_stops_and_counts_one_failure(model_api, monkeypatch):
+    client, directory = model_api
+    task = create_task(client, directory)
+    calls = []
+
+    async def model(goal, context, failure):
+        calls.append(goal)
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "not json")
+
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={})
+    assert response.json()["code"] == "MODEL_INVALID_OUTPUT"
+    assert len(calls) == main.agent_service.CONTEXT_ROUNDS + 1
+    assert client.get(f"/api/v1/tasks/{task['id']}").json()["budget"]["consecutive_failures"] == 1
+
+
+@pytest.mark.parametrize("mode", ["standard", "conservative"])
+def test_model_run_requests_return_output_except_in_conservative_mode(model_api, monkeypatch, mode):
+    client, directory = model_api
+    task = create_task(client, directory)
+    main.task_service.set_mode(task["id"], mode)
+    calls = []
+
+    async def model(goal, context, failure):
+        calls.append(goal)
+        if len(calls) == 1:
+            return PatchProposal(context_requests=[
+                ContextRequest(action="run", command=["python", "-c", "print('probe-output'); raise SystemExit(3)"]),
+                ContextRequest(action="run", command=["bash", "-c", "echo no"]),
+            ])
+        return PatchProposal(files=[PatchFile(path="app.py", content="def value():\n    return 2\n")])
+
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    post(client, f"/api/v1/runs/{task['run_id']}/patches/draft")
+    result = calls[1]
+    if mode == "standard":
+        assert "probe-output" in result and "failed (exit 3)" in result
+        assert "'bash' is not an allowed program" in result
+    else:
+        assert "(exit 3)" not in result and "disabled in conservative mode" in result
+    assert not main.test_service.is_running(task["run_id"])  # model commands never look like validation
+    events = client.get(f"/api/v1/runs/{task['run_id']}/events").json()["items"]
+    runs = [event for event in events if event["action"] == "context.request"]
+    assert [event["details"]["action"] for event in runs] == ["run", "run"]
+    if mode == "standard":
+        assert "probe-output" in runs[0]["details"]["output"]  # shown in the chat transcript

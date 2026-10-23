@@ -70,6 +70,9 @@ AUTO_GRANT: dict[AgentMode, frozenset[ApprovalType]] = {
     "autonomous": frozenset({"plan", "write", "push", "pr"}),
 }
 
+# Bad replies the model can fix itself; draft_patch sends the error back instead of ending the run.
+_FEEDBACK_ERRORS = frozenset({"MODEL_INVALID_OUTPUT", "MODEL_EDIT_CONFLICT", "MODEL_CONTEXT_REQUIRED", "MODEL_OUTPUT_TRUNCATED"})
+
 
 class AgentService:
     """Advance one local step, yielding to the existing patch and approval UI."""
@@ -96,6 +99,10 @@ class AgentService:
         self.remote = remote
         self.patch = patch
         self.models = models
+
+    def set_model_provider(self, provider: ModelProvider) -> None:
+        """Swap the provider after a settings change; the object is built from Settings once at startup."""
+        self.models = provider
 
     def validation_hash(self, task: TaskSummary) -> str:
         if task.validation_checks:
@@ -413,7 +420,22 @@ class AgentService:
         repository = self.tasks.repositories.get(task.repository_id)
         rounds = 0
         while True:
-            proposal = await self._propose(task, goal, context_files, failure)
+            try:
+                proposal = await self._propose(task, goal, context_files, failure)
+            except RepositoryError as exc:
+                if exc.code not in _FEEDBACK_ERRORS:
+                    raise
+                if rounds >= self.CONTEXT_ROUNDS:
+                    self.tasks.record_remote_result(task.id, False)  # retries exhausted: now it counts
+                    raise
+                rounds += 1
+                self.audit.record("patch.draft.retry", "failed", f"Model reply rejected: {exc.code}", task_id=task.id, run_id=task.run_id,
+                                  details={"error": exc.code, **exc.details})
+                goal = f"{goal}\n\n# Previous reply rejected\n{exc.code}: {exc.message} Fix this and reply again."
+                missing = exc.details.get("path") if exc.code == "MODEL_CONTEXT_REQUIRED" else None
+                if isinstance(missing, str):  # read the file it wanted to edit instead of making it ask
+                    goal, context_files = await self._resolve_context_requests(task, goal, context_files, [ContextRequest(action="read", path=missing)])
+                continue
             if not proposal.context_requests:
                 break
             # Bounded on purpose: a model that keeps asking for context must stop, not loop.
@@ -424,7 +446,7 @@ class AgentService:
                     {"requests": [item.model_dump(exclude_none=True) for item in proposal.context_requests]},
                 )
             rounds += 1
-            goal, context_files = self._resolve_context_requests(task, goal, context_files, proposal.context_requests)
+            goal, context_files = await self._resolve_context_requests(task, goal, context_files, proposal.context_requests)
         # Edits are applied against the content the model actually saw, so hashes come from the final context.
         baselines = {repository.path / path: self.patch._content_hash(content) for path, content in context_files}
         files = []
@@ -493,19 +515,23 @@ class AgentService:
         """One model turn; a stop or pause while it runs discards the reply instead of applying it."""
         # ponytail: model calls share the task's remote-call budget (one counter with git-host calls); split if it ever matters.
         self.tasks.consume_remote_call(task.id)
-        succeeded = False
         try:
             proposal = await self.models.propose_patch(goal, context_files, failure)
-            succeeded = True
-        finally:
-            self.tasks.record_remote_result(task.id, succeeded)
+        except RepositoryError as exc:
+            # Protocol errors are fed back to the model by draft_patch; only a final give-up counts.
+            self.tasks.record_remote_result(task.id, exc.code in _FEEDBACK_ERRORS)
+            raise
+        except Exception:  # CancelledError (a user stop) is a BaseException: not a model failure
+            self.tasks.record_remote_result(task.id, False)
+            raise
+        self.tasks.record_remote_result(task.id, True)
         current = self.tasks.get(task.id)
         if current.status in {"paused", "cancelled", "done"}:
             raise TaskStateError("The task stopped while the model was drafting; the reply was discarded.", {"status": current.status})
         return proposal
 
-    def _resolve_context_requests(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], requests: list[ContextRequest]) -> tuple[str, list[tuple[str, str]]]:
-        """Run the model's search/read requests and fold the results into the next prompt.
+    async def _resolve_context_requests(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], requests: list[ContextRequest]) -> tuple[str, list[tuple[str, str]]]:
+        """Run the model's search/read/run requests and fold the results into the next prompt.
 
         A request that cannot be served (protected, missing, binary) is reported back to the
         model as a failed note; it never turns into file content, and the caller's round cap
@@ -526,6 +552,9 @@ class AgentService:
                 self.audit.record("context.request", "succeeded", f"Searched for {request.query}", task_id=task.id, run_id=task.run_id,
                                   details={"action": "search", "query": request.query, "paths": paths[:10]})
                 continue
+            if request.action == "run":
+                notes.append(await self._run_for_model(task, request.command))
+                continue
             try:
                 source = self.tasks.repositories.read_file(task.repository_id, request.path)
             except RepositoryError as exc:
@@ -538,9 +567,30 @@ class AgentService:
             notes.append(f"Read {source.path}.")
             self.audit.record("context.request", "succeeded", f"Read {source.path}", task_id=task.id, run_id=task.run_id,
                               details={"action": "read", "path": source.path})
+        kept = self._trim_context(context_files)
+        kept_paths = {name for name, _ in kept}
+        dropped = [path for path, _ in context_files if path not in kept_paths]
+        if dropped:
+            notes.append("Dropped from context (size budget), read again before editing: " + ", ".join(dropped))
         if notes:
             goal = goal + "\n\n# Context results\n" + "\n".join(notes)
-        return goal, self._trim_context(context_files)
+        return goal, kept
+
+    async def _run_for_model(self, task: TaskSummary, command: list[str]) -> str:
+        """Execute one model-requested program and return a note for the next prompt; never raises on command failure."""
+        shown = " ".join(command)[:300]
+        if task.mode == "conservative":
+            self.audit.record("context.request", "failed", f"Command refused (conservative): {shown}", task_id=task.id, run_id=task.run_id,
+                              details={"action": "run", "command": command, "error": "COMMAND_NOT_ALLOWED"})
+            return f"Run {shown} refused: commands are disabled in conservative mode."
+        result = await run_in_threadpool(self.tests.run_command, task.run_id, task.repository_id, command)
+        self.audit.record("context.request", "succeeded" if result.status in {"passed", "failed"} else "failed", f"Ran {shown}",
+                          task_id=task.id, run_id=task.run_id,
+                          details={"action": "run", "command": command, "status": result.status, "exit_code": result.exit_code,
+                                   "output": (result.stdout[-2_000:] + ("\n" + result.stderr[-2_000:] if result.stderr else "")).strip()})
+        # ponytail: output capped at 4k chars per stream in the prompt; raise if the model needs longer traces.
+        return (f"Run {shown} -> {result.status} (exit {result.exit_code})\n"
+                f"stdout:\n{result.stdout[-4_000:]}\nstderr:\n{result.stderr[-4_000:]}")
 
     def _trim_context(self, context_files: list[tuple[str, str]]) -> list[tuple[str, str]]:
         """Keep the newest files within the configured count and byte budget."""

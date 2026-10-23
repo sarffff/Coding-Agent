@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     openai_api_url: str = "https://api.openai.com/v1"
     llm_model: str = "claude-sonnet-5-5"
     llm_max_tokens: int = Field(default=4_096, ge=256, le=131_072)
-    llm_timeout_seconds: int = Field(default=60, ge=1)
+    llm_timeout_seconds: int = Field(default=300, ge=1)
     llm_max_context_files: int = Field(default=12, ge=1)
     llm_max_context_bytes: int = Field(default=120_000, ge=1_000)
     task_max_iterations: int = Field(default=8, ge=1)

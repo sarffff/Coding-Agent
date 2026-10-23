@@ -29,6 +29,9 @@ def test_context_requests_extract_and_validate_without_proposing_edits():
     {"action": "read"}, {"action": "read", "path": "a.py", "query": "x"},
     {"action": "read", "path": "x" * 4097}, {"action": "execute", "query": "anything"},
     {"action": "read", "path": "a.py", "extra": True}, "a.py",
+    {"action": "run"}, {"action": "run", "command": []}, {"action": "run", "command": [" "]},
+    {"action": "run", "command": ["python"], "path": "a.py"}, {"action": "read", "path": "a.py", "command": ["python"]},
+    {"action": "run", "command": ["python", "x" * 1001]},
 ])
 def test_invalid_context_requests_are_rejected(context_request):
     with pytest.raises(RepositoryError) as error:
@@ -136,3 +139,8 @@ def test_providers_return_context_requests_then_expand_local_edits(monkeypatch, 
     proposal = asyncio.run(model.propose_patch("fix", [("a.py", "def value():\n    return 1\n")], None))
     assert proposal.files[0].content == "def value():\n    return 2\n"
     assert not proposal.context_requests
+
+
+def test_run_requests_keep_the_argv_verbatim():
+    proposal = _proposal_from_payload({"context_requests": [{"action": "run", "command": ["python", "-m", "pytest", "-q", "test_app.py"]}]})
+    assert proposal.context_requests[0].command == ["python", "-m", "pytest", "-q", "test_app.py"]

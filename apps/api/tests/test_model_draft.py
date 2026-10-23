@@ -4,6 +4,7 @@ import json
 import os
 from threading import Event
 
+import httpx
 import pytest
 from conftest import build_settings, mount_services
 from test_api_workflow import apply_value, create_task, post
@@ -114,6 +115,62 @@ def test_both_providers_extract_their_response_shapes(monkeypatch):
     monkeypatch.setattr(mp, "_post_json", fake_openai)
     openai = asyncio.run(OpenAIModelProvider(settings).propose_patch("goal", [], None))
     assert openai.files[0].path == "a.py"
+
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _mock_client(monkeypatch, responses):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(mp, "_RETRY_DELAYS", (0, 0))
+    monkeypatch.setattr(mp.httpx, "AsyncClient", lambda **kw: _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler), **kw))
+    return calls
+
+
+def test_post_json_retries_overload_and_dropped_connections_then_gives_up(monkeypatch):
+    settings = Settings(anthropic_api_key="k")
+    ok = httpx.Response(200, json={"ok": True})
+    calls = _mock_client(monkeypatch, [httpx.Response(529), httpx.ConnectError("drop"), ok])
+    assert asyncio.run(mp._post_json(settings, "https://x/v1/messages", {}, {})) == {"ok": True}
+    assert len(calls) == 3
+
+    calls = _mock_client(monkeypatch, [httpx.Response(429)] * 3)
+    with pytest.raises(RepositoryError) as error:
+        asyncio.run(mp._post_json(settings, "https://x/v1/messages", {}, {}))
+    assert error.value.code == "MODEL_RATE_LIMITED" and len(calls) == 3
+
+    calls = _mock_client(monkeypatch, [httpx.Response(401)])
+    with pytest.raises(RepositoryError) as error:
+        asyncio.run(mp._post_json(settings, "https://x/v1/messages", {}, {}))
+    assert error.value.code == "MODEL_AUTH_FAILED" and len(calls) == 1
+
+
+def test_truncated_replies_report_the_token_limit(monkeypatch):
+    settings = Settings(anthropic_api_key="k", openai_api_key="k")
+
+    async def anthropic(*_args):
+        return {"stop_reason": "max_tokens", "content": [{"type": "text", "text": '{"files": ['}]}
+
+    monkeypatch.setattr(mp, "_post_json", anthropic)
+    with pytest.raises(RepositoryError) as error:
+        asyncio.run(AnthropicModelProvider(settings).propose_patch("goal", [], None))
+    assert error.value.code == "MODEL_OUTPUT_TRUNCATED"
+
+    async def openai(*_args):
+        return {"choices": [{"finish_reason": "length", "message": {"content": '{"files": ['}}]}
+
+    monkeypatch.setattr(mp, "_post_json", openai)
+    with pytest.raises(RepositoryError) as error:
+        asyncio.run(OpenAIModelProvider(settings).propose_patch("goal", [], None))
+    assert error.value.code == "MODEL_OUTPUT_TRUNCATED"
 
 
 def test_draft_passes_requested_context_file_content_to_the_model(model_api):
