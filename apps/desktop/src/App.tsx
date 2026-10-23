@@ -234,6 +234,7 @@ function App() {
   const [testError, setTestError] = useState<string | null>(null);
   const [validationSaving, setValidationSaving] = useState(false);
   const [patchPath, setPatchPath] = useState("");
+  const [patchFeedback, setPatchFeedback] = useState("");
   const [patchContent, setPatchContent] = useState("");
   const [patchPreviewResult, setPatchPreviewResult] = useState<PatchPreview | null>(null);
   const [patchRunning, setPatchRunning] = useState(false);
@@ -787,7 +788,11 @@ function App() {
     setPatchError(null);
     setPatchApplied(null);
     try {
-      const preview = await draftPatch(activeTask.runId, { context_paths: patchPath.trim() ? [patchPath.trim()] : [] });
+      const preview = await draftPatch(activeTask.runId, {
+        context_paths: patchPath.trim() ? [patchPath.trim()] : [],
+        feedback: patchFeedback.trim() || undefined,
+      });
+      setPatchFeedback("");
       setPatchPreviewResult(preview);
       setPatchRationale(preview.rationale);
       const events = await listRunEvents(activeTask.runId);
@@ -1383,6 +1388,7 @@ function App() {
                 <label className="patch-operation">{t("patch.operation")}<select value={patchOperation} onChange={event => { setPatchOperation(event.target.value as PatchFileInput["operation"]); setPatchPreviewResult(null); }}>{["update", "create", "delete"].map(operation => <option value={operation} key={operation}>{t("patch." + operation)}</option>)}</select></label>
                 <input value={patchPath} onChange={(event) => { setPatchPath(event.target.value); setPatchExpectedHash(undefined); setPatchPreviewResult(null); }} placeholder={t("patchPathPlaceholder")} aria-label={t("patchPath")} />
                 <textarea value={patchContent} disabled={patchOperation === "delete"} onChange={(event) => { setPatchContent(event.target.value); setPatchPreviewResult(null); }} placeholder={t("patchContentPlaceholder")} aria-label={t("patchContent")} rows={4} />
+                <input className="patch-feedback" value={patchFeedback} disabled={patchRunning} onChange={(event) => setPatchFeedback(event.target.value)} placeholder={t("patch.feedbackPlaceholder")} aria-label={t("patch.feedbackPlaceholder")} />
                 <div className="patch-form-actions"><span>{patchPath.trim() ? `${t("patch.draftContext")}：${patchPath.trim()}` : t("updateOnly")}</span><div className="patch-form-buttons"><button className="small-action small-action--muted" onClick={() => void draftActivePatch()} disabled={!activeTask?.runId || patchRunning}>{patchRunning ? t("patch.drafting") : t("patch.draft")}</button><button className="small-action" onClick={() => void previewActivePatch()} disabled={!activeTask?.runId || !patchPath.trim() || patchRunning}>{patchRunning ? t("working") : t("previewDiff")}</button></div></div>
               </div>
               {patchPreviewResult ? <div className="patch-result">{patchRationale ? <div className="patch-rationale"><strong>{t("patch.rationale")}</strong> {patchRationale}</div> : null}<div className="patch-summary"><span>{patchPreviewResult.files.length} {t("file")}</span><span className="diff-add">+{patchPreviewResult.additions}</span><span className="diff-del">-{patchPreviewResult.deletions}</span><span>{patchPreviewResult.bytes_changed} {t("bytes")}</span></div><pre className="diff-view">{patchPreviewResult.diff || t("noChangesDetected")}</pre><div className="patch-result-actions"><span>{t("reviewUnifiedDiff")}</span><div className="patch-result-buttons"><button className="small-action small-action--muted" onClick={cancelPatchPreview} disabled={patchRunning}>{t("cancel")}</button><button className="small-action" onClick={() => void applyActivePatch()} disabled={patchRunning || !patchPreviewResult.diff}>{t("applyCheckpoint")}</button></div></div></div> : <div className="empty-operation"><FileCode2 size={17} /><span>{t("previewBeforeRepository")}</span></div>}
