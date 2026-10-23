@@ -166,6 +166,14 @@ class RepositoryService:
             raise RepositoryError("REPOSITORY_NOT_FOUND", "Repository is not registered.", {"repository_id": repository_id})
         return record
 
+    def delete(self, repository_id: str) -> None:
+        """Unregister a folder. The files on disk are never touched."""
+        self.get(repository_id)
+        key = self._keys.pop(repository_id, None)
+        self._repositories.pop(repository_id, None)
+        if self.store and key:
+            self.store.delete("repositories", key)
+
     def summary(self, record: RepositoryRecord) -> RepositorySummary:
         branch, head, last_commit, changed_files = "", None, None, 0
         if record.has_git:

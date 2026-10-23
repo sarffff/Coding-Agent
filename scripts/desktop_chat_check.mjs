@@ -132,6 +132,9 @@ try {
 
   // Execute the real compiled callbacks with API stubs; no browser or new test dependency.
   const { code } = await server.transformRequest("/src/App.tsx", { ssr: true });
+  // Error text now comes from a module table; the slices below only need the shape of it.
+  const errorImport = code.match(/([\w$]+)\.describeError/)?.[1];
+  const errorStub = { describeError: (reason, fallback) => (reason instanceof Error ? reason.message : fallback) };
   const handlers = code.slice(code.indexOf("const sendChatMessage ="), code.indexOf("const decideChatApproval ="));
   const apiName = handlers.match(/([\w$]+)\.createTask/)[1];
   const newSession = code.slice(code.indexOf("const startNewChatSession ="), code.indexOf("const selectChatSession ="));
@@ -145,6 +148,7 @@ try {
       runEvents: ["old-event"], chatPending: {}, chatBudget: {}, chatAction: "working", chatError: "old-error",
       loopRunning: false, sourceLocation: { path: "old-folder.py", line: 3 }, registered: [], picked: [] };
     const context = {
+      ...(errorImport ? { [errorImport]: errorStub } : {}),
       [folderApiName]: {
         validateRepository: async path => error ? { valid: false, reason: error.message, reason_code: "PATH_OUTSIDE_WORKSPACE" } : { valid: true },
         registerRepository: async path => {
@@ -225,6 +229,7 @@ try {
       },
     };
     const context = {
+      ...(errorImport ? { [errorImport]: errorStub } : {}),
       [workspaceBridgeName]: { desktopBridge: bridge },
       desktopBridge: bridge,
       t: key => key, Error,

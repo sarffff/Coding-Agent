@@ -1,3 +1,4 @@
+import { describeError } from "../lib/errorMessages";
 import { useEffect, useState } from "react";
 import { AsyncMessage, Dialog } from "@coding-agent/ui";
 import { Clock3, RotateCcw, RefreshCw } from "lucide-react";
@@ -18,7 +19,7 @@ export function RunHistory({ runId, revision, onRestored, disabled }: { runId: s
     setLoading(true); setError(null); setTests([]); setCheckpoints([]);
     Promise.all([listTestHistory(runId, controller.signal), listCheckpoints(runId, controller.signal)])
       .then(([history, snapshots]) => { if (!controller.signal.aborted) { setTests(history.items); setCheckpoints(snapshots.items); } })
-      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t("common.error")); })
+      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(describeError(reason, t("common.error"))); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [runId, revision, refresh, t]);
@@ -30,7 +31,7 @@ export function RunHistory({ runId, revision, onRestored, disabled }: { runId: s
       await rollbackRun(runId, checkpoint.id);
       await onRestored();
       setRefresh(value => value + 1);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : t("common.error")); }
+    } catch (reason) { setError(describeError(reason, t("common.error"))); }
     finally { setBusy(false); }
   };
   const time = (value: string) => new Date(value).toLocaleString(language, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });

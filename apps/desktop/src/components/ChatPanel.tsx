@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Bot, Check, ChevronDown, Code2, FileSearch, FolderOpen, FolderPlus, GitBranch, Monitor, Rocket, ShieldCheck, Sparkles, Square, Workflow, X } from "lucide-react";
+import { ArrowUp, Bot, Check, ChevronDown, Code2, FileSearch, FolderOpen, FolderPlus, GitBranch, Monitor, Rocket, ShieldCheck, Sparkles, Square, Trash2, Workflow, X } from "lucide-react";
 import type { AgentMode, Approval, AuditEvent, TaskBudget, TaskTrack } from "../lib/api";
 import { usePreferences, type Language } from "../lib/preferences";
 
@@ -47,6 +47,7 @@ type ChatPanelProps = {
   pending: Approval | null;
   onDecide: (approvalId: string, decision: "approve" | "reject", reason?: string) => void | Promise<void>;
   budget: TaskBudget | null;
+  onDelete?: () => void | Promise<void>;
 };
 
 const MODES: AgentMode[] = ["conservative", "standard", "autonomous"];
@@ -62,7 +63,7 @@ function roleForEvent(action: string): ChatRole {
   if (a === "chat.user") return "user";
   if (a === "chat.assistant") return "assistant";
   if (a.startsWith("patch.draft") || a.startsWith("iteration.") || a === "agent.plan") return "assistant";
-  if (a.startsWith("patch.") || a.startsWith("tests.") || a.startsWith("git.") || a.startsWith("checkpoint.")) return "tool";
+  if (a.startsWith("patch.") || a.startsWith("tests.") || a.startsWith("git.") || a.startsWith("checkpoint.") || a === "context.request") return "tool";
   return "system";
 }
 
@@ -91,13 +92,14 @@ export function ChatPanel(props: ChatPanelProps) {
       const role = roleForEvent(event.action);
       const rationale = typeof event.details?.rationale === "string" ? event.details.rationale : undefined;
       const failed = Array.isArray(event.details?.failed_tests) ? (event.details.failed_tests as Array<{ message?: string }>).map((item) => item.message).filter(Boolean).join("\n") : undefined;
+      const output = typeof event.details?.output === "string" && event.details.output ? event.details.output : undefined;
       turns.push({
         id: event.id,
         role,
         title: event.action === "patch.draft" ? t("chat.thinking") : event.summary,
-        body: rationale || failed || undefined,
-        bodyPre: Boolean(failed),
-        collapse: Boolean(rationale || failed),
+        body: rationale || failed || output || undefined,
+        bodyPre: Boolean(failed || output),
+        collapse: Boolean(rationale || failed || output),
         status: event.status,
         time: new Date(event.created_at).toLocaleTimeString(language as Language, { hour12: false }),
       });
@@ -294,7 +296,7 @@ export function ChatPanel(props: ChatPanelProps) {
           <>
             <div className="chat-header">
         <div><div className="section-kicker"><Bot size={13} /> {t("chat.title")}</div><h2>{t("chat.subtitle")}</h2></div>
-        {props.loopRunning ? <button className="small-action small-action--muted" onClick={() => void props.onStop()}><Square size={13} /> {t("chat.stop")}</button> : <span className="chat-state">{terminal ? t("chat.idle") : t("chat.active")}</span>}
+        <div className="chat-header-actions">{props.onDelete && !props.loopRunning ? <button className="small-action small-action--muted" onClick={() => void props.onDelete?.()} disabled={busy}><Trash2 size={13} /> {t("chat.delete")}</button> : null}{props.loopRunning ? <button className="small-action small-action--muted" onClick={() => void props.onStop()}><Square size={13} /> {t("chat.stop")}</button> : <span className="chat-state">{terminal ? t("chat.idle") : t("chat.active")}</span>}</div>
       </div>
 
       {props.budget ? (

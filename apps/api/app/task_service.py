@@ -492,6 +492,14 @@ class TaskService:
         self._persist(record)
         return record.summary
 
+    def delete(self, task_id: str) -> None:
+        """Drop the task record. Checkpoints and approvals are removed by the caller."""
+        self._record(task_id)
+        key = self._keys.pop(task_id, None)
+        self._tasks.pop(task_id, None)
+        if self.store and key:
+            self.store.delete("tasks", key)
+
     def record_rollback(self, run_id: str, checkpoint_ids: list[str]) -> TaskSummary:
         record = self._record_by_run(run_id)
         for iteration in record.iterations:

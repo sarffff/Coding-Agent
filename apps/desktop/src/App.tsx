@@ -1,3 +1,4 @@
+import { describeError } from "./lib/errorMessages";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
@@ -49,6 +50,9 @@ import {
   listRunEvents,
   listTasks,
   draftPatch,
+  deleteTask,
+  deleteRepository,
+  ApiRequestError,
   startAgentLoop,
   stopAgentLoop,
   getAgentState,
@@ -104,8 +108,9 @@ import { AgentPanel } from "./components/AgentPanel";
 import { ApprovalPanel } from "./components/ApprovalPanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { ValidationChecklist } from "./components/ValidationChecklist";
+import { SettingsPanel } from "./components/SettingsPanel";
 
-type NavKey = "chat" | "overview" | "tasks" | "repositories" | "runs" | "approvals";
+type NavKey = "chat" | "overview" | "tasks" | "repositories" | "runs" | "approvals" | "settings";
 
 type Task = {
   id: string;
@@ -171,6 +176,7 @@ const navItems: Array<{ key: NavKey; icon: typeof LayoutDashboard }> = [
   { key: "repositories", icon: FolderOpen },
   { key: "runs", icon: TerminalSquare },
   { key: "approvals", icon: ShieldCheck },
+  { key: "settings", icon: Settings2 },
 ];
 
 function eventToStreamEvent(event: AuditEvent, t: (key: string) => string, locale: Language): StreamEvent {
@@ -320,7 +326,7 @@ function App() {
           setEventsError(null);
         }
       } catch (error) {
-        if (!disposed) setEventsError(error instanceof Error ? error.message : t("eventsError"));
+        if (!disposed) setEventsError(describeError(error, t("eventsError")));
       }
     };
     void loadEvents();
@@ -462,7 +468,7 @@ function App() {
       if (controller.signal.aborted) {
         setOverviewError(t("overview.timeout"));
       } else {
-        setOverviewError(error instanceof Error ? error.message : t("overview.error"));
+        setOverviewError(describeError(error, t("overview.error")));
       }
     } finally {
       clearTimeout(timeout);
@@ -505,6 +511,45 @@ function App() {
   const pushApproval = approvals.find((item) => item.type === "push");
   const pullRequestApproval = approvals.find((item) => item.type === "pr");
 
+  const removeRepository = async (repositoryId: string) => {
+    const repository = repositories.find((item) => item.id === repositoryId);
+    if (!repository || !window.confirm(t("browser.removeConfirm").replace("{name}", repository.name))) return;
+    setRepositoryError(null);
+    try {
+      try {
+        await deleteRepository(repositoryId);
+      } catch (reason) {
+        // The folder still owns tasks: ask once more before taking them down with it.
+        if (reason instanceof ApiRequestError && reason.code === "REPOSITORY_IN_USE") {
+          if (!window.confirm(t("browser.removeCascade").replace("{name}", repository.name))) return;
+          await deleteRepository(repositoryId, true);
+        } else {
+          throw reason;
+        }
+      }
+      setRepositories((current) => current.filter((item) => item.id !== repositoryId));
+      if (selectedRepositoryId === repositoryId) setSelectedRepositoryId("");
+      if (activeTask?.repositoryId === repositoryId) { setActiveTaskId(""); startNewChatSession(); }
+      setTasks((current) => current.filter((task) => task.repositoryId !== repositoryId));
+    } catch (reason) {
+      setRepositoryError(describeError(reason, t("repositoryError")));
+    }
+  };
+
+  const removeActiveTask = async () => {
+    if (!activeTask) return;
+    if (!window.confirm(t("chat.deleteConfirm").replace("{title}", activeTask.title))) return;
+    setChatError(null);
+    try {
+      await deleteTask(activeTask.id);
+      setTasks((current) => current.filter((task) => task.id !== activeTask.id));
+      setActiveTaskId("");
+      startNewChatSession();
+    } catch (reason) {
+      setChatError(describeError(reason, t("chat.error")));
+    }
+  };
+
   const runTask = async () => {
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt || isRunning || agentBusyAction) return;
@@ -518,7 +563,7 @@ function App() {
       setTasks((current) => [newTask, ...current.filter((item) => item.id !== newTask.id)]);
       setActiveTaskId(newTask.id);
     } catch (error) {
-      setTaskError(error instanceof Error ? error.message : t("taskCreatedError"));
+      setTaskError(describeError(error, t("taskCreatedError")));
       setPrompt(trimmedPrompt);
     } finally {
       setIsRunning(false);
@@ -573,7 +618,7 @@ function App() {
       setChatAction(null);
       return true;
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : t("chat.error"));
+      setChatError(describeError(error, t("chat.error")));
       return false;
     } finally {
       chatSendingRef.current = false;
@@ -587,7 +632,7 @@ function App() {
       const state = await stopAgentLoop(activeTask.runId);
       setLoopRunning(state.loop_running);
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : t("chat.error"));
+      setChatError(describeError(error, t("chat.error")));
     }
   };
 
@@ -605,7 +650,7 @@ function App() {
         setLoopRunning(true);
       }
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : t("chat.error"));
+      setChatError(describeError(error, t("chat.error")));
     } finally {
       chatSendingRef.current = false;
       setChatSending(false);
@@ -666,7 +711,7 @@ function App() {
       setRepositoryPathInput("");
       void getWorkspaceSummary().then(setWorkspaceSummary).catch(() => {});
     } catch (error) {
-      setRepositoryError(error instanceof Error ? error.message : t("repositoryError"));
+      setRepositoryError(describeError(error, t("repositoryError")));
       setRepositoryDialogOpen(true);
     } finally {
       repositoryOpeningRef.current = false;
@@ -687,7 +732,7 @@ function App() {
       setDesktopRuntime((current) => ({ ...(current ?? {}), ...result } as DesktopStatus));
       if (result.error) setRepositoryError(result.error);
     } catch (error) {
-      setRepositoryError(error instanceof Error ? error.message : t("repositoryError"));
+      setRepositoryError(describeError(error, t("repositoryError")));
     } finally {
       setRepositorySaving(false);
     }
@@ -712,7 +757,7 @@ function App() {
       setIterations(nextIterations.items);
       updateTaskFromApi(task);
     } catch (error) {
-      setTestError(error instanceof Error ? error.message : t("testsError"));
+      setTestError(describeError(error, t("testsError")));
     } finally {
       setTestRunning(false);
     }
@@ -730,7 +775,7 @@ function App() {
       const events = await listRunEvents(activeTask.runId);
       setRunEvents(events.items);
     } catch (error) {
-      setPatchError(error instanceof Error ? error.message : t("patchPreviewError"));
+      setPatchError(describeError(error, t("patchPreviewError")));
     } finally {
       setPatchRunning(false);
     }
@@ -748,7 +793,7 @@ function App() {
       const events = await listRunEvents(activeTask.runId);
       setRunEvents(events.items);
     } catch (error) {
-      setPatchError(error instanceof Error ? error.message : t("patch.draftError"));
+      setPatchError(describeError(error, t("patch.draftError")));
     } finally {
       setPatchRunning(false);
     }
@@ -773,7 +818,7 @@ function App() {
       setIterations(nextIterations.items);
       updateTaskFromApi(task);
     } catch (error) {
-      setPatchError(error instanceof Error ? error.message : t("patchApplyError"));
+      setPatchError(describeError(error, t("patchApplyError")));
     } finally {
       setPatchRunning(false);
     }
@@ -796,7 +841,7 @@ function App() {
       const task = await getTask(activeTask.id);
       updateTaskFromApi(task);
     } catch (error) {
-      setGitError(error instanceof Error ? error.message : t("branchError"));
+      setGitError(describeError(error, t("branchError")));
     } finally {
       setGitRunning(false);
     }
@@ -809,7 +854,7 @@ function App() {
     try {
       setCommitPreviewResult(await previewCommit(activeTask.id, commitMessage.trim()));
     } catch (error) {
-      setGitError(error instanceof Error ? error.message : t("commitPreviewError"));
+      setGitError(describeError(error, t("commitPreviewError")));
     } finally {
       setGitRunning(false);
     }
@@ -826,7 +871,7 @@ function App() {
       const task = await getTask(activeTask.id);
       updateTaskFromApi(task);
     } catch (error) {
-      setGitError(error instanceof Error ? error.message : t("commitError"));
+      setGitError(describeError(error, t("commitError")));
     } finally {
       setGitRunning(false);
     }
@@ -840,7 +885,7 @@ function App() {
       const approval = await requestApproval(activeTask.id, "write", `Approve commit: ${commitPreviewResult.commit_message}`, commitPreviewResult.scope_hash);
       setApprovals((current) => [approval, ...current.filter((item) => item.id !== approval.id)]);
     } catch (error) {
-      setGitError(error instanceof Error ? error.message : t("writeApprovalRequestError"));
+      setGitError(describeError(error, t("writeApprovalRequestError")));
     } finally {
       setGitRunning(false);
     }
@@ -855,7 +900,7 @@ function App() {
       const decided = await decideApproval(approval.id, "approve");
       setApprovals((current) => current.map((item) => item.id === decided.id ? decided : item));
     } catch (error) {
-      setGitError(error instanceof Error ? error.message : t("writeApprovalDecisionError"));
+      setGitError(describeError(error, t("writeApprovalDecisionError")));
     } finally {
       setGitRunning(false);
     }
@@ -870,7 +915,7 @@ function App() {
       const approval = await requestApproval(activeTask.id, type, summary);
       setApprovals((current) => [approval, ...current.filter((item) => item.id !== approval.id)]);
     } catch (error) {
-      setPublishError(error instanceof Error ? error.message : t("publish.approvalRequestError"));
+      setPublishError(describeError(error, t("publish.approvalRequestError")));
     } finally {
       setPublishRunning(false);
     }
@@ -885,7 +930,7 @@ function App() {
       const decided = await decideApproval(approval.id, "approve");
       setApprovals((current) => current.map((item) => item.id === decided.id ? decided : item));
     } catch (error) {
-      setPublishError(error instanceof Error ? error.message : t("publish.approvalDecisionError"));
+      setPublishError(describeError(error, t("publish.approvalDecisionError")));
     } finally {
       setPublishRunning(false);
     }
@@ -906,7 +951,7 @@ function App() {
       await refreshPublishState(activeTask.id);
       updateTaskFromApi(await getTask(activeTask.id));
     } catch (error) {
-      setPublishError(error instanceof Error ? error.message : t("publish.pushError"));
+      setPublishError(describeError(error, t("publish.pushError")));
     } finally {
       setPublishRunning(false);
     }
@@ -919,7 +964,7 @@ function App() {
     try {
       setPullRequestPreview(await previewPullRequest(activeTask.id, pullRequestTarget));
     } catch (error) {
-      setPublishError(error instanceof Error ? error.message : t("publish.previewError"));
+      setPublishError(describeError(error, t("publish.previewError")));
     } finally {
       setPublishRunning(false);
     }
@@ -937,7 +982,7 @@ function App() {
       await refreshPublishState(activeTask.id);
       updateTaskFromApi(await getTask(activeTask.id));
     } catch (error) {
-      setPublishError(error instanceof Error ? error.message : t("publish.createError"));
+      setPublishError(describeError(error, t("publish.createError")));
     } finally {
       setPublishRunning(false);
     }
@@ -952,7 +997,7 @@ function App() {
       await refreshPublishState(activeTask.id);
       updateTaskFromApi(await getTask(activeTask.id));
     } catch (error) {
-      setPublishError(error instanceof Error ? error.message : t("publish.refreshError"));
+      setPublishError(describeError(error, t("publish.refreshError")));
     } finally {
       setPublishRunning(false);
     }
@@ -973,7 +1018,7 @@ function App() {
       const task = await getTask(activeTask.id);
       updateTaskFromApi(task);
     } catch (error) {
-      setIterationError(error instanceof Error ? error.message : t("iterationStartError"));
+      setIterationError(describeError(error, t("iterationStartError")));
     } finally {
       setIterationRunning(false);
     }
@@ -987,7 +1032,7 @@ function App() {
       const approval = await requestApproval(activeTask.id, "plan", `Approve the plan for: ${activeTask.title}`);
       setApprovals((current) => [approval, ...current.filter((item) => item.id !== approval.id)]);
     } catch (error) {
-      setIterationError(error instanceof Error ? error.message : t("approvalRequestError"));
+      setIterationError(describeError(error, t("approvalRequestError")));
     } finally {
       setIterationRunning(false);
     }
@@ -1002,7 +1047,7 @@ function App() {
       const decided = await decideApproval(approval.id, "approve");
       setApprovals((current) => current.map((item) => item.id === decided.id ? decided : item));
     } catch (error) {
-      setIterationError(error instanceof Error ? error.message : t("approvalDecisionError"));
+      setIterationError(describeError(error, t("approvalDecisionError")));
     } finally {
       setIterationRunning(false);
     }
@@ -1018,7 +1063,7 @@ function App() {
       const task = await getTask(activeTask.id);
       updateTaskFromApi(task);
     } catch (error) {
-      setIterationError(error instanceof Error ? error.message : t("repairStartError"));
+      setIterationError(describeError(error, t("repairStartError")));
     } finally {
       setIterationRunning(false);
     }
@@ -1034,7 +1079,7 @@ function App() {
       const result = action === "pause" ? await pauseTask(activeTask.id) : action === "resume" ? await resumeTask(activeTask.id) : await cancelTask(activeTask.id);
       updateTaskFromApi(result.task);
     } catch (error) {
-      setIterationError(error instanceof Error ? error.message : t("taskStateError"));
+      setIterationError(describeError(error, t("taskStateError")));
     } finally {
       setIterationRunning(false);
     }
@@ -1047,7 +1092,7 @@ function App() {
     try {
       updateTaskFromApi((await recoverTask(activeTask.id)).task);
     } catch (error) {
-      setIterationError(error instanceof Error ? error.message : t("taskStateError"));
+      setIterationError(describeError(error, t("taskStateError")));
     } finally {
       setIterationRunning(false);
     }
@@ -1089,7 +1134,7 @@ function App() {
   const chatRepositoryId = !chatComposingNew && activeTask && !["done", "completed", "cancelled"].includes(activeTask.lifecycleStatus) ? activeTask.repositoryId ?? "" : selectedRepositoryId;
   const openChatRun = () => {
     setActiveNav("runs");
-    void refreshActiveTask().catch(error => setIterationError(error instanceof Error ? error.message : t("common.error")));
+    void refreshActiveTask().catch(error => setIterationError(describeError(error, t("common.error"))));
   };
 
   return (
@@ -1183,7 +1228,7 @@ function App() {
                 <div className="rail-menu" role="menu">
                   <label className="preference-control"><Languages size={14} /><select value={language} onChange={(event) => setLanguage(event.target.value as Language)} aria-label={t("language")}><option value="zh-CN">{t("chinese")}</option><option value="en-US">{t("english")}</option></select></label>
                   <label className="preference-control"><span className="preference-theme-icon">{theme === "light" ? <Sun size={14} /> : theme === "dark" ? <Moon size={14} /> : <Monitor size={14} />}</span><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeMode)} aria-label={t("theme")}><option value="system">{t("system")}</option><option value="light">{t("light")}</option><option value="dark">{t("dark")}</option></select></label>
-                  <button className="rail-menu-item" disabled><Settings2 size={14} /> {t("settings")}</button>
+                  <button className="rail-menu-item" onClick={() => { setActiveNav("settings"); setAccountMenuOpen(false); }}><Settings2 size={14} /> {t("settings")}</button>
                 </div>
               </>
             ) : null}
@@ -1209,6 +1254,7 @@ function App() {
         </header>
 
         <div className="page-wrap" data-view={activeNav}>
+          {activeNav === "settings" ? <SettingsPanel /> : null}
           <ChatPanel
             goal={chatComposingNew || chatTrack === "cowork" ? null : (activeTask?.title ?? null)}
             plan={chatComposingNew || chatTrack === "cowork" ? undefined : (activeTask?.plan ?? undefined)}
@@ -1235,8 +1281,9 @@ function App() {
             pending={chatComposingNew ? null : chatPending}
             onDecide={decideChatApproval}
             budget={chatComposingNew ? null : chatBudget}
+            onDelete={activeTask && !loopRunning && !chatComposingNew ? removeActiveTask : undefined}
           />
-          {activeNav === "repositories" ? <RepositoryBrowser repositories={repositories} repositoryId={selectedRepositoryId} onRepositoryChange={(id) => { setSelectedRepositoryId(id); setSourceLocation(null); }} onOpenFolder={addRepository} onEdit={prepareSourceChange} canEdit={Boolean(activeTask?.repositoryId === selectedRepositoryId && activeTask.lifecycleStatus === "coding")} initialFile={sourceLocation} /> : null}
+          {activeNav === "repositories" ? <RepositoryBrowser repositories={repositories} repositoryId={selectedRepositoryId} onRepositoryChange={(id) => { setSelectedRepositoryId(id); setSourceLocation(null); }} onOpenFolder={addRepository} onEdit={prepareSourceChange} canEdit={Boolean(activeTask?.repositoryId === selectedRepositoryId && activeTask.lifecycleStatus === "coding")} initialFile={sourceLocation} onDelete={removeRepository} /> : null}
           <section className="hero-block">
             <div className="hero-copy">
               <div className="eyebrow"><span className="eyebrow-line" /> {t("controlRoom")} / {new Intl.DateTimeFormat(language, { weekday: "long", day: "2-digit", month: "short" }).format(new Date()).toUpperCase()}</div>

@@ -43,6 +43,7 @@ def mount_services(monkeypatch, settings) -> object:
         "remote_service",
         "agent_service",
         "idempotency_service",
+        "config_service",
     ):
         monkeypatch.setattr(main, name, getattr(services, name))
     return services

@@ -73,6 +73,9 @@ from .models import (
     AgentLoopRequest,
     AgentStateResponse,
     WorkspaceSummary,
+    ConfigResponse,
+    ConfigUpdateRequest,
+    DeleteResponse,
 )
 from .approval_service import plan_scope_hash
 from .repository_service import RepositoryError
@@ -92,6 +95,7 @@ approval_service = services.approval_service
 remote_service = services.remote_service
 agent_service = services.agent_service
 idempotency_service = services.idempotency_service
+config_service = services.config_service
 
 app = FastAPI(
     title="Coding Agent API",
@@ -177,6 +181,10 @@ ERROR_STATUS_BY_CODE = {
     "REMOTE_HEAD_MOVED": 409,
     "NO_APPROVED_COMMIT": 409,
     "TASK_BRANCH_NOT_CHECKED_OUT": 409,
+    "REPOSITORY_IN_USE": 409,
+    "WORKSPACE_BUSY": 409,
+    "CONFIG_EMPTY": 422,
+    "CONFIG_INVALID_VALUE": 422,
 }
 
 
@@ -690,3 +698,58 @@ async def list_run_events(run_id: str) -> AuditEventListResponse:
     task_service.get_by_run(run_id)
     items = audit_service.list_for_run(run_id)
     return AuditEventListResponse(items=items, total=len(items))
+
+
+@app.get("/api/v1/config", response_model=ConfigResponse)
+async def get_config() -> ConfigResponse:
+    """Runtime settings for the settings page; API keys are reported as configured or not."""
+    return config_service.describe()
+
+
+@app.put("/api/v1/config", response_model=ConfigResponse)
+async def update_config(payload: ConfigUpdateRequest) -> ConfigResponse:
+    updated = config_service.update(payload)
+    audit_service.record(
+        "config.update", "succeeded", "Updated runtime configuration",
+        # Field names only: the values include API keys.
+        details={"fields": sorted(payload.model_dump(exclude_none=True).keys()), "provider": updated.provider, "model": updated.model},
+    )
+    return updated
+
+
+@app.delete("/api/v1/tasks/{task_id}", response_model=DeleteResponse)
+async def delete_task(task_id: str) -> DeleteResponse:
+    """Delete a task with its checkpoints and approvals. Audit events stay immutable."""
+    task = task_service.get(task_id)
+    if agent_service._loop_running(task_id) or test_service.is_running(task.run_id):
+        raise RepositoryError("WORKSPACE_BUSY", "Stop the task before deleting it.", {"task_id": task_id})
+    checkpoints = patch_service.delete_for_run(task.run_id)
+    approvals = approval_service.delete_for_task(task_id)
+    task_service.delete(task_id)
+    audit_service.record("task.delete", "succeeded", "Task deleted", task_id=task_id, run_id=task.run_id,
+                         details={"checkpoints": checkpoints, "approvals": approvals})
+    return DeleteResponse(deleted=task_id, checkpoints=checkpoints, approvals=approvals)
+
+
+@app.delete("/api/v1/repositories/{repository_id}", response_model=DeleteResponse)
+async def delete_repository(repository_id: str, cascade: bool = Query(False)) -> DeleteResponse:
+    """Unregister a folder. Files on disk are never touched; `cascade` also drops its tasks."""
+    repository_service.get(repository_id)
+    owned = [task for task in task_service.list() if task.repository_id == repository_id]
+    if owned and not cascade:
+        raise RepositoryError(
+            "REPOSITORY_IN_USE", "This folder still has tasks; pass cascade=true to delete them with it.",
+            {"tasks": len(owned)},
+        )
+    busy = [task.id for task in owned if agent_service._loop_running(task.id) or test_service.is_running(task.run_id)]
+    if busy:
+        raise RepositoryError("WORKSPACE_BUSY", "Stop the running tasks before deleting the folder.", {"tasks": busy})
+    removed = 0
+    for task in owned:
+        patch_service.delete_for_run(task.run_id)
+        approval_service.delete_for_task(task.id)
+        task_service.delete(task.id)
+        removed += 1
+    repository_service.delete(repository_id)
+    audit_service.record("repository.delete", "succeeded", "Folder unregistered", details={"repository_id": repository_id, "tasks": removed})
+    return DeleteResponse(deleted=repository_id, tasks=removed)

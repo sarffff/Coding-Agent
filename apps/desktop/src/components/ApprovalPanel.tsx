@@ -1,3 +1,4 @@
+import { describeError } from "../lib/errorMessages";
 import { useEffect, useState } from "react";
 import { ArrowUpRight, RefreshCw, ShieldCheck } from "lucide-react";
 import { AsyncMessage, Dialog } from "@coding-agent/ui";
@@ -38,7 +39,7 @@ export function ApprovalPanel({ compact, revision, disabled, tasks, onOpenTask, 
         onPendingCount(result.items.filter(item => item.status === "pending").length);
         setLoadError(null);
       })
-      .catch(cause => { if (!controller.signal.aborted) setLoadError(cause instanceof Error ? cause.message : t("common.error")); })
+      .catch(cause => { if (!controller.signal.aborted) setLoadError(describeError(cause, t("common.error"))); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [revision, refresh, compact, t, onPendingCount]);
@@ -55,7 +56,7 @@ export function ApprovalPanel({ compact, revision, disabled, tasks, onOpenTask, 
       await onChanged(approval.task_id);
       if (action === "continue") onOpenTask(approval.task_id);
     } catch (cause) {
-      setError((saved ? t("approval.syncError") + " " : "") + (cause instanceof Error ? cause.message : t("common.error")));
+      setError((saved ? t("approval.syncError") + " " : "") + (describeError(cause, t("common.error"))));
     } finally {
       setBusy(false); onBusyChange(false); setRefresh(value => value + 1);
     }

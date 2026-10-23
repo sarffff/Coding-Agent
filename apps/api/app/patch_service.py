@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -98,6 +99,20 @@ class PatchService:
             ),
             checkpoint.summary.created_at.isoformat(),
         )
+
+    def delete_for_run(self, run_id: str) -> int:
+        """Remove every checkpoint of a run, backups included. A task owns exactly one run."""
+        removed = 0
+        for checkpoint_id, checkpoint in list(self._checkpoints.items()):
+            if checkpoint.summary.run_id != run_id:
+                continue
+            shutil.rmtree(checkpoint.backup_dir, ignore_errors=True)
+            key = self._keys.pop(checkpoint_id, None)
+            self._checkpoints.pop(checkpoint_id, None)
+            if self.store and key:
+                self.store.delete("checkpoints", key)
+            removed += 1
+        return removed
 
     def _backup_path(self, backup_dir: Path, relative_path: str) -> Path:
         target = (backup_dir / relative_path).resolve()

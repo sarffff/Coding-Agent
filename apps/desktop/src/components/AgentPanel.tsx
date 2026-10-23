@@ -1,3 +1,4 @@
+import { describeError } from "../lib/errorMessages";
 import { useEffect, useRef, useState } from "react";
 import { Activity, ArrowUpRight, Bot, RefreshCw, ShieldCheck } from "lucide-react";
 import { AsyncMessage } from "@coding-agent/ui";
@@ -62,7 +63,7 @@ export function AgentPanel({ taskId, revision, testKind, testTarget, disabled, h
     getAgentState(taskId, controller.signal)
       .then(result => { if (!controller.signal.aborted) setState(result); })
       .catch(reason => {
-        if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t("agent.loadError"));
+        if (!controller.signal.aborted) setError(describeError(reason, t("agent.loadError")));
       })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();

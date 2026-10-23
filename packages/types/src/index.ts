@@ -387,3 +387,49 @@ export type PublishState = {
 
 export type TaskStatus = AgentTask["status"];
 export type RepositorySummary = Repository;
+
+export type AppConfig = {
+  provider: string;
+  model: string;
+  anthropic_api_url: string;
+  openai_api_url: string;
+  anthropic_key_configured: boolean;
+  openai_key_configured: boolean;
+  workspace_root: string;
+  state_dir: string;
+  overrides_path: string;
+  command_timeout_seconds: number;
+  llm_timeout_seconds: number;
+  llm_max_tokens: number;
+  llm_max_context_files: number;
+  llm_max_context_bytes: number;
+  task_max_iterations: number;
+  task_max_wall_time_seconds: number;
+  task_max_remote_calls: number;
+  task_max_consecutive_failures: number;
+  audit_retention_days: number;
+  test_output_retention_days: number;
+  restart_required: boolean;
+};
+
+/** Request shape uses the backend field names; AppConfig is the response shape. */
+export type ConfigUpdate = {
+  llm_provider?: string;
+  llm_model?: string;
+  anthropic_api_key?: string;
+  openai_api_key?: string;
+  anthropic_api_url?: string;
+  openai_api_url?: string;
+  llm_max_tokens?: number;
+  llm_timeout_seconds?: number;
+  llm_max_context_files?: number;
+  llm_max_context_bytes?: number;
+  command_timeout_seconds?: number;
+};
+
+export type DeleteResult = {
+  deleted: string;
+  checkpoints: number;
+  approvals: number;
+  tasks: number;
+};

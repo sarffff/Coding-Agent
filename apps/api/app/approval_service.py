@@ -77,6 +77,18 @@ class ApprovalService:
     def list_for_task(self, task_id: str) -> list[ApprovalSummary]:
         return self.list(task_id=task_id)
 
+    def delete_for_task(self, task_id: str) -> int:
+        """Approvals are workflow state, not history: they go away with their task. Audit stays."""
+        removed = 0
+        for approval_id, record in list(self._items.items()):
+            if record.summary.task_id != task_id:
+                continue
+            self._items.pop(approval_id, None)
+            if self.store and record.key:
+                self.store.delete("approvals", record.key)
+            removed += 1
+        return removed
+
     def list(self, task_id: str | None = None, status: str | None = None, approval_type: str | None = None) -> list[ApprovalSummary]:
         items = []
         for record in self._items.values():

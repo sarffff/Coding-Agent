@@ -1,5 +1,5 @@
-import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
-export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, ValidationCheckStatus, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState } from "@coding-agent/types";
+import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState, AppConfig, ConfigUpdate, DeleteResult } from "@coding-agent/types";
+export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, ValidationCheckStatus, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState, AppConfig, ConfigUpdate, DeleteResult } from "@coding-agent/types";
 
 import { desktopBridge } from "./desktop";
 
@@ -294,4 +294,21 @@ export function createPullRequest(
 
 export function refreshPullRequest(taskId: string): Promise<PullRequest> {
   return request<PullRequest>(`/api/v1/tasks/${taskId}/pull-request/refresh`, { method: "POST" });
+}
+
+export function getConfig(signal?: AbortSignal): Promise<AppConfig> {
+  return request<AppConfig>("/api/v1/config", { signal });
+}
+
+export function updateConfig(body: ConfigUpdate): Promise<AppConfig> {
+  return request<AppConfig>("/api/v1/config", { method: "PUT", body: JSON.stringify(body) });
+}
+
+export function deleteTask(taskId: string): Promise<DeleteResult> {
+  return request<DeleteResult>(`/api/v1/tasks/${taskId}`, { method: "DELETE" });
+}
+
+export function deleteRepository(repositoryId: string, cascade = false): Promise<DeleteResult> {
+  const query = cascade ? "?cascade=true" : "";
+  return request<DeleteResult>(`/api/v1/repositories/${repositoryId}${query}`, { method: "DELETE" });
 }

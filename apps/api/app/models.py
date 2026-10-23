@@ -695,3 +695,57 @@ class AuditEvent(BaseModel):
 class AuditEventListResponse(BaseModel):
     items: list[AuditEvent]
     total: int
+
+
+class ConfigResponse(BaseModel):
+    """Runtime configuration with secrets reduced to "configured or not"."""
+
+    provider: str
+    model: str
+    anthropic_api_url: str
+    openai_api_url: str
+    anthropic_key_configured: bool
+    openai_key_configured: bool
+    workspace_root: str
+    state_dir: str
+    overrides_path: str
+    command_timeout_seconds: int
+    llm_timeout_seconds: int
+    llm_max_tokens: int
+    llm_max_context_files: int
+    llm_max_context_bytes: int
+    task_max_iterations: int
+    task_max_wall_time_seconds: int
+    task_max_remote_calls: int
+    task_max_consecutive_failures: int
+    audit_retention_days: int
+    test_output_retention_days: int
+    restart_required: bool = False
+
+
+class ConfigUpdateRequest(BaseModel):
+    """Only the model-facing knobs change at runtime; retention and budgets stay env-only.
+
+    An empty string clears a key, which is why the keys are not filtered out as falsy.
+    """
+
+    llm_provider: Literal["anthropic", "openai", "fake"] | None = None
+    llm_model: str | None = Field(default=None, min_length=1, max_length=200)
+    anthropic_api_key: str | None = Field(default=None, max_length=500)
+    openai_api_key: str | None = Field(default=None, max_length=500)
+    anthropic_api_url: str | None = Field(default=None, min_length=1, max_length=500)
+    openai_api_url: str | None = Field(default=None, min_length=1, max_length=500)
+    llm_max_tokens: int | None = Field(default=None, ge=256, le=131_072)
+    llm_timeout_seconds: int | None = Field(default=None, ge=5, le=900)
+    llm_max_context_files: int | None = Field(default=None, ge=1, le=64)
+    llm_max_context_bytes: int | None = Field(default=None, ge=1_000, le=1_000_000)
+    command_timeout_seconds: int | None = Field(default=None, ge=1, le=3_600)
+
+
+class DeleteResponse(BaseModel):
+    """What a delete actually removed; counts make the cascade visible instead of silent."""
+
+    deleted: str
+    checkpoints: int = 0
+    approvals: int = 0
+    tasks: int = 0

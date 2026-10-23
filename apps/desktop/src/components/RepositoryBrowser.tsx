@@ -1,6 +1,7 @@
+import { describeError } from "../lib/errorMessages";
 import { useEffect, useRef, useState } from "react";
 import { AsyncMessage } from "@coding-agent/ui";
-import { ChevronDown, ChevronRight, FileCode2, Folder, FolderOpen, Search, RefreshCw, Pencil } from "lucide-react";
+import { ChevronDown, ChevronRight, FileCode2, Folder, FolderOpen, Search, RefreshCw, Pencil, Trash2 } from "lucide-react";
 import { getRepositoryContext, getRepositoryTree, readSourceFile, searchRepository, type Repository, type RepositoryContext, type SearchMatch, type SourceFile, type TreeEntry } from "../lib/api";
 import { usePreferences } from "../lib/preferences";
 
@@ -12,9 +13,10 @@ type Props = {
   onEdit: (file: SourceFile) => void;
   canEdit: boolean;
   initialFile?: { path: string; line: number } | null;
+  onDelete?: (repositoryId: string) => void | Promise<void>;
 };
 
-export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChange, onOpenFolder, onEdit, canEdit, initialFile }: Props) {
+export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChange, onOpenFolder, onEdit, canEdit, initialFile, onDelete }: Props) {
   const { t } = usePreferences();
   const [entries, setEntries] = useState<TreeEntry[]>([]);
   const [context, setContext] = useState<RepositoryContext | null>(null);
@@ -49,7 +51,7 @@ export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChan
         setEntries(tree.items.sort((a, b) => a.path.localeCompare(b.path)));
         setContext(summary); setTruncated(tree.truncated);
       })
-      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t("common.error")); })
+      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(describeError(reason, t("common.error"))); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => { controller.abort(); fileRequest.current?.abort(); searchRequest.current?.abort(); };
   }, [repositoryId, revision]);
@@ -62,7 +64,7 @@ export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChan
       const result = await readSourceFile(repositoryId, name, controller.signal);
       if (!controller.signal.aborted) { setFile(result); setSelectedLine(line); }
     } catch (reason) {
-      if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t("common.error"));
+      if (!controller.signal.aborted) setError(describeError(reason, t("common.error")));
     } finally { if (!controller.signal.aborted) setFileLoading(false); }
   };
 
@@ -82,7 +84,7 @@ export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChan
     try {
       const result = await searchRepository(repositoryId, query.trim(), glob.trim(), controller.signal);
       if (!controller.signal.aborted) { setMatches(result.matches); setTruncated(result.truncated); }
-    } catch (reason) { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t("common.error")); }
+    } catch (reason) { if (!controller.signal.aborted) setError(describeError(reason, t("common.error"))); }
     finally { if (!controller.signal.aborted) setSearching(false); }
   };
 
@@ -93,7 +95,7 @@ export function RepositoryBrowser({ repositories, repositoryId, onRepositoryChan
 
   return <section className="repository-workspace" aria-label={t("browser.title")}>
     <div className="workspace-heading"><div><div className="section-kicker">SOURCE / EXPLORER</div><h1>{t("browser.title")}</h1><p>{repository?.path ?? t("browser.subtitle")}</p></div>
-      <div className="workspace-controls"><button className="small-action" onClick={onOpenFolder}><FolderOpen size={14} /> {t("chat.importFolder")}</button><label><span className="sr-only">{t("browser.repository")}</span><select value={repositoryId} onChange={event => onRepositoryChange(event.target.value)}>{!repositoryId ? <option value="">{t("chat.needRepository")}</option> : null}{repositories.map(item => <option value={item.id} key={item.id}>{item.name}{item.has_git ? ` · ${item.branch}` : ""}</option>)}</select></label><button className="icon-button" title={t("common.refresh")} aria-label={t("common.refresh")} disabled={loading || !repositoryId} onClick={() => setRevision(value => value + 1)}><RefreshCw size={16} /></button></div>
+      <div className="workspace-controls"><button className="small-action" onClick={onOpenFolder}><FolderOpen size={14} /> {t("chat.importFolder")}</button><label><span className="sr-only">{t("browser.repository")}</span><select value={repositoryId} onChange={event => onRepositoryChange(event.target.value)}>{!repositoryId ? <option value="">{t("chat.needRepository")}</option> : null}{repositories.map(item => <option value={item.id} key={item.id}>{item.name}{item.has_git ? ` · ${item.branch}` : ""}</option>)}</select></label><button className="icon-button" title={t("common.refresh")} aria-label={t("common.refresh")} disabled={loading || !repositoryId} onClick={() => setRevision(value => value + 1)}><RefreshCw size={16} /></button>{onDelete && repositoryId ? <button className="small-action small-action--muted" onClick={() => void onDelete(repositoryId)}><Trash2 size={13} /> {t("browser.remove")}</button> : null}</div>
     </div>
     {!repositoryId ? <div className="panel browser-empty">{t("browser.empty")}</div> : <>
       <form className="browser-search" onSubmit={event => { event.preventDefault(); void search(); }}><Search size={16} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder={t("browser.query")} aria-label={t("browser.query")} /><input className="glob-input" value={glob} onChange={event => setGlob(event.target.value)} placeholder={t("browser.glob")} aria-label={t("browser.glob")} /><button className="small-action" disabled={!query.trim() || searching}>{searching ? t("common.loading") : t("browser.search")}</button></form>

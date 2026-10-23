@@ -1,3 +1,4 @@
+import { describeError } from "../lib/errorMessages";
 import { useEffect, useState } from "react";
 import { Check, Plus, Trash2 } from "lucide-react";
 import { getAgentState, saveValidationChecks, type AgentState, type AgentTask, type TestKind, type ValidationCheck } from "../lib/api";
@@ -37,7 +38,7 @@ export function ValidationChecklist({ taskId, checks, currentIteration, revision
         const next = await getAgentState(taskId, controller.signal);
         if (!controller.signal.aborted) { setState(next); setLoadError(null); }
       } catch (reason) {
-        if (!controller.signal.aborted) setLoadError(reason instanceof Error ? reason.message : t("agent.loadError"));
+        if (!controller.signal.aborted) setLoadError(describeError(reason, t("agent.loadError")));
       } finally {
         loading = false;
       }
@@ -73,7 +74,7 @@ export function ValidationChecklist({ taskId, checks, currentIteration, revision
       onSaved(task);
       setSaved(true);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : t("validation.saveError"));
+      setError(describeError(reason, t("validation.saveError")));
     } finally {
       setSaving(false);
       onBusyChange(false);

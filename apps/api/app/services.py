@@ -6,6 +6,7 @@ from .agent_service import AgentService
 from .approval_service import ApprovalService
 from .audit_service import AuditService
 from .config import Settings, get_settings
+from .config_service import ConfigService, apply_overrides
 from .git_service import GitService
 from .idempotency import IdempotencyService
 from .model_provider import build_model_provider
@@ -31,6 +32,7 @@ class Services:
     remote_service: RemoteService
     idempotency_service: IdempotencyService
     agent_service: AgentService
+    config_service: ConfigService
 
 
 def build_services(settings: Settings | None = None) -> Services:
@@ -42,6 +44,7 @@ def build_services(settings: Settings | None = None) -> Services:
     """
 
     settings = settings or get_settings()
+    apply_overrides(settings)
     store = StateStore(settings.state_dir / "state.db")
     repository_service = RepositoryService(settings, store)
     task_service = TaskService(repository_service, store)
@@ -57,6 +60,7 @@ def build_services(settings: Settings | None = None) -> Services:
     agent_service = AgentService(
         task_service, approval_service, test_service, git_service, audit_service, remote_service, patch_service, model_provider
     )
+    config_service = ConfigService(settings, on_provider_change=agent_service.set_model_provider)
     return Services(
         settings=settings,
         store=store,
@@ -70,4 +74,5 @@ def build_services(settings: Settings | None = None) -> Services:
         remote_service=remote_service,
         idempotency_service=IdempotencyService(store, settings.idempotency_ttl_hours),
         agent_service=agent_service,
+        config_service=config_service,
     )
