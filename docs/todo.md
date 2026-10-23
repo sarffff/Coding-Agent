@@ -21,6 +21,9 @@
 - [x] 必跑验证清单：任务可配置最多 12 条检查（`kind`/`workdir`/`target`/`script`/`timeout`），默认按根 `package.json` 推导；清单全绿才允许提交，验证结果绑定整仓输入哈希，首轮开始后锁定。
 - [x] 模型编辑协议：`edits` 精确替换（`old_text` 唯一匹配、累计最多 100 处）与 `context_requests` 自查上下文（最多 4 轮，超限报 `MODEL_CONTEXT_LIMIT`，暂停/停止丢弃迟到回复）。
 - [x] 打开文件夹不再受工作区根约束：只拒绝盘符与文件系统根，`FORGE_WORKSPACE_ROOT` 退化为默认起点。
+- [x] 设置页与运行时配置：`GET/PUT /api/v1/config`，改动落在 `state_dir/config.json` 并覆盖 `.env`，密钥只回显是否配置；Provider 切换即时重建模型实例。
+- [x] 删除能力：`DELETE /api/v1/tasks/{id}`（连带检查点与审批）、`DELETE /api/v1/repositories/{id}`（有任务时需 `cascade=true`），运行中的任务拒绝删除，磁盘文件不受影响。
+- [x] 错误信息本地化：后端错误码映射为中文/英文文案，未知码回退服务端原文；界面不再直接显示英文报错。
 - [x] API 全量回归：218 passed（15m17s）；`pnpm check`、`pnpm build`、`pnpm desktop:smoke`、`pnpm desktop:chat-check` 全过。
 - [ ] 浏览器完整点击验收：本轮打开本地验收页面被自动审批服务 503 阻断，未执行；组件检查不能替代点击回放。
 - [x] 桌面壳真机启动与交互自检：`pnpm desktop:electron:smoke` 退出码 0、14 条断言全过——协议来源与 CSS 子资源都走 `forge-app://desktop`、渲染进程直接 `fetch` 壳托管的 API（特权 scheme 的 CORS 边界由此从推断变成实证）、受控输入使「发送」退出 disabled、端口记忆落盘、以及选择器之后的完整链路（登记 → 侧栏 → 选中 → 文件树 → 读到正文标记串）。前提是 `electron/dist` 拿到 `ALL APPLICATION PACKAGES` 只读授权。

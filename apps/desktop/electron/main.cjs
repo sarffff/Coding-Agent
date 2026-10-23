@@ -357,7 +357,7 @@ function registerIpc() {
   ipcMain.handle("forge:pick-workspace-root", async () => {
     const current = statusPayload().workspaceRoot;
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: "选择工作区根目录（API 只允许读写其内的仓库）",
+      title: "选择工作区根目录（打开文件夹的默认起点）",
       defaultPath: fs.existsSync(current) ? current : app.getPath("home"),
       properties: ["openDirectory", "createDirectory"],
     });
