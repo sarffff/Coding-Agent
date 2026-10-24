@@ -410,7 +410,7 @@ try {
     [completionErrorName]: errorStub,
     draft: completionCriteria, taskId: "task", unavailable: false, changed: true, canConfirm: false,
     activeState: staleState, displayedCriteria: completionCriteria, evidence: { goal: "  The regression passes.  " },
-    text: (_zh, en) => en, setSaving() {}, setSaved() {}, setError() {}, onSaved() {}, onBusyChange() {},
+    t: key => key, setSaving() {}, setSaved() {}, setError() {}, onSaved() {}, onBusyChange() {},
     onDirtyChange: value => { criteriaChanges.dirty = value; },
     setDraft: value => { criteriaChanges.draft = typeof value === "function" ? value(criteriaChanges.draft) : value; completionContext.draft = criteriaChanges.draft; },
   };

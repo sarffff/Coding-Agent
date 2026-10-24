@@ -119,7 +119,7 @@ export function AgentPanel({ taskId, revision, testKind, testTarget, disabled, h
     {error ? <AsyncMessage tone="error" onRetry={canRefresh ? () => setRefresh(value => value + 1) : undefined} retryLabel={t("common.refresh")}>{error}</AsyncMessage> : null}
     {state ? <>
       <div className="iteration-bar">
-        <div className="iteration-status"><strong>{state.action === "review_completion" ? (language === "zh-CN" ? "确认完成条件" : "Review completion") : t(actionLabels[state.action])}</strong><span>{state.requires_approval ? t("agent.approvalRequired") : t("agent.scope")}</span></div>
+        <div className="iteration-status"><strong>{state.action === "review_completion" ? t("completion.review") : t(actionLabels[state.action])}</strong><span>{state.requires_approval ? t("agent.approvalRequired") : t("agent.scope")}</span></div>
         <button type="button" className="small-action" onClick={() => void advance()} disabled={!state.can_advance || !nextAction || disabled || loading || advancing || Boolean(error)}>
           {advancing ? <Activity size={13} className="spin" /> : <ArrowUpRight size={13} />}{advancing ? t("working") : t("agent.advance")}
         </button>
