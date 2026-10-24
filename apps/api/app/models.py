@@ -295,6 +295,8 @@ class TaskBudget(BaseModel):
     remote_calls: int = 0
     consecutive_failures: int = 0
     started_at: datetime | None = None
+    # Set while the task waits for a human; that time is not agent runtime.
+    waiting_since: datetime | None = None
     exhausted_reason: Literal["iterations", "wall_time", "remote_calls", "consecutive_failures"] | None = None
 
 

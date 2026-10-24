@@ -934,10 +934,14 @@ class AgentService:
             return f"Run {shown} refused: commands are disabled in conservative mode."
         # A model-chosen program is unbounded work like a model call, so it shares that budget counter.
         # A program outside the allowlist never runs, so it is not charged: the model only wasted a turn.
-        if command[0].lower().removesuffix(".exe") in COMMAND_EXECUTABLES:
-            self.tasks.consume_remote_call(task.id)
+        chargeable = command[0].lower().removesuffix(".exe") in COMMAND_EXECUTABLES
+        if chargeable:
+            # Check the budget before taking the slot: a refused call must not leave it reserved.
+            self.tasks.assert_budget_available(task.id)
         reservation_id = task.run_id + self.tests.COMMAND_SUFFIX
         self.tests.reserve(reservation_id)
+        if chargeable:
+            self.tasks.consume_remote_call(task.id)
         worker = asyncio.create_task(run_in_threadpool(self.tests.run_command, task.run_id, task.repository_id, command, reserved=True))
         result = await self._wait_for_worker(task, worker, reservation_id)
         self.audit.record("context.request", "succeeded" if result.status in {"passed", "failed"} else "failed", f"Ran {shown}",

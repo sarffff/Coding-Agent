@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 from uuid import uuid4
 
@@ -86,6 +86,8 @@ class TaskService:
     }
 
     IN_FLIGHT_STATES: set[TaskStatus] = {"queued", "planning", "running", "coding", "testing", "repairing", "awaiting_approval", "ready_for_pr"}
+    # The clock stops here: a task parked for review must not burn its wall-time budget while a person reads.
+    HUMAN_WAIT_STATES: set[TaskStatus] = {"awaiting_approval", "ready_for_pr"}
 
     def __init__(self, repositories: RepositoryService, store: StateStore | None = None, settings: Settings | None = None):
         self.repositories = repositories
@@ -224,7 +226,15 @@ class TaskService:
         budget = record.summary.budget
         budget.iterations = len(record.iterations)
         if budget.started_at:
-            end = record.summary.updated_at if record.summary.status in {"completed", "done", "cancelled"} else datetime.now(timezone.utc)
+            if record.summary.status in self.HUMAN_WAIT_STATES and budget.waiting_since is None:
+                # A task loaded mid-review (or parked by an older build) starts the pause here.
+                budget.waiting_since = datetime.now(timezone.utc)
+            if budget.waiting_since is not None:
+                end = budget.waiting_since
+            elif record.summary.status in {"completed", "done", "cancelled"}:
+                end = record.summary.updated_at
+            else:
+                end = datetime.now(timezone.utc)
             budget.elapsed_seconds = round(max(0, (end - budget.started_at).total_seconds()), 3)
         if budget.exhausted_reason is None:
             if budget.elapsed_seconds >= budget.max_wall_time_seconds:
@@ -708,8 +718,19 @@ class TaskService:
             return
         if target not in self.ALLOWED_TRANSITIONS.get(current, set()):
             raise TaskStateError(f"Cannot transition task from {current} to {target}.", {"from": current, "to": target})
+        now = datetime.now(timezone.utc)
+        budget = record.summary.budget
+        if budget.started_at:
+            if target in self.HUMAN_WAIT_STATES and budget.waiting_since is None:
+                budget.waiting_since = now
+            elif current in self.HUMAN_WAIT_STATES and target not in self.HUMAN_WAIT_STATES and budget.waiting_since is not None:
+                # Push the start forward by the wait so `now - started_at` stays agent-only time.
+                waited = (now - budget.waiting_since).total_seconds()
+                if waited > 0:
+                    budget.started_at = budget.started_at + timedelta(seconds=waited)
+                budget.waiting_since = None
         record.summary.status = target
-        record.summary.updated_at = datetime.now(timezone.utc)
+        record.summary.updated_at = now
 
     def _current_iteration(self, record: TaskRecord) -> TaskIteration:
         if not record.iterations:
