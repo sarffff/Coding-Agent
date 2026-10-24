@@ -16,6 +16,7 @@ const actionLabels: Record<AgentAction, string> = {
   run_tests: "runTests",
   wait_for_tests: "running",
   start_repair: "repair",
+  review_completion: "agent.manualReview",
   review_commit: "previewLocalDiff",
   review_push: "publish.pushTitle",
   review_pr: "publish.prTitle",
@@ -40,7 +41,7 @@ type AgentPanelProps = {
 };
 
 export function AgentPanel({ taskId, revision, testKind, testTarget, disabled, hidden, onAdvanced, onBusyChange }: AgentPanelProps) {
-  const { t } = usePreferences();
+  const { t, language } = usePreferences();
   const [state, setState] = useState<AgentState | null>(null);
   const [loading, setLoading] = useState(true);
   const [advancing, setAdvancing] = useState(false);
@@ -118,7 +119,7 @@ export function AgentPanel({ taskId, revision, testKind, testTarget, disabled, h
     {error ? <AsyncMessage tone="error" onRetry={canRefresh ? () => setRefresh(value => value + 1) : undefined} retryLabel={t("common.refresh")}>{error}</AsyncMessage> : null}
     {state ? <>
       <div className="iteration-bar">
-        <div className="iteration-status"><strong>{t(actionLabels[state.action])}</strong><span>{state.requires_approval ? t("agent.approvalRequired") : t("agent.scope")}</span></div>
+        <div className="iteration-status"><strong>{state.action === "review_completion" ? (language === "zh-CN" ? "确认完成条件" : "Review completion") : t(actionLabels[state.action])}</strong><span>{state.requires_approval ? t("agent.approvalRequired") : t("agent.scope")}</span></div>
         <button type="button" className="small-action" onClick={() => void advance()} disabled={!state.can_advance || !nextAction || disabled || loading || advancing || Boolean(error)}>
           {advancing ? <Activity size={13} className="spin" /> : <ArrowUpRight size={13} />}{advancing ? t("working") : t("agent.advance")}
         </button>

@@ -13,9 +13,11 @@ type ValidationChecklistProps = {
   disabled: boolean;
   onSaved: (task: AgentTask) => void;
   onBusyChange: (busy: boolean) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  onStateChange?: (state: AgentState) => void;
 };
 
-export function ValidationChecklist({ taskId, checks, currentIteration, revision, hidden, disabled, onSaved, onBusyChange }: ValidationChecklistProps) {
+export function ValidationChecklist({ taskId, checks, currentIteration, revision, hidden, disabled, onSaved, onBusyChange, onDirtyChange, onStateChange }: ValidationChecklistProps) {
   const { t } = usePreferences();
   const [draft, setDraft] = useState(checks);
   const [state, setState] = useState<AgentState | null>(null);
@@ -36,7 +38,7 @@ export function ValidationChecklist({ taskId, checks, currentIteration, revision
       loading = true;
       try {
         const next = await getAgentState(taskId, controller.signal);
-        if (!controller.signal.aborted) { setState(next); setLoadError(null); }
+        if (!controller.signal.aborted) { setState(next); setLoadError(null); onStateChange?.(next); }
       } catch (reason) {
         if (!controller.signal.aborted) setLoadError(describeError(reason, t("agent.loadError")));
       } finally {
@@ -46,12 +48,14 @@ export function ValidationChecklist({ taskId, checks, currentIteration, revision
     void refresh();
     const timer = window.setInterval(() => void refresh(), 2500);
     return () => { controller.abort(); window.clearInterval(timer); };
-  }, [taskId, revision, hidden, t]);
+  }, [taskId, revision, hidden, t, onStateChange]);
 
   const locked = currentIteration > 0 || (state?.task.current_iteration ?? 0) > 0;
   const changed = JSON.stringify(draft) !== savedChecks;
+  useEffect(() => { onDirtyChange?.(changed); }, [changed, onDirtyChange]);
   const unavailable = disabled || saving || locked;
   const update = (id: string, values: Partial<ValidationCheck>) => {
+    onDirtyChange?.(true);
     setDraft(items => items.map(item => item.id === id ? { ...item, ...values } : item));
     setSaved(false);
   };
@@ -72,6 +76,7 @@ export function ValidationChecklist({ taskId, checks, currentIteration, revision
       })));
       setDraft(task.validation_checks);
       onSaved(task);
+      onDirtyChange?.(false);
       setSaved(true);
     } catch (reason) {
       setError(describeError(reason, t("validation.saveError")));
@@ -108,13 +113,14 @@ export function ValidationChecklist({ taskId, checks, currentIteration, revision
           </div>
           <div className="validation-options">
             <label>{t("validation.timeout")}<input type="number" min={1} max={300} value={check.timeout_seconds || ""} onChange={event => update(check.id, { timeout_seconds: Number(event.target.value) })} required style={{ width: 76, flex: "none" }} /></label>
-            <button className="small-action small-action--muted" type="button" onClick={() => { setDraft(items => items.filter(item => item.id !== check.id)); setSaved(false); }} aria-label={`${t("validation.remove")} ${check.label || index + 1}`}><Trash2 size={13} />{t("validation.remove")}</button>
+            <button className="small-action small-action--muted" type="button" onClick={() => { onDirtyChange?.(true); setDraft(items => items.filter(item => item.id !== check.id)); setSaved(false); }} aria-label={`${t("validation.remove")} ${check.label || index + 1}`}><Trash2 size={13} />{t("validation.remove")}</button>
           </div>
         </>}
       </fieldset>;
     })}
     {!locked ? <div className="patch-form-actions" style={{ marginTop: 12 }}>
       <button className="small-action small-action--muted" type="button" disabled={unavailable || draft.length >= 12} onClick={() => {
+        onDirtyChange?.(true);
         setDraft(items => [...items, { id: crypto.randomUUID(), label: "", kind: "auto", workdir: ".", target: null, script: null, timeout_seconds: 120 }]);
         setSaved(false);
       }}><Plus size={13} />{t("validation.add")}</button>

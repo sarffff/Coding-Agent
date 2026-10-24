@@ -1,5 +1,5 @@
-import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState, AppConfig, ConfigUpdate, DeleteResult } from "@coding-agent/types";
-export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, ValidationCheckStatus, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState, AppConfig, ConfigUpdate, DeleteResult } from "@coding-agent/types";
+import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, CompletionCriterion, CompletionConfirmation, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState, AppConfig, ConfigUpdate, DeleteResult } from "@coding-agent/types";
+export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, CompletionCriterion, CompletionConfirmation, ValidationCheckStatus, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState, AppConfig, ConfigUpdate, DeleteResult } from "@coding-agent/types";
 
 import { desktopBridge } from "./desktop";
 
@@ -66,10 +66,10 @@ export function getRepositoryTree(repositoryId: string, signal?: AbortSignal): P
   return request<{ items: TreeEntry[]; truncated: boolean }>(`/api/v1/repositories/${repositoryId}/tree?max_depth=6`, { signal });
 }
 
-export function createTask(goal: string, repositoryId?: string, mode?: AgentMode, track?: TaskTrack, validationChecks?: ValidationCheck[]): Promise<AgentTask> {
+export function createTask(goal: string, repositoryId?: string, mode?: AgentMode, track?: TaskTrack, validationChecks?: ValidationCheck[], completionCriteria?: CompletionCriterion[]): Promise<AgentTask> {
   return request<AgentTask>("/api/v1/tasks", {
     method: "POST",
-    body: JSON.stringify({ goal, repository_id: repositoryId, mode, track, validation_checks: validationChecks }),
+    body: JSON.stringify({ goal, repository_id: repositoryId, mode, track, validation_checks: validationChecks, completion_criteria: completionCriteria }),
   });
 }
 
@@ -184,6 +184,20 @@ export function saveValidationChecks(taskId: string, checks: ValidationCheck[]):
   });
 }
 
+export function saveCompletionCriteria(taskId: string, criteria: CompletionCriterion[]): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/tasks/${taskId}/completion-criteria`, {
+    method: "PUT",
+    body: JSON.stringify({ criteria }),
+  });
+}
+
+export function confirmCompletion(taskId: string, payload: Pick<CompletionConfirmation, "scope_hash" | "validation_hash" | "iteration_id" | "evidence">): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/tasks/${taskId}/completion-confirmation`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function advanceAgent(taskId: string, payload: AgentAdvanceRequest = {}, idempotencyKey?: string, signal?: AbortSignal): Promise<AgentAdvanceResponse> {
   return request<AgentAdvanceResponse>(`/api/v1/tasks/${taskId}/agent/advance`, {
     method: "POST",
@@ -229,10 +243,10 @@ export function stopAgentLoop(runId: string): Promise<AgentState> {
   return request<AgentState>(`/api/v1/runs/${runId}/loop/stop`, { method: "POST" });
 }
 
-export function applyPatch(runId: string, patchId: string, confirm = false): Promise<{ patch_id: string; checkpoint: { id: string; files: string[] }; applied_files: string[] }> {
+export function applyPatch(runId: string, patchId: string, confirm = false, confirmValidationChanges = false): Promise<{ patch_id: string; checkpoint: { id: string; files: string[] }; applied_files: string[] }> {
   return request<{ patch_id: string; checkpoint: { id: string; files: string[] }; applied_files: string[] }>(`/api/v1/runs/${runId}/patches/apply`, {
     method: "POST",
-    body: JSON.stringify({ patch_id: patchId, confirm }),
+    body: JSON.stringify({ patch_id: patchId, confirm, confirm_validation_changes: confirmValidationChanges }),
   });
 }
 

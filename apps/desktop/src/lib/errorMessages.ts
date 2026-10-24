@@ -31,6 +31,9 @@ const MESSAGES: Record<string, Entry> = {
   MODEL_CONTEXT_LIMIT: { zh: "模型反复要上下文却没有改动，已停止。缩小目标或显式加入文件。", en: "The model kept asking for context without editing; narrow the goal or add files explicitly." },
   MODEL_CONTEXT_REQUIRED: { zh: "该文件还没完整读过，先加入上下文再改。", en: "That file has not been read in full; add it to context first." },
   MODEL_EDIT_CONFLICT: { zh: "精确替换没匹配上原文，文件可能在等待期间被改过。", en: "An edit did not match the file; it may have changed while waiting." },
+  MODEL_NO_CHANGE: { zh: "模型提出的补丁没有实际变化，请检查失败原因或补充上下文。", en: "The proposal makes no changes; inspect the failure or add relevant context." },
+  AGENT_NO_PROGRESS: { zh: "Agent 在相同上下文中重复无效建议，已停止。请审阅错误并调整任务或上下文。", en: "The agent repeated an invalid suggestion without new evidence and stopped. Review the error and revise the task or context." },
+  AGENT_EXECUTION_FAILED: { zh: "Agent 执行失败并已停止，请查看错误记录后再继续。", en: "The agent stopped after an execution failure; review the error before continuing." },
 
   TASK_NOT_FOUND: { zh: "任务不存在。", en: "Task not found." },
   RUN_NOT_FOUND: { zh: "运行记录不存在。", en: "Run not found." },
@@ -42,6 +45,14 @@ const MESSAGES: Record<string, Entry> = {
   WORKSPACE_BUSY: { zh: "还有任务在运行，先停止再操作。", en: "A task is still running; stop it first." },
   RECOVERY_CONFIRMATION_REQUIRED: { zh: "服务重启过，先确认继续。", en: "The API restarted; confirm recovery first." },
   TASK_REPOSITORY_REQUIRED: { zh: "先给任务关联一个文件夹。", en: "Connect a folder to this task first." },
+  COMPLETION_REQUIRED: { zh: "请逐条填写完成证据并明确确认完成条件。", en: "Provide evidence for every completion criterion and explicitly confirm it." },
+  COMPLETION_NOT_REQUIRED: { zh: "该任务没有需要确认的完成条件。", en: "This task has no completion criteria to confirm." },
+  COMPLETION_CONFIRMATION_STALE: { zh: "目标范围、迭代或验证结果已改变，请重新复核完成条件。", en: "The scope, iteration or validation changed; review the completion criteria again." },
+  UNCOMMITTED_TASK_CHANGES: { zh: "任务文件还有未提交的改动，请先审阅并提交后再发布。", en: "Task files still have uncommitted changes; review and commit them before publishing." },
+  PUBLISH_NOT_READY: { zh: "当前迭代未通过验证或任务已停止，请修复并重新验证后再发布。", en: "The latest iteration has not passed validation or the task stopped; resolve it and validate before publishing." },
+  PR_SCOPE_UNAVAILABLE: { zh: "本地缺少目标分支，无法核对完整 PR 范围。请获取目标分支后重新预览。", en: "The target branch is unavailable locally; fetch it and review the complete PR scope again." },
+  COMPLETION_VALIDATION_REQUIRED: { zh: "先完成当前改动的全部必要验证，再确认完成条件。", en: "Pass all required validation for the current changes before confirming completion." },
+  INVALID_COMPLETION_EVIDENCE: { zh: "每条完成条件都需要一条有效证据。", en: "Every completion criterion needs exactly one valid evidence entry." },
 
   REPOSITORY_NOT_FOUND: { zh: "文件夹未登记。", en: "Folder is not registered." },
   REPOSITORY_IN_USE: { zh: "该文件夹下还有任务，需要一并删除。", en: "This folder still has tasks; delete them with it." },
@@ -103,6 +114,8 @@ const MESSAGES: Record<string, Entry> = {
   PROJECT_PYTHON_UNAVAILABLE: { zh: "项目的虚拟环境里找不到 Python。", en: "The project virtualenv has no Python interpreter." },
   VALIDATION_SCOPE_TOO_LARGE: { zh: "参与校验的文件太多，缩小范围再试。", en: "Too many files for validation; narrow the workspace." },
   VALIDATION_INPUT_UNAVAILABLE: { zh: "有校验输入读不了。", en: "A validation input could not be read." },
+  VALIDATION_REVIEW_REQUIRED: { zh: "补丁改变了已有测试或验证脚本，请先审阅并明确确认验收变更。", en: "This patch changes existing tests or validation scripts; review and explicitly confirm the acceptance changes." },
+  VALIDATION_BASELINE_BLOCKED: { zh: "验收基线已发生未确认的变化，请审阅受影响的测试或验证脚本后继续。", en: "Acceptance inputs changed without confirmation; review the affected tests or scripts before continuing." },
   TEST_ALREADY_RUNNING: { zh: "已有验证在跑。", en: "A validation is already running." },
 
   CONFIG_EMPTY: { zh: "没有要保存的改动。", en: "Nothing to save." },

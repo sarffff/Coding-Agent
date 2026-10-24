@@ -89,6 +89,7 @@ export type AgentTask = {
   current_iteration: number;
   retry_count: number;
   next_action: string | null;
+  agent_blocked_reason: string | null;
   branch: string | null;
   task_branch: string | null;
   resume_state: AgentTask["status"] | null;
@@ -97,11 +98,13 @@ export type AgentTask = {
   mode: AgentMode;
   track: TaskTrack;
   validation_checks: ValidationCheck[];
+  completion_criteria: CompletionCriterion[];
+  completion_confirmation: CompletionConfirmation | null;
 };
 
 export type AgentAdvanceAction = "request_plan_approval" | "start_iteration" | "start_repair" | "run_tests";
 
-export type AgentAction = AgentAdvanceAction | "recover" | "await_plan_approval" | "connect_repository" | "create_branch" | "review_patch" | "wait_for_tests" | "review_commit" | "review_push" | "review_pr" | "await_pr" | "completed" | "paused" | "cancelled" | "manual_review";
+export type AgentAction = AgentAdvanceAction | "recover" | "await_plan_approval" | "connect_repository" | "create_branch" | "review_patch" | "wait_for_tests" | "review_completion" | "review_commit" | "review_push" | "review_pr" | "await_pr" | "completed" | "paused" | "cancelled" | "manual_review";
 
 export type AgentState = {
   task: AgentTask;
@@ -115,6 +118,10 @@ export type AgentState = {
   last_test: TestRunResult | null;
   loop_running: boolean;
   validation_status: ValidationCheckStatus[];
+  completion_status: "not_required" | "pending" | "stale" | "confirmed";
+  completion_scope_hash: string | null;
+  completion_validation_hash: string | null;
+  can_confirm_completion: boolean;
 };
 
 export type AgentLoopRequest = {
@@ -162,6 +169,17 @@ export type TaskIteration = {
 
 export type TestKind = "auto" | "pytest" | "frontend" | "static" | "script";
 
+export type CompletionCriterion = { id: string; text: string };
+
+export type CompletionConfirmation = {
+  scope_hash: string;
+  validation_hash: string;
+  iteration_id: string;
+  evidence: Array<{ criterion_id: string; evidence: string }>;
+  confirmed_at: string;
+  confirmed_by: string;
+};
+
 export type ValidationCheck = {
   id: string;
   label: string;
@@ -197,6 +215,7 @@ export type TestRunResult = {
   output_truncated: boolean;
   output_pruned: boolean;
   failed_tests: TestFailure[];
+  baseline_comparison?: { existing?: string[]; introduced?: string[]; resolved?: string[] };
 };
 
 export type PatchFileInput = {
@@ -215,6 +234,8 @@ export type PatchPreview = {
   deletions: number;
   bytes_changed: number;
   requires_delete_confirmation: boolean;
+  requires_validation_confirmation: boolean;
+  validation_changes: string[];
 };
 
 export type DraftPatch = PatchPreview & { rationale: string };

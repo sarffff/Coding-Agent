@@ -1,5 +1,5 @@
 import { describeError } from "./lib/errorMessages";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -82,6 +82,7 @@ import {
   type TaskBudget,
   type AgentAdvanceAction,
   type AgentAction,
+  type AgentState,
   type AuditEvent,
   type CommitPreview,
   type GitSnapshot,
@@ -108,6 +109,7 @@ import { AgentPanel } from "./components/AgentPanel";
 import { ApprovalPanel } from "./components/ApprovalPanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { ValidationChecklist } from "./components/ValidationChecklist";
+import { CompletionCriteria } from "./components/CompletionCriteria";
 import { SettingsPanel } from "./components/SettingsPanel";
 
 type NavKey = "chat" | "overview" | "tasks" | "repositories" | "runs" | "approvals" | "settings";
@@ -121,6 +123,8 @@ type Task = {
   currentIteration: number;
   retryCount: number;
   nextAction: string | null;
+  agentBlockedReason: string | null;
+  error: string | null;
   requiresRecovery: boolean;
   updatedAt: string;
   title: string;
@@ -133,6 +137,8 @@ type Task = {
   mode: AgentMode;
   track: TaskTrack;
   validationChecks: AgentTask["validation_checks"];
+  completionCriteria: AgentTask["completion_criteria"];
+  completionConfirmation: AgentTask["completion_confirmation"];
 };
 
 type StreamEvent = {
@@ -156,6 +162,8 @@ function taskFromApi(task: AgentTask): Task {
     currentIteration: task.current_iteration,
     retryCount: task.retry_count,
     nextAction: task.next_action,
+    agentBlockedReason: task.agent_blocked_reason ?? null,
+    error: task.error,
     requiresRecovery: task.requires_recovery,
     updatedAt: task.updated_at,
     title: task.goal,
@@ -168,6 +176,8 @@ function taskFromApi(task: AgentTask): Task {
     mode: task.mode,
     track: task.track,
     validationChecks: task.validation_checks ?? [],
+    completionCriteria: task.completion_criteria ?? [],
+    completionConfirmation: task.completion_confirmation ?? null,
   };
 }
 
@@ -212,6 +222,11 @@ function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [loopRunning, setLoopRunning] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [chatPollError, setChatPollError] = useState<string | null>(null);
+  const [taskSetup, setTaskSetup] = useState<{ taskId: string; mode: AgentMode; feedback?: string } | null>(null);
+  const [taskSetupDirty, setTaskSetupDirty] = useState(false);
+  const [taskCriteriaDirty, setTaskCriteriaDirty] = useState(false);
+  const [taskSetupError, setTaskSetupError] = useState<string | null>(null);
   const [chatMode, setChatMode] = useState<AgentMode>("standard");
   const [chatPending, setChatPending] = useState<Approval | null>(null);
   const [chatBudget, setChatBudget] = useState<TaskBudget | null>(null);
@@ -233,6 +248,9 @@ function App() {
   const [testRunning, setTestRunning] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [validationSaving, setValidationSaving] = useState(false);
+  const [completionSaving, setCompletionSaving] = useState(false);
+  const [completionConfirming, setCompletionConfirming] = useState(false);
+  const [validationAgentState, setValidationAgentState] = useState<AgentState | null>(null);
   const [patchPath, setPatchPath] = useState("");
   const [patchFeedback, setPatchFeedback] = useState("");
   const [patchContent, setPatchContent] = useState("");
@@ -274,12 +292,17 @@ function App() {
   const [desktopRuntime, setDesktopRuntime] = useState<DesktopStatus | null>(desktopStatus);
   const [repositorySaving, setRepositorySaving] = useState(false);
   const repositoryOpeningRef = useRef(false);
-  const [confirmAction, setConfirmAction] = useState<"cancel" | "delete" | null>(null);
+  const [confirmAction, setConfirmAction] = useState<"cancel" | "delete" | "validation" | null>(null);
+  const patchConfirmationRef = useRef<{ runId: string; patchId: string; delete: boolean; validation: boolean } | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [overviewError, setOverviewError] = useState<string | null>(null);
   const promptInputRef = useRef<HTMLInputElement>(null);
   const taskRef = useRef(activeTaskId);
+  const validationPanelRef = useRef<HTMLElement>(null);
   useEffect(() => { taskRef.current = activeTaskId; }, [activeTaskId]);
+  const updateValidationState = useCallback((state: AgentState) => {
+    if (state.task.id === taskRef.current) setValidationAgentState(state);
+  }, []);
   useEffect(() => { if (selectedRepositoryId && !repositories.some(repository => repository.id === selectedRepositoryId)) setSelectedRepositoryId(""); }, [repositories, selectedRepositoryId]);
 
   const activeTask = useMemo(
@@ -288,6 +311,8 @@ function App() {
   );
   const activeRepository = repositories.find(repository => repository.id === activeTask?.repositoryId);
   const activeTaskHasGit = activeRepository?.has_git === true;
+  const setupTask = tasks.find(task => task.id === taskSetup?.taskId);
+  const activeTaskStarted = (activeTask?.currentIteration ?? 0) > 0;
 
   // Two stores: Cowork (chat, flat by recency) and Code (coding, grouped by folder).
   const coworkTasks = useMemo(() => tasks.filter((task) => task.track === "cowork"), [tasks]);
@@ -305,10 +330,22 @@ function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    getApiHealth(controller.signal)
-      .then(() => setApiStatus("connected"))
-      .catch(() => setApiStatus("offline"));
-    return () => controller.abort();
+    let checking = false;
+    const refreshHealth = async () => {
+      if (checking || controller.signal.aborted) return;
+      checking = true;
+      try {
+        await getApiHealth(controller.signal);
+        if (!controller.signal.aborted) setApiStatus("connected");
+      } catch {
+        if (!controller.signal.aborted) setApiStatus("offline");
+      } finally {
+        checking = false;
+      }
+    };
+    void refreshHealth();
+    const timer = window.setInterval(() => void refreshHealth(), 5000);
+    return () => { controller.abort(); window.clearInterval(timer); };
   }, []);
 
   useEffect(() => {
@@ -340,8 +377,11 @@ function App() {
 
   useEffect(() => {
     setTestResult(null);
+    setValidationAgentState(null);
     setTestError(null);
     setPatchPreviewResult(null);
+    setConfirmAction(null);
+    patchConfirmationRef.current = null;
     setPatchApplied(null);
     setPatchError(null);
     setPatchPath("");
@@ -409,31 +449,42 @@ function App() {
   // Chat view poll: the autonomous loop runs server-side, so refresh the agent state, task
   // and event stream on an interval while a CODE chat is open (Cowork chat is synchronous, see below).
   useEffect(() => {
+    setChatPollError(null);
     if (activeNav !== "chat" || chatComposingNew || activeTask?.track === "cowork" || !activeTask?.runId) {
       setLoopRunning(false);
       return;
     }
     const runId = activeTask.runId;
     const taskId = activeTask.id;
-    let disposed = false;
+    const controller = new AbortController();
+    let refreshing = false;
     const tick = async () => {
+      if (refreshing || controller.signal.aborted) return;
+      refreshing = true;
       try {
-        const [state, events] = await Promise.all([getAgentState(taskId), listRunEvents(runId)]);
-        if (disposed) return;
+        const [state, events] = await Promise.all([getAgentState(taskId, controller.signal), listRunEvents(runId, controller.signal)]);
+        if (controller.signal.aborted) return;
+        setApiStatus("connected");
+        setChatPollError(null);
         setLoopRunning(state.loop_running);
         setRunEvents(events.items);
         setChatPending(state.pending_approval ?? null);
         setChatBudget(state.task.budget ?? null);
         setChatAction(state.action);
         updateTaskFromApi(state.task);
-      } catch {
-        /* transient poll failure — the next tick retries */
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setChatPollError(describeError(error, t("chat.refreshError")));
+          if (!(error instanceof ApiRequestError)) setApiStatus("offline");
+        }
+      } finally {
+        refreshing = false;
       }
     };
     void tick();
     const timer = window.setInterval(() => void tick(), 2500);
-    return () => { disposed = true; window.clearInterval(timer); };
-  }, [activeNav, activeTask?.runId, activeTask?.id, activeTask?.track, chatComposingNew]);
+    return () => { controller.abort(); window.clearInterval(timer); };
+  }, [activeNav, activeTask?.runId, activeTask?.id, activeTask?.track, chatComposingNew, t]);
 
   // Cowork is a plain chat: no loop. Just load its transcript (chat.* events) when it is opened.
   useEffect(() => {
@@ -497,6 +548,7 @@ function App() {
           setRepositoryDialogOpen(false);
         } else if (confirmAction) {
           setConfirmAction(null);
+          patchConfirmationRef.current = null;
         }
       }
     };
@@ -611,7 +663,17 @@ function App() {
         setActiveTaskId(newTask.id);
         setChatComposingNew(false);
         setChatPending(null);
-        await startAgentLoop(created.run_id, { mode });
+        setTaskSetup({ taskId: newTask.id, mode });
+        setTaskSetupDirty(false);
+        setTaskCriteriaDirty(false);
+        setTaskSetupError(null);
+        return true;
+      } else if (!activeTaskStarted && !activeTask?.requiresRecovery) {
+        setTaskSetup({ taskId: activeTask!.id, mode: activeTask!.mode, feedback: trimmed });
+        setTaskSetupDirty(false);
+        setTaskCriteriaDirty(false);
+        setTaskSetupError(null);
+        return true;
       } else {
         await startAgentLoop(runId, { feedback: trimmed });
       }
@@ -621,6 +683,25 @@ function App() {
     } catch (error) {
       setChatError(describeError(error, t("chat.error")));
       return false;
+    } finally {
+      chatSendingRef.current = false;
+      setChatSending(false);
+    }
+  };
+
+  const startPreparedTask = async () => {
+    if (!taskSetup || !setupTask?.runId || taskSetupDirty || taskCriteriaDirty || validationSaving || completionSaving || chatSendingRef.current) return;
+    chatSendingRef.current = true;
+    setChatSending(true);
+    setTaskSetupError(null);
+    try {
+      const state = await startAgentLoop(setupTask.runId, { mode: taskSetup.mode, feedback: taskSetup.feedback });
+      updateTaskFromApi(state.task);
+      setLoopRunning(state.loop_running);
+      setChatAction(state.action);
+      setTaskSetup(null);
+    } catch (error) {
+      setTaskSetupError(describeError(error, t("chat.error")));
     } finally {
       chatSendingRef.current = false;
       setChatSending(false);
@@ -804,14 +885,23 @@ function App() {
     }
   };
 
-  const applyActivePatch = async (confirmedDelete = false) => {
+  const applyActivePatch = async (confirmation?: "delete" | "validation") => {
     if (!activeTask?.runId || !patchPreviewResult || patchRunning) return;
-    if (patchPreviewResult.requires_delete_confirmation && !confirmedDelete) { setConfirmAction("delete"); return; }
-    setConfirmAction(null);
+    let confirmed = patchConfirmationRef.current;
+    if (confirmation) {
+      if (!confirmed || confirmed.runId !== activeTask.runId || confirmed.patchId !== patchPreviewResult.patch_id) { closeConfirmation(); return; }
+      confirmed[confirmation] = true;
+    } else {
+      confirmed = { runId: activeTask.runId, patchId: patchPreviewResult.patch_id, delete: false, validation: false };
+      patchConfirmationRef.current = confirmed;
+    }
+    if (patchPreviewResult.requires_delete_confirmation && !confirmed.delete) { setConfirmAction("delete"); return; }
+    if (patchPreviewResult.requires_validation_confirmation && !confirmed.validation) { setConfirmAction("validation"); return; }
+    closeConfirmation();
     setPatchRunning(true);
     setPatchError(null);
     try {
-      const result = await applyPatch(activeTask.runId, patchPreviewResult.patch_id, true);
+      const result = await applyPatch(activeTask.runId, patchPreviewResult.patch_id, true, confirmed.validation);
       setPatchApplied(t("patchAppliedSummary").replace("{checkpoint}", result.checkpoint.id).replace("{files}", String(result.applied_files.length)));
       const [events, repositoriesPayload] = await Promise.all([
         listRunEvents(activeTask.runId),
@@ -829,7 +919,13 @@ function App() {
     }
   };
 
+  const closeConfirmation = () => {
+    patchConfirmationRef.current = null;
+    setConfirmAction(null);
+  };
+
   const cancelPatchPreview = () => {
+    closeConfirmation();
     setPatchPreviewResult(null);
     setPatchApplied(null);
     setPatchError(null);
@@ -1133,13 +1229,21 @@ function App() {
   };
 
   const agentRevision = [activeTask?.updatedAt, iterations.map(item => item.updated_at + String(item.rolled_back)).join(), approvals.map(item => item.id + item.status).join(), publishState?.pull_request?.updated_at].join(":");
-  const operationBusy = Boolean(isRunning || testRunning || validationSaving || patchRunning || gitRunning || iterationRunning || publishRunning || repositorySaving || confirmAction || agentBusyAction || approvalRunning);
+  const operationBusy = Boolean(isRunning || testRunning || validationSaving || completionSaving || completionConfirming || patchRunning || gitRunning || iterationRunning || publishRunning || repositorySaving || confirmAction || agentBusyAction || approvalRunning);
   const filteredTasks = tasks.filter(task => taskFilter === "all" || task.status === taskFilter);
   const chatTrack: TaskTrack = chatComposingNew ? railTab : (activeTask?.track ?? railTab);
   const chatRepositoryId = !chatComposingNew && activeTask && !["done", "completed", "cancelled"].includes(activeTask.lifecycleStatus) ? activeTask.repositoryId ?? "" : selectedRepositoryId;
   const openChatRun = () => {
     setActiveNav("runs");
     void refreshActiveTask().catch(error => setIterationError(describeError(error, t("common.error"))));
+  };
+  const openCompletionReview = () => {
+    openChatRun();
+    window.requestAnimationFrame(() => validationPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  };
+  const completionConfirmed = (task: AgentTask) => {
+    updateTaskFromApi(task);
+    setValidationAgentState(current => current?.task.id === task.id ? { ...current, task, completion_status: "confirmed", can_confirm_completion: false } : current);
   };
 
   return (
@@ -1165,10 +1269,22 @@ function App() {
           <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={repositorySaving} onClick={() => setRepositoryDialogOpen(false)}>{t("cancel")}</button><button className="small-action folder-confirm" disabled={repositorySaving || !repositoryPathInput.trim()}>{repositorySaving ? t("folder.opening") : t("folder.openAction")}</button></div>
         </form>
       </Dialog>
-      <Dialog open={confirmAction !== null} title={confirmAction === "delete" ? t("patch.delete") : t("cancel")} onClose={() => setConfirmAction(null)}>
-        <p>{confirmAction === "delete" ? t("patch.deleteConfirm") : t("cancelTaskConfirm")}</p>
-        {confirmAction === "delete" ? <pre>{patchPreviewResult?.files.join("\n")}</pre> : null}
-        <div className="dialog-actions"><button className="small-action small-action--muted" onClick={() => setConfirmAction(null)}>{t("common.back")}</button><button className="small-action" onClick={() => confirmAction === "delete" ? void applyActivePatch(true) : void changeTaskState("cancel", true)}>{t("common.confirm")}</button></div>
+      <Dialog open={confirmAction !== null} title={confirmAction === "validation" ? t("patch.validation") : confirmAction === "delete" ? t("patch.delete") : t("cancel")} onClose={closeConfirmation}>
+        <p>{confirmAction === "validation" ? t("patch.validationConfirm") : confirmAction === "delete" ? t("patch.deleteConfirm") : t("cancelTaskConfirm")}</p>
+        {confirmAction === "validation" ? <pre>{patchPreviewResult?.validation_changes?.join("\n")}</pre> : confirmAction === "delete" ? <pre>{patchPreviewResult?.files.join("\n")}</pre> : null}
+        <div className="dialog-actions"><button className="small-action small-action--muted" onClick={closeConfirmation}>{t("common.back")}</button><button className="small-action" onClick={() => confirmAction === "delete" || confirmAction === "validation" ? void applyActivePatch(confirmAction) : void changeTaskState("cancel", true)}>{t("common.confirm")}</button></div>
+      </Dialog>
+      <Dialog open={taskSetup !== null} title={t("chat.setupTitle")} onClose={() => { if (!chatSending && !validationSaving && !completionSaving) setTaskSetup(null); }}>
+        {setupTask && taskSetup ? <>
+          <p>{setupTask.title}</p>
+          <p className="empty-detail">{t("chat.setupHint")}</p>
+          <div className="chat-mode">{(["conservative", "standard", "autonomous"] as AgentMode[]).map(mode => <button key={mode} type="button" className={`chat-mode-opt chat-mode-opt--${mode} ${taskSetup.mode === mode ? "is-active" : ""}`} disabled={chatSending || validationSaving || completionSaving} aria-pressed={taskSetup.mode === mode} title={t(`chat.mode.${mode}.hint`)} onClick={() => setTaskSetup(current => current ? { ...current, mode } : null)}><span className="chat-mode-dot" />{t(`chat.mode.${mode}`)}</button>)}</div>
+          <p className="empty-detail">{t(`chat.mode.${taskSetup.mode}.hint`)}</p>
+          <ValidationChecklist key={setupTask.id} taskId={setupTask.id} checks={setupTask.validationChecks} currentIteration={setupTask.currentIteration} revision={setupTask.updatedAt} hidden={false} disabled={chatSending || completionSaving} onSaved={updateTaskFromApi} onBusyChange={setValidationSaving} onDirtyChange={setTaskSetupDirty} />
+          <CompletionCriteria key={`criteria-${setupTask.id}`} taskId={setupTask.id} goal={setupTask.title} criteria={setupTask.completionCriteria} confirmation={setupTask.completionConfirmation} currentIteration={setupTask.currentIteration} preparation disabled={chatSending || validationSaving} onSaved={updateTaskFromApi} onBusyChange={setCompletionSaving} onDirtyChange={setTaskCriteriaDirty} />
+          {taskSetupError ? <p className="inline-error" role="alert">{taskSetupError}</p> : null}
+          <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={chatSending || validationSaving || completionSaving} onClick={() => setTaskSetup(null)}>{t("common.back")}</button><button type="button" className="small-action" disabled={chatSending || validationSaving || completionSaving || taskSetupDirty || taskCriteriaDirty} onClick={() => void startPreparedTask()}>{t(chatSending ? "working" : "chat.startPrepared")}</button></div>
+        </> : null}
       </Dialog>
       <aside className={`sidebar rail ${sidebarOpen ? "sidebar--open" : ""}`}>
         <div className="rail-brand"><Code2 size={19} /><span>Coding Agent</span></div>
@@ -1277,9 +1393,13 @@ function App() {
             onSend={sendChatMessage}
             onStop={stopChatLoop}
             onOpenPublish={openChatRun}
+            reviewCompletion={!chatComposingNew && chatAction === "review_completion" && !loopRunning}
+            onOpenCompletion={openCompletionReview}
             reviewPatch={!chatComposingNew && activeTask?.mode === "conservative" && chatAction === "review_patch" && !loopRunning}
             onReviewPatch={openChatRun}
-            error={chatError}
+            prepareTask={!chatComposingNew && activeTask?.track === "code" && !activeTaskStarted && !activeTask.requiresRecovery && !loopRunning && !["paused", "cancelled", "done", "failed"].includes(activeTask.status)}
+            onPrepareTask={() => { if (activeTask) { setTaskSetup({ taskId: activeTask.id, mode: activeTask.mode }); setTaskSetupDirty(false); setTaskCriteriaDirty(false); setTaskSetupError(null); } }}
+            error={chatError ?? chatPollError}
             mode={chatComposingNew || !activeTask ? chatMode : activeTask.mode}
             modeLocked={!chatComposingNew && Boolean(activeTask)}
             onModeChange={setChatMode}
@@ -1348,6 +1468,7 @@ function App() {
               {activeTask?.requiresRecovery ? <div className="recovery-note" role="status"><AlertTriangle size={14} /><span>{t("recovery.title")}</span><button className="small-action" onClick={() => void confirmRecovery()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("recovery.action")}</button></div> : null}
               {activeTask ? <div className="iteration-bar"><div className="iteration-status"><strong>{t("iteration")} {activeTask.currentIteration || iterations.length || 0}</strong><span>{activeTask.nextAction ?? activeTask.plan?.objective ?? t("currentCodingLoop")}</span></div><div className="iteration-actions">{activeTask.status === "failed" ? <button className="small-action" onClick={() => void beginRepair()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("repair")}</button> : activeTask.status === "paused" ? <button className="small-action" onClick={() => void changeTaskState("resume")} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("resume")}</button> : (activeTask.status === "review" && !iterations.length || activeTask.lifecycleStatus === "coding" && Boolean(iterations.at(-1)?.rolled_back)) ? planApproval?.status === "approved" ? <button className="small-action" onClick={() => void beginIteration()} disabled={iterationRunning || Boolean(agentBusyAction) || Boolean(activeTaskHasGit && !activeTask.taskBranch)} title={activeTaskHasGit && !activeTask.taskBranch ? t("createBranchBeforeCommit") : undefined}>{t("startIteration")}</button> : <button className="small-action" onClick={() => void requestPlanApproval()} disabled={iterationRunning || Boolean(agentBusyAction)}>{planApproval ? t("awaitingApproval") : t("requestPlanApproval")}</button> : null}{planApproval?.status === "pending" ? <button className="small-action small-action--muted" onClick={() => void approvePlan()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("approvePlan")}</button> : null}{["coding", "testing", "running"].includes(activeTask.status) ? <button className="small-action small-action--muted" onClick={() => void changeTaskState("pause")} disabled={iterationRunning || Boolean(agentBusyAction && agentBusyAction !== "run_tests")}>{t("pause")}</button> : null}{!["cancelled", "done"].includes(activeTask.status) ? <button className="text-button" onClick={() => void changeTaskState("cancel")} disabled={iterationRunning || Boolean(agentBusyAction && agentBusyAction !== "run_tests")}>{t("cancel")}</button> : null}</div></div> : null}
               {iterationError ? <div className="inline-error">{iterationError}</div> : null}
+              {activeTask?.agentBlockedReason ? <div className="inline-error" role="alert"><strong>{describeError(new ApiRequestError(activeTask.agentBlockedReason, activeTask.error ?? activeTask.nextAction ?? ""), t("common.error"))}</strong>{activeTask.error ? <p>{activeTask.error}</p> : null}</div> : null}
               {activeTask?.plan ? <div className="plan-list"><div className="plan-label">{t("plan")} / {activeTask.plan.steps.length} {t("steps")}</div>{activeTask.plan.steps.map((step, index) => <div className="plan-step" key={step.id}><span className={`plan-step-index ${index === 0 ? "plan-step-index--active" : ""}`}>{index + 1}</span><div className="plan-step-copy"><strong>{step.title}</strong><span>{step.description}</span></div><span className={`plan-risk plan-risk--${step.risk}`}>{t(`risk.${step.risk}`)}</span></div>)}</div> : null}
               {iterations.length ? <div className="iteration-history"><div className="plan-label">{t("iterations")} / {iterations.length}</div>{iterations.map((iteration) => <div className="iteration-row" key={iteration.id}><span className={`iteration-dot iteration-dot--${iteration.status}`} /><div className="iteration-row-copy"><strong>#{iteration.number} {t(`iterationStatus.${iteration.status}`)}</strong><span>{iteration.goal}</span>{iteration.failure_summary ? <small>{iteration.failure_summary}</small> : null}</div>{iteration.test_result?.failed_tests?.[0] ? <span className="failure-location">{iteration.test_result.failed_tests[0].path ?? t("testOutput")}{iteration.test_result.failed_tests[0].line ? `:${iteration.test_result.failed_tests[0].line}` : ""}</span> : null}</div>)}</div> : null}
               <div className="stream-list">
@@ -1368,9 +1489,10 @@ function App() {
           {activeTask?.runId ? <AgentPanel key={activeTask.id} taskId={activeTask.id} revision={agentRevision} testKind={activeTask.validationChecks.length ? "auto" : testKind} testTarget={activeTask.validationChecks.length ? "" : testTarget} disabled={operationBusy} hidden={activeNav !== "runs"} onAdvanced={refreshActiveTask} onBusyChange={setAgentBusyAction} /> : null}
 
           <section className="operations-grid" inert={Boolean(agentBusyAction) || approvalRunning}>
-            <section className="panel test-panel">
+            <section className="panel test-panel" ref={validationPanelRef}>
               <div className="panel-header"><div><div className="section-kicker"><PackageCheck size={13} /> {t("validation")}</div><h2>{t("testConsole")}</h2></div><button className="small-action" onClick={() => void executeTests()} disabled={!activeTask?.runId || operationBusy || !iterations.length || Boolean(iterations.at(-1)?.rolled_back) || ["paused", "cancelled", "done"].includes(activeTask.status)}>{testRunning ? <><Activity size={13} className="spin" /> {t("running")}</> : <><TerminalSquare size={13} /> {t(activeTask?.validationChecks.length ? "validation.next" : "runTests")}</>}</button></div>
-              {activeTask?.runId ? <ValidationChecklist key={activeTask.id} taskId={activeTask.id} checks={activeTask.validationChecks} currentIteration={activeTask.currentIteration} revision={agentRevision} hidden={activeNav !== "runs"} disabled={operationBusy || ["paused", "cancelled", "done"].includes(activeTask.status)} onSaved={updateTaskFromApi} onBusyChange={setValidationSaving} /> : null}
+              {activeTask?.runId ? <ValidationChecklist key={activeTask.id} taskId={activeTask.id} checks={activeTask.validationChecks} currentIteration={activeTask.currentIteration} revision={agentRevision} hidden={activeNav !== "runs"} disabled={operationBusy || ["paused", "cancelled", "done"].includes(activeTask.status)} onSaved={updateTaskFromApi} onBusyChange={setValidationSaving} onStateChange={updateValidationState} /> : null}
+              {activeTask?.runId ? <CompletionCriteria key={`criteria-${activeTask.id}`} taskId={activeTask.id} goal={activeTask.title} criteria={activeTask.completionCriteria} confirmation={activeTask.completionConfirmation} currentIteration={activeTask.currentIteration} state={validationAgentState} disabled={operationBusy || ["paused", "cancelled", "done"].includes(activeTask.status)} onSaved={completionConfirmed} onBusyChange={setCompletionConfirming} /> : null}
               {!activeTask?.validationChecks.length ? <div className="validation-options"><label>{t("validation.kind")}<select value={testKind} onChange={event => setTestKind(event.target.value as TestKind)} disabled={testRunning}>{["auto", "pytest", "frontend", "static"].map(kind => <option value={kind} key={kind}>{t("validation." + kind)}</option>)}</select></label><input value={testTarget} onChange={event => setTestTarget(event.target.value)} aria-label={t("validation.target")} placeholder={t("validation.target")} disabled={testRunning} /></div> : null}
               {testResult ? <div className="test-result">
                 <div className="test-result-top"><span className={`result-badge result-badge--${testResult.status}`}>{t("validation." + testResult.status)}</span><span>{testResult.duration_ms} ms · exit {testResult.exit_code ?? "—"}</span></div>
@@ -1391,7 +1513,7 @@ function App() {
                 <input className="patch-feedback" value={patchFeedback} disabled={patchRunning} onChange={(event) => setPatchFeedback(event.target.value)} placeholder={t("patch.feedbackPlaceholder")} aria-label={t("patch.feedbackPlaceholder")} />
                 <div className="patch-form-actions"><span>{patchPath.trim() ? `${t("patch.draftContext")}：${patchPath.trim()}` : t("updateOnly")}</span><div className="patch-form-buttons"><button className="small-action small-action--muted" onClick={() => void draftActivePatch()} disabled={!activeTask?.runId || patchRunning}>{patchRunning ? t("patch.drafting") : t("patch.draft")}</button><button className="small-action" onClick={() => void previewActivePatch()} disabled={!activeTask?.runId || !patchPath.trim() || patchRunning}>{patchRunning ? t("working") : t("previewDiff")}</button></div></div>
               </div>
-              {patchPreviewResult ? <div className="patch-result">{patchRationale ? <div className="patch-rationale"><strong>{t("patch.rationale")}</strong> {patchRationale}</div> : null}<div className="patch-summary"><span>{patchPreviewResult.files.length} {t("file")}</span><span className="diff-add">+{patchPreviewResult.additions}</span><span className="diff-del">-{patchPreviewResult.deletions}</span><span>{patchPreviewResult.bytes_changed} {t("bytes")}</span></div><pre className="diff-view">{patchPreviewResult.diff || t("noChangesDetected")}</pre><div className="patch-result-actions"><span>{t("reviewUnifiedDiff")}</span><div className="patch-result-buttons"><button className="small-action small-action--muted" onClick={cancelPatchPreview} disabled={patchRunning}>{t("cancel")}</button><button className="small-action" onClick={() => void applyActivePatch()} disabled={patchRunning || !patchPreviewResult.diff}>{t("applyCheckpoint")}</button></div></div></div> : <div className="empty-operation"><FileCode2 size={17} /><span>{t("previewBeforeRepository")}</span></div>}
+              {patchPreviewResult ? <div className="patch-result">{patchRationale ? <div className="patch-rationale"><strong>{t("patch.rationale")}</strong> {patchRationale}</div> : null}<div className="patch-summary"><span>{patchPreviewResult.files.length} {t("file")}</span><span className="diff-add">+{patchPreviewResult.additions}</span><span className="diff-del">-{patchPreviewResult.deletions}</span><span>{patchPreviewResult.bytes_changed} {t("bytes")}</span></div><pre className="diff-view">{patchPreviewResult.diff || t("patch.emptyFileChanges")}</pre><div className="patch-result-actions"><span>{t("reviewUnifiedDiff")}</span><div className="patch-result-buttons"><button className="small-action small-action--muted" onClick={cancelPatchPreview} disabled={patchRunning}>{t("cancel")}</button><button className="small-action" onClick={() => void applyActivePatch()} disabled={patchRunning || !patchPreviewResult.files.length}>{t("applyCheckpoint")}</button></div></div></div> : <div className="empty-operation"><FileCode2 size={17} /><span>{t("previewBeforeRepository")}</span></div>}
               {patchApplied ? <div className="success-note"><Check size={14} /> {patchApplied}</div> : null}
               {patchError ? <div className="inline-error">{patchError}</div> : null}
             </section>
