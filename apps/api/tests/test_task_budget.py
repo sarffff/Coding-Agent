@@ -105,9 +105,28 @@ def test_leaving_review_credits_the_wait_back_to_the_clock(api_client, demo_repo
     record.summary.status = "ready_for_pr"
     started = record.summary.budget.started_at
 
-    main.task_service._transition(record, "pr_created")
+    # Back to active work: the wait is credited, and the clock runs again.
+    main.task_service._transition(record, "testing")
 
     assert record.summary.budget.waiting_since is None
     # The 30 minute wait moved the start forward, so it will not be billed as runtime.
     assert record.summary.budget.started_at - started >= timedelta(minutes=29)
 
+
+
+def test_paused_time_is_not_agent_runtime(api_client, demo_repository):
+    from datetime import datetime, timedelta, timezone
+    from app import main
+
+    task = create_task(api_client, demo_repository)
+    record = main.task_service._record(task["id"])
+    now = datetime.now(timezone.utc)
+    record.summary.budget.max_wall_time_seconds = 3_600
+    record.summary.budget.started_at = now - timedelta(hours=3)
+    record.summary.status = "paused"
+    record.summary.budget.waiting_since = now - timedelta(hours=2, minutes=30)
+
+    budget = main.task_service.get_budget(task["id"])
+    # Three hours on the clock, two and a half of them paused: 30 minutes of agent time.
+    assert budget.exhausted_reason is None
+    assert 1_700 < budget.elapsed_seconds < 1_900

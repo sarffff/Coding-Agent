@@ -86,8 +86,8 @@ class TaskService:
     }
 
     IN_FLIGHT_STATES: set[TaskStatus] = {"queued", "planning", "running", "coding", "testing", "repairing", "awaiting_approval", "ready_for_pr"}
-    # The clock stops here: a task parked for review must not burn its wall-time budget while a person reads.
-    HUMAN_WAIT_STATES: set[TaskStatus] = {"awaiting_approval", "ready_for_pr"}
+    # The clock stops here: review, pause and merge wait are the human's time, not the agent's.
+    HUMAN_WAIT_STATES: set[TaskStatus] = {"awaiting_approval", "ready_for_pr", "paused", "pr_created"}
 
     def __init__(self, repositories: RepositoryService, store: StateStore | None = None, settings: Settings | None = None):
         self.repositories = repositories
