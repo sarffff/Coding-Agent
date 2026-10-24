@@ -120,3 +120,149 @@ def test_commit_scratch_is_kept_inside_the_state_directory(git_services):
         created = Path(directory)
         assert created.parent == service.settings.state_dir.resolve()
         assert created.is_dir()
+
+
+def test_transient_not_a_repository_error_is_retried_once(git_services, monkeypatch):
+    from app import git_service as module
+
+    _, service, repository_id = git_services
+    real_run = module.subprocess.run
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(list(args[0]))
+        if len(calls) == 1:
+            # What Windows reports when a scanner holds `.git` for a moment.
+            return module.subprocess.CompletedProcess(
+                args[0], 128, "", "fatal: not a git repository (or any of the parent directories): .git\n"
+            )
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", flaky)
+
+    snapshot = service.snapshot(repository_id)
+    assert snapshot.head
+    assert calls[0] == calls[1], "the same command must be retried, not skipped"
+    assert len(calls) > 2, "the rest of the snapshot still runs"
+
+
+def test_missing_git_dir_is_reported_without_retry(git_services, monkeypatch):
+    from app import git_service as module
+
+    _, service, repository_id = git_services
+    calls = []
+
+    def always_missing(*args, **kwargs):
+        calls.append(list(args[0]))
+        return module.subprocess.CompletedProcess(
+            args[0], 128, "", "fatal: not a git repository (or any of the parent directories): .git\n"
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", always_missing)
+    monkeypatch.setattr(service, "_git_dir_present", lambda repository: False)
+
+    with pytest.raises(RepositoryError) as excinfo:
+        service.snapshot(repository_id)
+
+    details = excinfo.value.details
+    assert details["attempts"] == 1, "a genuinely missing .git is not worth a retry"
+    assert details["git_dir_present"] is False
+    assert details["workdir"].endswith("demo")
+    assert "GIT_LITERAL_PATHSPECS" in details["git_env"]
+    assert len(calls) == 1
+
+
+def test_transient_not_a_repository_error_is_retried_once(git_services, monkeypatch):
+    from app import git_service as module
+
+    _, service, repository_id = git_services
+    real_run = module.subprocess.run
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(list(args[0]))
+        if len(calls) == 1:
+            # What Windows reports when a scanner holds `.git` for a moment.
+            return module.subprocess.CompletedProcess(
+                args[0], 128, "", "fatal: not a git repository (or any of the parent directories): .git\n"
+            )
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", flaky)
+
+    snapshot = service.snapshot(repository_id)
+    assert snapshot.head
+    assert calls[0] == calls[1], "the same command must be retried, not skipped"
+    assert len(calls) > 2, "the rest of the snapshot still runs"
+
+
+def test_missing_git_dir_is_reported_without_retry(git_services, monkeypatch):
+    from app import git_service as module
+
+    _, service, repository_id = git_services
+    calls = []
+
+    def always_missing(*args, **kwargs):
+        calls.append(list(args[0]))
+        return module.subprocess.CompletedProcess(
+            args[0], 128, "", "fatal: not a git repository (or any of the parent directories): .git\n"
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", always_missing)
+    monkeypatch.setattr(service, "_git_dir_present", lambda repository: False)
+
+    with pytest.raises(RepositoryError) as excinfo:
+        service.snapshot(repository_id)
+
+    details = excinfo.value.details
+    assert details["attempts"] == 1, "a genuinely missing .git is not worth a retry"
+    assert details["git_dir_present"] is False
+    assert details["workdir"].endswith("demo")
+    assert "GIT_LITERAL_PATHSPECS" in details["git_env"]
+    assert len(calls) == 1
+
+
+def test_state_changing_commands_are_never_retried(git_services, monkeypatch):
+    from app import git_service as module
+
+    _, service, repository_id = git_services
+    calls = []
+
+    def always_missing(*args, **kwargs):
+        calls.append(list(args[0]))
+        return module.subprocess.CompletedProcess(
+            args[0], 128, "", "fatal: not a git repository (or any of the parent directories): .git\n"
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", always_missing)
+    repository = service.repositories.get(repository_id)
+
+    with pytest.raises(RepositoryError) as excinfo:
+        service._run(repository, ["commit", "-m", "task: retry me"])
+
+    assert excinfo.value.details["attempts"] == 1, "a retried commit could apply twice"
+    assert len(calls) == 1
+    assert "commit" not in service.RETRYABLE
+
+
+def test_state_changing_commands_are_never_retried(git_services, monkeypatch):
+    from app import git_service as module
+
+    _, service, repository_id = git_services
+    calls = []
+
+    def always_missing(*args, **kwargs):
+        calls.append(list(args[0]))
+        return module.subprocess.CompletedProcess(
+            args[0], 128, "", "fatal: not a git repository (or any of the parent directories): .git\n"
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", always_missing)
+    repository = service.repositories.get(repository_id)
+
+    with pytest.raises(RepositoryError) as excinfo:
+        service._run(repository, ["commit", "-m", "task: retry me"])
+
+    assert excinfo.value.details["attempts"] == 1, "a retried commit could apply twice"
+    assert len(calls) == 1
+    assert "commit" not in service.RETRYABLE

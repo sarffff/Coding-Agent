@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -218,20 +219,49 @@ class GitService:
     def _hash(value: dict[str, str]) -> str:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
+    # Windows occasionally fails a stat on `.git` while a scanner holds the directory; git then
+    # reports "not a git repository" even though it is right there. One retry tells the two apart.
+    NOT_A_REPOSITORY = "not a git repository"
+    # Only commands that cannot change repository state may be retried: a retried commit or push
+    # could apply twice, a retried read cannot.
+    RETRYABLE = frozenset({
+        "branch", "cat-file", "diff", "for-each-ref", "log", "ls-files", "ls-tree",
+        "merge-base", "read-tree", "rev-list", "rev-parse", "show", "status", "write-tree",
+    })
+
+    def _git_dir_present(self, repository: RepositoryRecord) -> bool:
+        return (repository.path / ".git").exists()
+
     def _run(self, repository: RepositoryRecord, args: list[str], *, env: dict[str, str] | None = None, input_text: str | None = None) -> str:
         if not repository.has_git:
             raise RepositoryError("GIT_NOT_AVAILABLE", "Git operations require opening a Git root with an initial commit. Local editing, tests and rollback remain available.")
         environment = child_env({"GIT_LITERAL_PATHSPECS": "1", **(env or {})})
-        try:
-            result = subprocess.run(
-                ["git", *args], cwd=repository.path, capture_output=True, input=input_text,
-                text=True, encoding="utf-8", errors="replace", env=environment,
-                timeout=self.settings.git_timeout_seconds, check=False, shell=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RepositoryError("GIT_COMMAND_FAILED", "The Git command could not be completed.") from exc
-        if is_process_startup_failure(result.returncode):
-            raise RepositoryError("GIT_UNAVAILABLE", "The API process could not start Git. Restart the API from a normal shell.", {"command": args, "exit_code": result.returncode})
-        if result.returncode != 0:
-            raise RepositoryError("GIT_COMMAND_FAILED", "The Git command was rejected.", {"command": args, "stderr": result.stderr[-2_000:]})
-        return result.stdout
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = subprocess.run(
+                    ["git", *args], cwd=repository.path, capture_output=True, input=input_text,
+                    text=True, encoding="utf-8", errors="replace", env=environment,
+                    timeout=self.settings.git_timeout_seconds, check=False, shell=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RepositoryError("GIT_COMMAND_FAILED", "The Git command could not be completed.") from exc
+            if is_process_startup_failure(result.returncode):
+                raise RepositoryError("GIT_UNAVAILABLE", "The API process could not start Git. Restart the API from a normal shell.", {"command": args, "exit_code": result.returncode})
+            if result.returncode == 0:
+                return result.stdout
+            if (attempt == 1 and args and args[0] in self.RETRYABLE
+                    and self.NOT_A_REPOSITORY in result.stderr.lower() and self._git_dir_present(repository)):
+                time.sleep(0.1)
+                continue
+            # Details exist so the next occurrence is explainable instead of "it failed once".
+            raise RepositoryError("GIT_COMMAND_FAILED", "The Git command was rejected.", {
+                "command": args,
+                "stderr": result.stderr[-2_000:],
+                "attempts": attempt,
+                "workdir": str(repository.path),
+                "workdir_exists": repository.path.is_dir(),
+                "git_dir_present": self._git_dir_present(repository),
+                "git_env": sorted(name for name in environment if name.startswith("GIT_")),
+            })
