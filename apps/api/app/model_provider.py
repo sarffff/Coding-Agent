@@ -78,6 +78,9 @@ _SYSTEM_PROMPT = (
     "For an update, prefer `edits` instead of `content`: "
     '[{"old_text": "<exact existing text>", "new_text": "<replacement text>"}]. '
     "Edits run in order; each nonempty old_text must match exactly once at that point. "
+    "Use the smallest unique old_text without a newline for a single-line change. "
+    "For multiline old_text in CRLF files, preserve the exact \\r\\n line endings. "
+    "Return a complete JSON object, including all closing braces and brackets. "
     "Use at most 100 edits in total. Do not combine content and edits; create/delete cannot use edits. "
     "Rules: only touch files the goal needs; `content` is the whole file, never a diff; never "
     "write secrets or files under .env/keys/vendor/build dirs; keep the existing code style. "
@@ -167,7 +170,7 @@ def _proposal_from_payload(payload: dict, context_files: list[tuple[str, str]] |
                 old_text = edit["old_text"]
                 match = content.find(old_text)
                 if match < 0 or match != content.rfind(old_text):
-                    raise RepositoryError("MODEL_EDIT_CONFLICT", "The text to replace must appear exactly once in the current file.", {"path": proposed.path})
+                    raise RepositoryError("MODEL_EDIT_CONFLICT", "The text to replace must appear exactly once in the current file. Use the smallest unique old_text without a newline for a single-line change; preserve CRLF, or provide complete file content.", {"path": proposed.path})
                 content = content[:match] + edit["new_text"] + content[match + len(old_text):]
             proposed.content = content
         files.append(proposed)
@@ -180,7 +183,9 @@ def _build_prompt(goal: str, context_files: list[tuple[str, str]], failure: str 
         parts.append(f"# Latest test failure\n{failure.strip()}")
     if context_files:
         parts.append("# Current files")
-        parts += [f"## {path}\n```\n{content}\n```" for path, content in context_files]
+        for path, content in context_files:
+            note = "\nThis file contains CRLF (\\r\\n); preserve \\r\\n in multiline old_text." if "\r\n" in content else ""
+            parts.append(f"## {path}{note}\n```\n{content}\n```")
     else:
         parts.append("# Current files\n(None supplied; search and read existing files before modifying them.)")
     return "\n\n".join(parts)

@@ -55,10 +55,14 @@ def test_unreadable_context_requests_do_not_write_files_or_loop_forever(model_ap
 
     monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
     response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={})
-    assert response.status_code == 400
-    assert response.json()["code"] == "MODEL_CONTEXT_LIMIT"
-    assert len(calls) <= 5
+    assert response.status_code == 409
+    assert response.json()["code"] == "AGENT_NO_PROGRESS"
+    assert len(calls) == 2
     assert (directory / "app.py").read_text(encoding="utf-8").endswith("return 1\n")
+    assert (directory / ".env").read_text(encoding="utf-8") == "SECRET=hidden\n"
+    assert client.get(f"/api/v1/runs/{task['run_id']}/checkpoints").json()["total"] == 0
+    budget = client.get(f"/api/v1/tasks/{task['id']}/budget").json()
+    assert budget["remote_calls"] == 2 and budget["consecutive_failures"] == 1
 
 
 def test_pause_during_a_manual_context_request_discards_late_response(model_api, monkeypatch):
@@ -112,9 +116,12 @@ def test_model_that_keeps_returning_bad_replies_stops_and_counts_one_failure(mod
 
     monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
     response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={})
-    assert response.json()["code"] == "MODEL_INVALID_OUTPUT"
-    assert len(calls) == main.agent_service.CONTEXT_ROUNDS + 1
+    assert response.status_code == 409
+    assert response.json()["code"] == "AGENT_NO_PROGRESS"
+    assert len(calls) == 2
     assert client.get(f"/api/v1/tasks/{task['id']}").json()["budget"]["consecutive_failures"] == 1
+    assert (directory / "app.py").read_text(encoding="utf-8").endswith("return 1\n")
+    assert not any(event.action == "patch.draft" for event in main.audit_service.list_for_run(task["run_id"]))
 
 
 @pytest.mark.parametrize("mode", ["standard", "conservative"])
@@ -186,3 +193,120 @@ def test_blocked_program_is_not_charged(model_api, monkeypatch):
     post(client, f"/api/v1/runs/{task['run_id']}/patches/draft")
     # The program never ran, so only the three model turns are charged.
     assert client.get(f"/api/v1/tasks/{task['id']}").json()["budget"]["remote_calls"] == 3
+
+
+def test_current_read_requests_keep_existing_target_alongside_new_evidence(model_api, monkeypatch):
+    client, directory = model_api
+    task = create_task(client, directory)
+    (directory / "extra.py").write_text("EXTRA = 1\n", encoding="utf-8")
+    monkeypatch.setattr(main.settings, "llm_max_context_files", 2)
+    calls = []
+
+    async def model(goal, context, failure):
+        calls.append(dict(context))
+        if len(calls) == 1:
+            assert "app.py" in dict(context)
+            return PatchProposal(context_requests=[ContextRequest(action="read", path="extra.py"), ContextRequest(action="read", path="app.py")])
+        assert set(dict(context)) == {"app.py", "extra.py"}
+        return PatchProposal(files=[PatchFile(path="app.py", content="def value():\n    return 2\n")])
+
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    draft = post(client, f"/api/v1/runs/{task['run_id']}/patches/draft", {"context_paths": ["app.py", "test_app.py"]})
+    assert "+    return 2" in draft["diff"] and len(calls) == 2
+
+
+def test_repeated_read_of_unchanged_context_is_not_progress(model_api, monkeypatch):
+    client, directory = model_api
+    task = create_task(client, directory)
+    calls = []
+
+    async def model(goal, context, failure):
+        calls.append(goal)
+        return PatchProposal(context_requests=[ContextRequest(action="read", path="app.py")])
+
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={})
+    assert response.status_code == 409 and response.json()["code"] == "AGENT_NO_PROGRESS"
+    assert len(calls) == 2
+
+
+def test_reread_after_external_change_stops_before_another_model_turn(model_api, monkeypatch):
+    client, directory = model_api
+    task = create_task(client, directory)
+    external = "def value():\n    return 99  # user edit\n"
+    calls = []
+
+    async def model(goal, context, failure):
+        calls.append(goal)
+        (directory / "app.py").write_text(external, encoding="utf-8")
+        return PatchProposal(context_requests=[ContextRequest(action="read", path="app.py")])
+
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={})
+    assert response.status_code == 400 and response.json()["code"] == "PATCH_CONFLICT"
+    assert len(calls) == 1
+    assert (directory / "app.py").read_text(encoding="utf-8") == external
+
+
+def test_evicted_context_keeps_its_original_hash_when_reread(model_api, monkeypatch):
+    client, directory = model_api
+    task = create_task(client, directory)
+    (directory / "extra.py").write_text("EXTRA = 1\n", encoding="utf-8")
+    monkeypatch.setattr(main.settings, "llm_max_context_files", 1)
+    calls = []
+    external = "def value():\n    return 99  # user edit\n"
+
+    async def model(goal, context, failure):
+        calls.append(dict(context))
+        if len(calls) == 1:
+            assert "app.py" in dict(context)
+            return PatchProposal(context_requests=[ContextRequest(action="read", path="extra.py")])
+        assert list(dict(context)) == ["extra.py"]
+        (directory / "app.py").write_text(external, encoding="utf-8")
+        return PatchProposal(context_requests=[ContextRequest(action="read", path="app.py")])
+
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={"context_paths": ["app.py"]})
+    assert response.status_code == 400 and response.json()["code"] == "PATCH_CONFLICT"
+    assert len(calls) == 2 and (directory / "app.py").read_text(encoding="utf-8") == external
+
+
+def test_request_history_keeps_unresolved_locations_ahead_of_completed_probes(model_api, monkeypatch):
+    client, directory = model_api
+    task = create_task(client, directory)
+    nested = directory / "src" / "domain"
+    nested.mkdir(parents=True)
+    pending = "MARKER = 'pending-evidence'\n"
+    (nested / "pending.py").write_text(pending, encoding="utf-8", newline="")
+    (directory / "extra.py").write_text("EXTRA = 1\n", encoding="utf-8")
+    monkeypatch.setattr(main.settings, "llm_max_context_files", 1)
+    monkeypatch.setattr(main.settings, "llm_max_context_bytes", 1_000)
+    calls = []
+
+    async def run(task, command):
+        return "probe-" + command[-1] + ("Z" * 2_000 if command[-1] == "1" else "")
+
+    async def model(goal, context, failure):
+        calls.append(goal)
+        if len(calls) == 1:
+            return PatchProposal(context_requests=[ContextRequest(action="search", query="pending-evidence"),
+                                                   ContextRequest(action="read", path="missing.py"),
+                                                   ContextRequest(action="run", command=["python", "1"])])
+        section = goal.split("\n\n# Context results\n", 1)[1]
+        assert len(section.encode("utf-8")) <= 1_000
+        assert "Read missing.py failed" in section
+        if len(calls) < 4:
+            assert "src/domain/pending.py:1" in section and "pending-evidence" in section
+        if len(calls) == 2:
+            return PatchProposal(context_requests=[ContextRequest(action="read", path="extra.py"), ContextRequest(action="run", command=["python", "2"])])
+        if len(calls) == 3:
+            return PatchProposal(context_requests=[ContextRequest(action="read", path="src/domain/pending.py"), ContextRequest(action="run", command=["python", "3"])])
+        assert "Search 'pending-evidence'" not in section and "Read extra.py." not in section
+        assert "probe-1" not in section and "probe-2" in section and "probe-3" in section
+        assert dict(context)["src/domain/pending.py"] == pending
+        return PatchProposal(files=[PatchFile(path="src/domain/pending.py", content=pending.replace("MARKER", "RESOLVED"))])
+
+    monkeypatch.setattr(main.agent_service, "_run_for_model", run)
+    monkeypatch.setattr(main.agent_service.models, "propose_patch", model)
+    draft = post(client, f"/api/v1/runs/{task['run_id']}/patches/draft")
+    assert "+RESOLVED" in draft["diff"] and len(calls) == 4

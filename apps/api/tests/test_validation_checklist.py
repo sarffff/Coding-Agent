@@ -4,6 +4,7 @@ import pytest
 
 from app import main
 from app.models import TestRunResponse as ValidationResult
+from conftest import git_output
 from test_api_workflow import post
 from test_agent_workflow import approve_plan, create_branch, start_agent_iteration, apply_value, agent_state
 from test_agent_loop import model_api
@@ -16,7 +17,14 @@ CHECKS = [
 ]
 
 
+def add_build_script(directory):
+    (directory / "package.json").write_text(json.dumps({"scripts": {"build": 'node -e "console.log(\'build-ok\')"'}}), encoding="utf-8")
+    git_output(directory, "add", "package.json")
+    git_output(directory, "commit", "-qm", "Add build validation")
+
+
 def prepared_task(client, directory, checks=CHECKS):
+    add_build_script(directory)
     repository = post(client, "/api/v1/repositories", {"path": str(directory)})
     task = post(client, "/api/v1/tasks", {"repository_id": repository["id"], "goal": "Fix value and validate every project", "validation_checks": checks})
     approve_plan(client, task)
@@ -79,6 +87,7 @@ def test_failed_required_check_cannot_be_hidden_by_a_manual_pass(api_client, dem
 
 
 def test_checklist_changes_require_new_plan_approval_and_lock_after_start(api_client, demo_repository):
+    add_build_script(demo_repository)
     repository = post(api_client, "/api/v1/repositories", {"path": str(demo_repository)})
     task = post(api_client, "/api/v1/tasks", {"repository_id": repository["id"], "goal": "Fix value"})
     approve_plan(api_client, task)
@@ -124,6 +133,13 @@ def test_changes_outside_task_patch_invalidate_required_checks(api_client, demo_
     post(api_client, f"/api/v1/runs/{task['run_id']}/tests")
     (demo_repository / changed).write_text("{}", encoding="utf-8")
     assert agent_state(api_client, task["id"])["validation_status"][0]["status"] == "stale"
+    if changed == "package.json":
+        denied = api_client.post(f"/api/v1/runs/{task['run_id']}/tests", json={})
+        assert denied.status_code == 409
+        assert denied.json()["code"] == "VALIDATION_REVIEW_REQUIRED"
+    else:
+        stub_runner(monkeypatch, iter(["passed"]))
+        assert post(api_client, f"/api/v1/runs/{task['run_id']}/tests")["check_id"] == "api"
 
 
 def test_loop_executes_actual_api_check_and_package_scripts(model_api):

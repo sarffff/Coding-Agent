@@ -144,3 +144,37 @@ def test_providers_return_context_requests_then_expand_local_edits(monkeypatch, 
 def test_run_requests_keep_the_argv_verbatim():
     proposal = _proposal_from_payload({"context_requests": [{"action": "run", "command": ["python", "-m", "pytest", "-q", "test_app.py"]}]})
     assert proposal.context_requests[0].command == ["python", "-m", "pytest", "-q", "test_app.py"]
+
+
+def test_crlf_prompt_keeps_raw_content_and_requests_complete_json():
+    original = "def value():\r\n    return 1\r\n"
+    prompt = mp._build_prompt("Fix value", [("a.py", original), ("b.py", "value = 1\n")], None)
+    assert original in prompt
+    assert "CRLF (\\r\\n)" in prompt.split("## b.py")[0]
+    assert "CRLF" not in prompt.split("## b.py")[1]
+    assert "smallest unique old_text" in mp._SYSTEM_PROMPT
+    assert "without a newline" in mp._SYSTEM_PROMPT
+    assert "complete JSON object" in mp._SYSTEM_PROMPT
+
+
+def test_crlf_single_line_edit_preserves_endings_and_multiline_lf_stays_rejected():
+    original = "def value():\r\n    return 1\r\n"
+    proposal = _proposal_from_payload({"files": [{"path": "a.py", "edits": [
+        {"old_text": "return 1", "new_text": "return 2"},
+    ]}]}, [("a.py", original)])
+    assert proposal.files[0].content == "def value():\r\n    return 2\r\n"
+    with pytest.raises(RepositoryError) as error:
+        _proposal_from_payload({"files": [{"path": "a.py", "edits": [
+            {"old_text": "def value():\n    return 1", "new_text": "def value():\n    return 2"},
+        ]}]}, [("a.py", original)])
+    assert error.value.code == "MODEL_EDIT_CONFLICT"
+    assert "smallest unique old_text without a newline" in error.value.message
+    assert "preserve CRLF" in error.value.message
+    assert error.value.details == {"path": "a.py"}
+
+
+def test_incomplete_json_is_rejected_without_repairing_the_response():
+    raw = json.dumps({"files": [{"path": "a.py", "edits": [{"old_text": "return 1", "new_text": "return 2"}]}]})
+    with pytest.raises(RepositoryError) as error:
+        extract_proposal_json(raw[:-1])
+    assert error.value.code == "MODEL_INVALID_OUTPUT"

@@ -29,6 +29,8 @@ from .remote_provider import _CAPTURE, FakeRemoteProvider, GitHubRemoteProvider,
 from .repository_service import RepositoryError, RepositoryService
 from .store import StateStore
 from .task_service import TaskService
+from .test_service import TestService
+from .validation_guard import validation_guard_changes
 
 T = TypeVar("T")
 
@@ -45,6 +47,7 @@ class RemoteService:
         audit: AuditService,
         settings: Settings,
         store: StateStore,
+        tests: TestService,
         provider: RemoteProvider | None = None,
     ) -> None:
         self.repositories = repositories
@@ -54,6 +57,7 @@ class RemoteService:
         self.audit = audit
         self.settings = settings
         self.store = store
+        self.tests = tests
         if provider is not None:
             self.provider = provider
         elif settings.remote_provider == "fake":
@@ -236,6 +240,7 @@ class RemoteService:
 
     async def push_branch(self, task_id: str, remote_name: str = "origin") -> RemoteBranchRecord:
         task = self.tasks.get(task_id)
+        self._assert_completion_ready(task)
         repository_id = self._require_repository(task)
         branch = task.task_branch
         if not branch:
@@ -245,14 +250,7 @@ class RemoteService:
         if not self.approvals.has_approved(task_id, "push"):
             raise RepositoryError("PUSH_APPROVAL_REQUIRED", "Pushing requires a current 'push' approval.", {"type": "push"})
 
-        commits = self.list_commits(task_id)
-        if not commits:
-            raise RepositoryError("NO_APPROVED_COMMIT", "Publish an approved local commit before pushing.")
-        snapshot = self.git.snapshot(repository_id)
-        if snapshot.branch != branch:
-            raise RepositoryError("TASK_BRANCH_NOT_CHECKED_OUT", f"Repository is on '{snapshot.branch}', not the task branch '{branch}'.")
-        if snapshot.head != commits[-1].commit_sha:
-            raise RepositoryError("REMOTE_HEAD_MOVED", "HEAD moved after the approved commit. Preview and approve the commit again.")
+        self._publish_snapshot(task)
 
         remote_url = self.get_remote_url(repository_id, remote_name)
         self.provider.validate_remote_url(remote_url)
@@ -285,9 +283,21 @@ class RemoteService:
         commits = self.list_commits(task_id)
         pushed = [record for record in self.list_remote_branches(task_id) if record.branch == task.task_branch]
         iterations = self.tasks.list_iterations(task_id)
-        files = sorted(self.tasks.changed_files(task_id))
+        files, scope_known = self._pull_request_files(task, target_branch)
         validation_passed = bool(iterations and iterations[-1].test_result and iterations[-1].test_result.status == "passed")
         latest_commit = commits[-1] if commits else None
+        snapshot_ready = True
+        try:
+            self._publish_snapshot(task, require_pushed=True)
+        except RepositoryError as exc:
+            if exc.code not in {"NO_APPROVED_COMMIT", "TASK_BRANCH_NOT_CHECKED_OUT", "REMOTE_HEAD_MOVED", "UNCOMMITTED_TASK_CHANGES", "BRANCH_NOT_PUSHED", "VALIDATION_REVIEW_REQUIRED", "PUBLISH_NOT_READY"}:
+                raise
+            snapshot_ready = False
+        completion_ready = not task.completion_criteria or self.tasks.completion_status(task_id, self.tests.input_hash(task.repository_id)) == "confirmed"
+        completion_lines = []
+        if task.completion_criteria:
+            evidence = {item.criterion_id: item.evidence for item in task.completion_confirmation.evidence} if task.completion_confirmation else {}
+            completion_lines = ["", "### Completion evidence", *[f"- {item.text}: {evidence.get(item.id, 'pending')}" for item in task.completion_criteria]]
         file_lines = [f"- `{name}`" for name in files] or ["- None"]
         body = "\n".join(
             [
@@ -295,10 +305,12 @@ class RemoteService:
                 "",
                 "### Modified files",
                 *file_lines,
+                *([] if scope_known else ["- The complete PR file scope is unavailable locally; listed files cover task edits only. Fetch the target branch before reviewing the full scope."]),
                 "",
                 "### Validation",
                 f"- Tests passed: **{'yes' if validation_passed else 'not yet'}**",
                 f"- Iterations: {len(iterations)}",
+                *completion_lines,
                 "",
                 "### Audit trail",
                 f"- Branch: `{task.task_branch or 'none'}`",
@@ -315,13 +327,14 @@ class RemoteService:
             draft=True,
             files=files,
             risk_level="low" if len(files) <= 5 else "medium",
-            ready=bool(pushed and latest_commit and validation_passed and task.task_branch),
+            ready=bool(pushed and latest_commit and validation_passed and task.task_branch and completion_ready and snapshot_ready and scope_known),
             validation_passed=validation_passed,
             commit_sha=latest_commit.commit_sha if latest_commit else None,
         )
 
     async def create_pull_request(self, task_id: str, payload: PullRequestCreateRequest) -> PullRequestRecord:
         task = self.tasks.get(task_id)
+        self._assert_completion_ready(task)
         branch = task.task_branch
         if not branch:
             raise RepositoryError("NO_TASK_BRANCH", "Create the task branch before opening a Pull Request.")
@@ -330,10 +343,10 @@ class RemoteService:
         if not self.approvals.has_approved(task_id, "pr"):
             raise RepositoryError("PR_APPROVAL_REQUIRED", "Creating a Pull Request requires a current 'pr' approval.", {"type": "pr"})
 
-        pushed = [record for record in self.list_remote_branches(task_id) if record.branch == branch]
-        if not pushed:
-            raise RepositoryError("BRANCH_NOT_PUSHED", "Push the task branch before creating a Pull Request.")
-        remote_url = pushed[-1].remote_url
+        _, pushed = self._publish_snapshot(task, require_pushed=True)
+        if not self._pull_request_files(task, payload.target_branch)[1]:
+            raise RepositoryError("PR_SCOPE_UNAVAILABLE", "Fetch the target branch and review the complete local PR scope before creating a Pull Request.")
+        remote_url = pushed.remote_url
 
         await self._call(task.id, task.run_id, "validate", lambda: self.provider.validate_repository(remote_url))
         if not await self._call(task.id, task.run_id, "validate", lambda: self.provider.check_branch_exists(remote_url, branch)):
@@ -406,6 +419,62 @@ class RemoteService:
         if record.state == "merged" and self.tasks.get(task_id).status == "pr_created":
             self.tasks.transition(task_id, "completed", next_action=f"Pull Request #{record.number} was merged.")
         return record
+
+    def _assert_completion_ready(self, task: TaskSummary) -> None:
+        if task.completion_criteria:
+            self.tasks.assert_completion_ready(task.id, self.tests.input_hash(self._require_repository(task)))
+
+    def _pull_request_files(self, task: TaskSummary, target_branch: str) -> tuple[list[str], bool]:
+        fallback = sorted(self.tasks.changed_files(task.id))
+        if not task.repository_id or not task.task_branch:
+            return fallback, False
+        repository = self.repositories.get(task.repository_id)
+        if not repository.has_git:
+            return fallback, False
+        for reference in (f"refs/remotes/origin/{target_branch}", f"refs/heads/{target_branch}"):
+            try:
+                base = self.git._run(repository, ["rev-parse", "--verify", "--quiet", reference + "^{commit}"]).strip()
+            except RepositoryError as exc:
+                if exc.code != "GIT_COMMAND_FAILED":
+                    raise
+                continue
+            try:
+                paths = self.git._run(repository, ["diff", "--name-only", "--no-renames", "-z", f"{base}...{task.task_branch}", "--"])
+            except RepositoryError as exc:
+                if exc.code != "GIT_COMMAND_FAILED":
+                    raise
+                return fallback, False
+            return sorted(path for path in paths.split("\0") if path), True
+        return fallback, False
+
+    def _publish_snapshot(self, task: TaskSummary, require_pushed: bool = False):
+        repository_id = self._require_repository(task)
+        changes = validation_guard_changes(self.repositories.get(repository_id), self.tasks.prepare_validation_guard(task.id))
+        if changes:
+            raise RepositoryError("VALIDATION_REVIEW_REQUIRED", "Review and explicitly confirm changed verification inputs before publishing.", {"paths": changes})
+        commits = self.list_commits(task.id)
+        if not commits:
+            raise RepositoryError("NO_APPROVED_COMMIT", "Publish an approved local commit before pushing.")
+        iterations = self.tasks.list_iterations(task.id)
+        if (task.status not in {"ready_for_pr", "pr_created"} or not iterations or iterations[-1].rolled_back
+                or not iterations[-1].test_result or iterations[-1].test_result.status != "passed"):
+            raise RepositoryError("PUBLISH_NOT_READY", "The latest iteration must pass validation before publishing.")
+        snapshot = self.git.snapshot(repository_id)
+        if snapshot.branch != task.task_branch:
+            raise RepositoryError("TASK_BRANCH_NOT_CHECKED_OUT", f"Repository is on '{snapshot.branch}', not the task branch '{task.task_branch}'.")
+        if snapshot.head != commits[-1].commit_sha:
+            raise RepositoryError("REMOTE_HEAD_MOVED", "HEAD moved after the approved commit. Preview and approve the commit again.")
+        prepared = self.git.preview(repository_id, self.tasks.changed_files(task.id), "")
+        if prepared.ready:
+            raise RepositoryError("UNCOMMITTED_TASK_CHANGES", "Commit the current task changes before pushing or creating a Pull Request.", {"files": prepared.changed_files})
+        pushed = [record for record in self.list_remote_branches(task.id) if record.branch == task.task_branch]
+        latest_push = pushed[-1] if pushed else None
+        if require_pushed:
+            if latest_push is None:
+                raise RepositoryError("BRANCH_NOT_PUSHED", "Push the task branch before creating a Pull Request.")
+            if latest_push.pushed_sha != snapshot.head:
+                raise RepositoryError("REMOTE_HEAD_MOVED", "Push the latest approved commit before creating a Pull Request.")
+        return snapshot, latest_push
 
     def _require_repository(self, task: TaskSummary) -> str:
         if not task.repository_id:

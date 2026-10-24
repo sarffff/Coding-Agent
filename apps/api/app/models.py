@@ -194,16 +194,71 @@ class ValidationChecksRequest(BaseModel):
         return self
 
 
+class CompletionCriterion(BaseModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    text: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def nonempty_text(self):
+        self.text = self.text.strip()
+        if not self.text:
+            raise PydanticCustomError("empty_criterion", "Completion criteria must have text.")
+        return self
+
+
+def unique_completion_criteria(criteria: list[CompletionCriterion]) -> None:
+    if len({criterion.id for criterion in criteria}) != len(criteria):
+        raise PydanticCustomError("duplicate_criterion_id", "Completion criterion ids must be unique.")
+
+
+class CompletionCriteriaRequest(BaseModel):
+    criteria: list[CompletionCriterion] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def unique_ids(self):
+        unique_completion_criteria(self.criteria)
+        return self
+
+
+class CompletionEvidence(BaseModel):
+    criterion_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    evidence: str = Field(min_length=1, max_length=1_000)
+
+    @model_validator(mode="after")
+    def nonempty_evidence(self):
+        self.evidence = self.evidence.strip()
+        if not self.evidence:
+            raise PydanticCustomError("empty_evidence", "Completion evidence must have text.")
+        return self
+
+
+class CompletionConfirmationRequest(BaseModel):
+    iteration_id: str = Field(min_length=1, max_length=80)
+    scope_hash: str = Field(min_length=64, max_length=64)
+    validation_hash: str = Field(min_length=64, max_length=64)
+    evidence: list[CompletionEvidence] = Field(max_length=12)
+
+
+class CompletionConfirmation(CompletionConfirmationRequest):
+    confirmed_at: datetime
+    confirmed_by: str
+
+
+CompletionStatus = Literal["not_required", "pending", "stale", "confirmed"]
+
+
 class TaskCreateRequest(BaseModel):
     goal: str = Field(min_length=3, max_length=4_000)
     repository_id: str | None = None
     mode: AgentMode = "standard"
     track: TaskTrack = "code"
     validation_checks: list[ValidationCheck] = Field(default_factory=list, max_length=12)
+    completion_criteria: list[CompletionCriterion] = Field(default_factory=list, max_length=12)
 
     @model_validator(mode="after")
     def unique_ids(self):
         unique_checks(self.validation_checks)
+        unique_completion_criteria(self.completion_criteria)
         return self
 
 
@@ -251,6 +306,7 @@ class TaskSummary(BaseModel):
     status: TaskStatus
     plan: TaskPlan | None = None
     error: str | None = None
+    agent_blocked_reason: str | None = None
     created_at: datetime
     updated_at: datetime
     current_iteration: int = 0
@@ -267,6 +323,8 @@ class TaskSummary(BaseModel):
     mode: AgentMode = "standard"
     track: TaskTrack = "code"
     validation_checks: list[ValidationCheck] = Field(default_factory=list)
+    completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
+    completion_confirmation: CompletionConfirmation | None = None
 
 
 IterationStatus = Literal["coding", "testing", "passed", "failed", "cancelled"]
@@ -546,11 +604,14 @@ class PatchPreviewResponse(BaseModel):
     deletions: int
     bytes_changed: int
     requires_delete_confirmation: bool = False
+    requires_validation_confirmation: bool = False
+    validation_changes: list[str] = Field(default_factory=list)
 
 
 class PatchApplyRequest(BaseModel):
     patch_id: str = Field(min_length=1, max_length=100)
     confirm: bool = False
+    confirm_validation_changes: bool = False
 
 
 class CheckpointSummary(BaseModel):
@@ -618,6 +679,7 @@ class TestRunResponse(BaseModel):
     workdir: str = "."
     target: str | None = None
     script: str | None = None
+    baseline_comparison: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class ValidationCheckStatus(BaseModel):
@@ -640,6 +702,7 @@ AgentAction = Literal[
     "run_tests",
     "wait_for_tests",
     "start_repair",
+    "review_completion",
     "review_commit",
     "review_push",
     "review_pr",
@@ -676,6 +739,10 @@ class AgentStateResponse(BaseModel):
     last_test: TestRunResponse | None = None
     loop_running: bool = False
     validation_status: list[ValidationCheckStatus] = Field(default_factory=list)
+    completion_status: CompletionStatus = "not_required"
+    completion_scope_hash: str | None = None
+    completion_validation_hash: str | None = None
+    can_confirm_completion: bool = False
 
 
 class AgentAdvanceResponse(AgentStateResponse):

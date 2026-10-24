@@ -14,6 +14,8 @@ def plan_scope_hash(task: TaskSummary) -> str:
     scope = task.id + "\n" + task.goal + "\n" + (task.plan.objective if task.plan else "")
     if task.validation_checks:
         scope += "\n" + "\n".join(check.model_dump_json() for check in task.validation_checks)
+    if task.completion_criteria:
+        scope += "\n" + "\n".join(criterion.model_dump_json() for criterion in task.completion_criteria)
     return hashlib.sha256(scope.encode("utf-8")).hexdigest()
 
 

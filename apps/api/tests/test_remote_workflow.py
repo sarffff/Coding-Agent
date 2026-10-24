@@ -64,6 +64,52 @@ def commit_passing_task(client, task):
     return post(client, f"/api/v1/tasks/{task['id']}/commits", {"message": "Fix value", "scope_hash": preview["scope_hash"]})
 
 
+@pytest.mark.parametrize("operation", ["push", "pr"])
+def test_direct_publish_rejects_changed_validation_without_completion_criteria(remote_api, remote_repository, operation):
+    client = remote_api.client
+    task = passing_task(client, remote_repository)
+    assert not task["completion_criteria"]
+    commit_passing_task(client, task)
+    approve(client, task, "push")
+    if operation == "pr":
+        post(client, f"/api/v1/tasks/{task['id']}/push", {"remote": "origin"})
+        approve(client, task, "pr")
+    before = len(remote_api.provider.pushes)
+    (remote_repository / "test_app.py").write_text("def test_value():\n    assert True\n", encoding="utf-8")
+    if operation == "pr":
+        from app import main
+        assert main.remote_service.preview_pull_request(task["id"]).ready is False
+    path = "/push" if operation == "push" else "/pull-request"
+    payload = {"remote": "origin"} if operation == "push" else {"title": "Fix value", "body": "Reviewed", "draft": True}
+    response = client.post(f"/api/v1/tasks/{task['id']}" + path, json=payload)
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "VALIDATION_REVIEW_REQUIRED"
+    assert len(remote_api.provider.pushes) == before
+    assert not remote_api.provider.pull_requests
+
+
+@pytest.mark.parametrize("operation", ["push", "pr"])
+def test_direct_publish_requires_latest_passing_validation(remote_api, remote_repository, operation):
+    client = remote_api.client
+    task = passing_task(client, remote_repository)
+    commit_passing_task(client, task)
+    approve(client, task, "push")
+    if operation == "pr":
+        post(client, f"/api/v1/tasks/{task['id']}/push", {"remote": "origin"})
+        approve(client, task, "pr")
+    before = len(remote_api.provider.pushes)
+    (remote_repository / "test_new.py").write_text("def test_new():\n    assert False\n", encoding="utf-8")
+    result = post(client, f"/api/v1/runs/{task['run_id']}/tests", {"kind": "pytest", "target": "test_new.py"})
+    assert result["status"] == "failed"
+    path = "/push" if operation == "push" else "/pull-request"
+    payload = {"remote": "origin"} if operation == "push" else {"title": "Fix value", "body": "Reviewed", "draft": True}
+    response = client.post(f"/api/v1/tasks/{task['id']}" + path, json=payload)
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "PUBLISH_NOT_READY"
+    assert len(remote_api.provider.pushes) == before
+    assert not remote_api.provider.pull_requests
+
+
 def test_push_requires_approval_then_publishes_the_task_branch(remote_api, remote_repository):
     client = remote_api.client
     task = passing_task(client, remote_repository)

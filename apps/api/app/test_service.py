@@ -191,7 +191,7 @@ class TestService:
         finally:
             self.release(run_id)
 
-    def run_command(self, run_id: str, repository_id: str, argv: list[str], timeout_seconds: int = 120) -> TestRunResponse:
+    def run_command(self, run_id: str, repository_id: str, argv: list[str], timeout_seconds: int = 120, *, reserved: bool = False) -> TestRunResponse:
         """Run one allowlisted program for the drafting model, no shell, in the repository root.
 
         Shares the validation cancel path (cancel(run_id) also stops it) but not its reservation,
@@ -199,7 +199,8 @@ class TestService:
         """
         repository = self.repositories.get(repository_id)
         key = f"{run_id}{self.COMMAND_SUFFIX}"
-        self.reserve(key)
+        if not reserved:
+            self.reserve(key)
         started = time.perf_counter()
         details = {"workdir": ".", "target": None, "script": None}
         try:
@@ -212,6 +213,8 @@ class TestService:
                 executable, args = shutil.which(name), argv[1:]
             if not executable:
                 return self._result(key, "auto", argv, "not_found", started, stderr=f"{argv[0]} is not available on PATH.", **details)
+            if self._active[key].is_set():
+                return self._result(key, "auto", argv, "cancelled", started, **details)
             limit = min(timeout_seconds, self.settings.command_timeout_seconds)
             return self._execute(key, "auto", [executable, *args], argv, repository.path, self._active[key], limit, started, details)
         except RepositoryError as exc:
@@ -244,8 +247,6 @@ class TestService:
                     break
                 cancel.wait(0.05)
             process.wait()
-            if status == "passed" and process.returncode:
-                status = "blocked" if is_process_startup_failure(process.returncode) else "failed"
             stdout.seek(0)
             stderr.seek(0)
             out = stdout.read(self.OUTPUT_LIMIT + 1)
@@ -253,9 +254,49 @@ class TestService:
         result = self._result(run_id, kind, command, status, started, stdout=out[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), stderr=err[:self.OUTPUT_LIMIT].decode("utf-8", errors="replace"), **details)
         result.exit_code = process.returncode
         result.output_truncated = len(out) > self.OUTPUT_LIMIT or len(err) > self.OUTPUT_LIMIT
-        if status == "blocked":
-            result.stderr = (result.stderr + "\n" if result.stderr else "") + "The validation process could not be started by the API process. Restart the API from a normal shell."
+        if status == "passed" and process.returncode:
+            reason = self._blocked_reason(argv, process.returncode, result.stdout, result.stderr)
+            result.status = "blocked" if reason else "failed"
+            if reason:
+                result.stderr = (result.stderr + "\n" if result.stderr else "") + reason
         return result
+
+    @staticmethod
+    def _blocked_reason(argv: list[str], exit_code: int, stdout: str, stderr: str) -> str | None:
+        if is_process_startup_failure(exit_code):
+            return "The validation process could not be started by the API process. Restart the API from a normal shell."
+        program = Path(argv[0]).stem.lower()
+        pytest_command = program == "pytest" or (program.startswith("python") and argv[1:3] == ["-m", "pytest"])
+        collection = "Pytest could not complete collection or was interrupted. Check the reported code, dependencies, and test configuration before retrying."
+        if pytest_command and exit_code in {2, 3, 4, 5}:
+            return {
+                2: collection,
+                3: "Pytest stopped because of an internal error. Review its diagnostic before retrying validation.",
+                4: "Pytest rejected its configuration or command arguments. Review the validation setup before retrying.",
+                5: "Pytest did not collect any tests. Check the validation directory and test selection before retrying.",
+            }[exit_code]
+        package_command = program in {"npm", "pnpm", "yarn"}
+        if not pytest_command and not package_command:
+            return None
+        output = f"{stdout}\n{stderr}"
+        if re.search(r"(?m)^\s*(?:.+[/\\])?python(?:\d+(?:\.\d+)*)?(?:\.exe)?: No module named ['\"]?pytest['\"]?\s*$", output):
+            return "pytest is not installed in the selected Python environment. Install the project's test dependencies before retrying."
+        if package_command:
+            # ponytail: match explicit runner diagnostics only; arbitrary script exits and application imports remain failures.
+            if re.search(r"(?m)^[=\s]*Interrupted: \d+ errors? during collection[=\s]*$", output):
+                return collection
+            if re.search(r"(?m)^ERROR: usage: .*pytest", output):
+                return "Pytest rejected its configuration or command arguments. Review the validation setup before retrying."
+            if re.search(r"(?m)^INTERNALERROR>", output):
+                return "Pytest stopped because of an internal error. Review its diagnostic before retrying validation."
+            if re.search(r"(?m)^\s*No test(?: files|s) found, exiting with code [1-9]\d*\s*$|^[=\s]*no tests ran in \d+(?:\.\d+)?s[=\s]*$", output):
+                return "The test runner did not collect any tests. Check the validation directory and test selection before retrying."
+            if re.search(r"ERR_PNPM_(?:NO_IMPORTER_MANIFEST_FOUND|NO_SCRIPT)\b|(?m:^\s*npm (?:ERR!|error) Missing script:)", output):
+                return "The package configuration does not provide the selected validation command. Review package.json and the validation setup before retrying."
+            runners = r"(?:vitest|jest|mocha|eslint|tsc|vite|tsx|pytest|node|python3?)"
+            if re.search(rf"(?m)^(?:(?:/bin/)?(?:ba)?sh: (?:\d+: )?{runners}: (?:not found|command not found)|'{runners}' is not recognized as an internal or external command,?)\s*$", output):
+                return "The test runner or package dependencies are unavailable. Check the reported command and install the project's validation dependencies before retrying."
+        return None
 
     @staticmethod
     def _stop(process: subprocess.Popen) -> None:

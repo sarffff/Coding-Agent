@@ -196,7 +196,7 @@ def test_draft_prioritizes_goal_paths_and_bounds_safe_complete_context(model_api
     (directory / "large.py").write_text("# " + "a" * 1_200, encoding="utf-8")
     monkeypatch.setattr(main.settings, "llm_max_context_files", 2)
     monkeypatch.setattr(main.settings, "llm_max_context_bytes", 1_000)
-    FakeModelProvider.seed([PatchFile(path="app.py", content="def value():\n    return 2\n")])
+    FakeModelProvider.seed([PatchFile(path="src/feature.py", content=content.replace("return 1", "return 2"))])
     post(client, f"/api/v1/runs/{task['run_id']}/patches/draft", {
         "feedback": "Fix src/feature.py", "context_paths": [".env", "missing.py", "large.py"],
     })
@@ -272,19 +272,28 @@ def test_draft_normalizes_paths_and_replaces_the_models_hash(model_api, path):
 
 
 @pytest.mark.parametrize("operation", ["update", "delete"])
-def test_draft_rejects_changes_to_existing_files_outside_its_context(model_api, monkeypatch, operation):
+def test_draft_reads_existing_files_before_guarded_preview(model_api, monkeypatch, operation):
     from app import main
 
     client, directory = model_api
     task = create_task(client, directory)
     original = (directory / "test_app.py").read_bytes()
     monkeypatch.setattr(main.settings, "llm_max_context_files", 1)
-    FakeModelProvider.seed([PatchFile(path="test_app.py", operation=operation, content="def test_value():\n    pass\n")])
+    files = [PatchFile(path="test_app.py", operation=operation, content="def test_value():\n    pass\n")]
+    FakeModelProvider.seed(files)
+    FakeModelProvider.seed(files)
     response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={"context_paths": ["app.py"]})
-    assert response.status_code == 400
-    assert response.json()["code"] == "MODEL_CONTEXT_REQUIRED"
-    assert "test_app.py" not in dict(FakeModelProvider._calls[-1][1])
+    assert response.status_code == 200, response.text
+    assert len(FakeModelProvider._calls) == 2
+    assert "test_app.py" not in dict(FakeModelProvider._calls[0][1])
+    assert dict(FakeModelProvider._calls[1][1])["test_app.py"] == original.decode("utf-8")
+    assert "MODEL_CONTEXT_REQUIRED" in FakeModelProvider._calls[1][0]
+    preview = response.json()
+    assert preview["requires_validation_confirmation"] is True
+    assert preview["validation_changes"] == ["test_app.py"]
     assert (directory / "test_app.py").read_bytes() == original
+    assert client.get(f"/api/v1/runs/{task['run_id']}/checkpoints").json()["total"] == 0
+    assert client.get(f"/api/v1/tasks/{task['id']}/budget").json()["consecutive_failures"] == 0
 
 
 def test_draft_can_create_a_file_without_an_existing_context_baseline(model_api):

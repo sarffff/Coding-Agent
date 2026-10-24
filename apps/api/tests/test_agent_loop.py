@@ -3,7 +3,7 @@ import time
 from threading import Event
 
 import pytest
-from conftest import build_settings, mount_services
+from conftest import build_settings, git_output, mount_services
 from fastapi.testclient import TestClient
 from test_api_workflow import create_task, post
 
@@ -104,12 +104,14 @@ SLOW_TEST = "import time\nfrom pathlib import Path\n\ndef test_slow():\n    Path
 
 def test_agent_loop_reports_running_and_can_be_stopped(model_api):
     client, directory = model_api
-    task = create_task(client, directory)  # repo+task+branch+plan+iteration while the worktree is still clean
     (directory / "test_app.py").write_text(SLOW_TEST, encoding="utf-8")
+    git_output(directory, "add", "test_app.py")
+    git_output(directory, "commit", "-qm", "Prepare slow validation fixture")
+    task = create_task(client, directory)  # repo+task+branch+plan+iteration while the worktree is still clean
     FakeModelProvider.seed([PatchFile(path="app.py", content="def value():\n    return 2\n")])
 
     post(client, f"/api/v1/runs/{task['run_id']}/loop", {})
-    _wait_for_file(directory / ".loop-test-started")  # loop reached run_tests and the slow test is executing
+    _wait_for_file(directory / ".loop-test-started")  # loop is executing the slow validation
 
     assert client.get(f"/api/v1/tasks/{task['id']}/agent").json()["loop_running"] is True
     second = client.post(f"/api/v1/runs/{task['run_id']}/loop", json={})

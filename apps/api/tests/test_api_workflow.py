@@ -146,9 +146,11 @@ def test_patch_cannot_cross_run_boundary(api_client, demo_repository):
 def test_running_validation_can_be_cancelled(api_client, demo_repository):
     import time
     from concurrent.futures import ThreadPoolExecutor
+    (demo_repository / "test_app.py").write_text("import time\nfrom pathlib import Path\n\ndef test_slow():\n    Path('.test-started').write_text('started')\n    time.sleep(20)\n", encoding="utf-8")
+    git_output(demo_repository, "add", "test_app.py")
+    git_output(demo_repository, "commit", "-qm", "Prepare slow validation fixture")
     task = create_task(api_client, demo_repository)
     apply_value(api_client, task, 2)
-    (demo_repository / "test_app.py").write_text("import time\nfrom pathlib import Path\n\ndef test_slow():\n    Path('.test-started').write_text('started')\n    time.sleep(20)\n", encoding="utf-8")
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(api_client.post, f"/api/v1/runs/{task['run_id']}/tests", json={"kind": "pytest", "timeout_seconds": 15})
         deadline = time.monotonic() + 10

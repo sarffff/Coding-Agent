@@ -53,7 +53,7 @@ def build_services(settings: Settings | None = None) -> Services:
     approval_service = ApprovalService(store)
     test_service = TestService(repository_service, settings)
     remote_service = RemoteService(
-        repository_service, task_service, git_service, approval_service, audit_service, settings, store
+        repository_service, task_service, git_service, approval_service, audit_service, settings, store, test_service
     )
     patch_service = PatchService(repository_service, settings, store)
     model_provider = build_model_provider(settings)

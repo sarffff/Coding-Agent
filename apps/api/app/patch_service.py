@@ -219,7 +219,7 @@ class PatchService:
             requires_delete_confirmation=requires_delete_confirmation,
         )
 
-    def apply(self, patch_id: str, confirm: bool = False) -> PatchApplyResponse:
+    def apply(self, patch_id: str, confirm: bool = False, *, prune: bool = True) -> PatchApplyResponse:
         patch = self._patches.get(patch_id)
         if patch is None:
             raise RepositoryError("PATCH_NOT_FOUND", "Patch preview was not found or has expired.")
@@ -246,7 +246,8 @@ class PatchService:
         except OSError as exc:
             self._restore_checkpoint(checkpoint)
             raise RepositoryError("PATCH_APPLY_FAILED", "Patch application failed and was rolled back.") from exc
-        self._prune(checkpoint.summary.run_id)
+        if prune:
+            self._prune(checkpoint.summary.run_id)
         return PatchApplyResponse(
             patch_id=patch.id,
             checkpoint=checkpoint.summary,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from conftest import git_output
 
 from app.models import TestRunResponse as ValidationResult
 
@@ -248,16 +249,18 @@ def test_agent_running_validation_is_not_repeated_and_can_be_paused(api_client, 
     import time
     from concurrent.futures import ThreadPoolExecutor
 
-    task = create_agent_task(api_client, demo_repository)
-    approve_plan(api_client, task)
-    create_branch(api_client, task)
-    start_agent_iteration(api_client, task)
-    apply_value(api_client, task, 2)
     (demo_repository / "test_app.py").write_text(
         "import time\nfrom pathlib import Path\n\ndef test_slow():\n"
         "    Path('.test-started').write_text('started')\n    time.sleep(20)\n",
         encoding="utf-8",
     )
+    git_output(demo_repository, "add", "test_app.py")
+    git_output(demo_repository, "commit", "-qm", "Prepare slow validation fixture")
+    task = create_agent_task(api_client, demo_repository)
+    approve_plan(api_client, task)
+    create_branch(api_client, task)
+    start_agent_iteration(api_client, task)
+    apply_value(api_client, task, 2)
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(
             agent_advance,

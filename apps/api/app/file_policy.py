@@ -3,7 +3,7 @@ from pathlib import Path
 
 IGNORED_DIRECTORIES = {
     ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".next",
-    ".turbo", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".forge",
+    ".turbo", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".forge", ".tmp",
 }
 SENSITIVE_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials", "credentials.json"}
 

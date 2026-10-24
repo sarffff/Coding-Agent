@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import re
+import sys
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -37,6 +42,8 @@ from .remote_service import RemoteService
 from .repository_service import RepositoryError
 from .task_service import TaskService, TaskStateError
 from .test_service import TestService
+from .workspace import WorkspaceReservations
+from .validation_guard import validation_guard_changes
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,13 +107,143 @@ class AgentService:
         self.remote = remote
         self.patch = patch
         self.models = models
+        self.workspaces = WorkspaceReservations()
+        self._workspace_owner: ContextVar[tuple[str, object] | None] = ContextVar("workspace_owner", default=None)
+        self._model_calls: dict[str, set[asyncio.Task]] = {}
+
+    @contextmanager
+    def workspace_operation(self, task_id: str):
+        task = self.tasks.get(task_id)
+        if not task.repository_id:
+            yield
+            return
+        repository = self.tasks.repositories.get(task.repository_id)
+        current = self._workspace_owner.get()
+        owner = current[1] if current and current[0] == task_id else None
+        owner = self.workspaces.acquire(repository.path, task_id, owner)
+        token = self._workspace_owner.set((task_id, owner))
+        try:
+            yield
+        finally:
+            self._workspace_owner.reset(token)
+            self.workspaces.release(owner)
+
+    def assert_workspace_available(self, task_id: str) -> None:
+        with self.workspace_operation(task_id):
+            pass
+
+    def validation_changes(self, task_id: str, files=None) -> list[str]:
+        task = self.tasks.get(task_id)
+        captured = self.tasks.prepare_validation_guard(task_id)
+        return validation_guard_changes(self.tasks.repositories.get(task.repository_id), captured, files)
+
+    def assert_validation_unchanged(self, task_id: str) -> None:
+        changes = self.validation_changes(task_id)
+        if changes:
+            message = "Verification files changed; review and explicitly confirm them in a patch preview before continuing."
+            self.tasks.block_agent(task_id, "VALIDATION_REVIEW_REQUIRED", message)
+            raise RepositoryError("VALIDATION_REVIEW_REQUIRED", message, {"paths": changes})
+
+    def annotate_validation_preview(self, task_id: str, preview):
+        files = self.patch._patches[preview.patch_id].files
+        changes = self.validation_changes(task_id, files)
+        return preview.model_copy(update={"requires_validation_confirmation": bool(changes), "validation_changes": changes})
+
+    async def _ensure_validation_baseline(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        self.assert_validation_unchanged(task_id)
+        if self.tasks.validation_baseline_hash(task_id):
+            return
+        iterations = self.tasks.list_iterations(task_id)
+        if any(item.patch_id for item in iterations):
+            # Earlier/manual edits cannot be relabelled as a pre-change baseline.
+            return
+        before = self.tests.input_hash(task.repository_id)
+        requests = [TestRunRequest(**check.model_dump(exclude={"id", "label"}), check_id=check.id)
+                    for check in task.validation_checks] or [TestRunRequest(timeout_seconds=30)]
+        results = []
+        for request in requests:
+            self.tasks.assert_recovered(task_id)
+            self.tasks.assert_budget_available(task_id)
+            if self.tasks.get(task_id).status in {"paused", "cancelled"}:
+                raise RepositoryError("INVALID_TASK_STATE", "Baseline validation was stopped.")
+            self.tests.reserve(task.run_id)
+            checked = await self._wait_for_validation(task, request)
+            checked.check_id = request.check_id
+            checked.workdir, checked.target, checked.script = request.workdir, request.target, request.script
+            if checked.kind == "auto":
+                if "pytest" in checked.command and "-m" in checked.command:
+                    checked.kind = "pytest"
+                elif "test" in checked.command and any(name in checked.command[0].lower() for name in ("npm", "pnpm", "yarn")):
+                    checked.kind = "frontend"
+            results.append(checked)
+            self.tasks.record_validation_baseline(task_id, results, None)
+            self.audit.record("tests.baseline", "succeeded" if checked.status == "passed" else "failed",
+                              f"Pre-change validation {checked.status}", task_id=task_id, run_id=task.run_id,
+                              details={"test_id": checked.id, "status": checked.status, "check_id": checked.check_id,
+                                       "failed_tests": [item.model_dump() for item in checked.failed_tests]})
+            empty_project = (not task.validation_checks and checked.status == "not_found" and not checked.command
+                             and checked.stderr == "No supported validation command was detected.")
+            if checked.status not in {"passed", "failed"} and not empty_project:
+                message = f"Pre-change validation is {checked.status}; resolve it before drafting. {checked.stderr[-1_000:]}"
+                self.tasks.block_agent(task_id, "VALIDATION_BASELINE_BLOCKED", message)
+                raise RepositoryError("VALIDATION_BASELINE_BLOCKED", message)
+        self.assert_validation_unchanged(task_id)
+        if before != self.tests.input_hash(task.repository_id):
+            message = "Files changed during baseline validation; rerun it before drafting."
+            self.tasks.block_agent(task_id, "VALIDATION_BASELINE_BLOCKED", message)
+            raise RepositoryError("VALIDATION_BASELINE_BLOCKED", message)
+        for checked in results:
+            checked.validation_hash = before
+        self.tasks.record_validation_baseline(task_id, results, before)
+        self.tasks.clear_agent_block(task_id)
+
+    async def _wait_for_validation(self, task: TaskSummary, request: TestRunRequest) -> TestRunResponse:
+        options = {"workdir": request.workdir, "script": request.script} if request.workdir != "." or request.script else {}
+        worker = asyncio.create_task(run_in_threadpool(self.tests.run, task.run_id, task.repository_id, request.kind,
+                                                       request.timeout_seconds, request.target, **options))
+        return await self._wait_for_worker(task, worker, task.run_id)
+
+    async def _wait_for_worker(self, task: TaskSummary, worker: asyncio.Task, reservation_id: str) -> TestRunResponse:
+        cancelled = False
+        try:
+            # Keep the workspace lease until the thread stops, even after repeated cancellation.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    self.tests.cancel(task.run_id)
+            result = worker.result()
+            if not isinstance(result, TestRunResponse):
+                raise RepositoryError("VALIDATION_RESULT_UNAVAILABLE", "The validation runner returned no valid result.")
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+        finally:
+            self.tests.release(reservation_id)
+
+    @staticmethod
+    def _failure_labels(result: TestRunResponse) -> set[str]:
+        return {f"{item.path or ''}::{item.test_name or item.message[:200]}" for item in result.failed_tests}
+
+    def _baseline_comparison(self, task_id: str, result: TestRunResponse) -> dict[str, list[str]]:
+        if result.status not in {"passed", "failed"} or (result.status == "failed" and not result.failed_tests):
+            return {}
+        baseline = next((item for item in self.tasks.validation_baseline(task_id)
+                         if item.kind == result.kind and (item.check_id, item.workdir, item.target, item.script) ==
+                         (result.check_id, result.workdir, result.target, result.script)), None)
+        if baseline is None:
+            return {}
+        original, current = self._failure_labels(baseline), self._failure_labels(result)
+        return {"existing": sorted(original & current), "introduced": sorted(current - original), "resolved": sorted(original - current)}
 
     def set_model_provider(self, provider: ModelProvider) -> None:
         """Swap the provider after a settings change; the object is built from Settings once at startup."""
         self.models = provider
 
     def validation_hash(self, task: TaskSummary) -> str:
-        if task.validation_checks:
+        if task.validation_checks or task.completion_criteria:
             # Required checks validate all readable inputs; committing the same bytes keeps the evidence valid.
             return self.tests.input_hash(task.repository_id)
         return self.git.validation_hash(task.repository_id, self.tasks.changed_files(task.id))
@@ -118,6 +255,7 @@ class AgentService:
         decision = self._decide(task, iteration)
         scope = plan_scope_hash(task) if decision.approval_type == "plan" else None
         approval = self._latest_approval(task_id, decision.approval_type, scope)
+        completion_hash = self.validation_hash(task) if task.completion_criteria and task.repository_id else None
         return AgentStateResponse(
             task=task,
             action=decision.action,
@@ -130,9 +268,25 @@ class AgentService:
             last_test=iteration.test_result if iteration else None,
             loop_running=self._loop_running(task_id),
             validation_status=self.tasks.validation_status(task_id, self.validation_hash(task)) if task.validation_checks and task.repository_id else [],
+            completion_status=self.tasks.completion_status(task_id, completion_hash),
+            completion_scope_hash=plan_scope_hash(task) if task.completion_criteria else None,
+            completion_validation_hash=completion_hash,
+            can_confirm_completion=bool(task.completion_criteria and iteration and not iteration.rolled_back
+                and iteration.test_result and iteration.test_result.status == "passed"
+                and iteration.test_result.validation_hash == completion_hash
+                and self.tasks.validation_passed(task_id, completion_hash)
+                and task.status == "ready_for_pr" and not task.requires_recovery and not task.agent_blocked_reason
+                and not self._loop_running(task_id) and not self.tests.is_running(task.run_id)),
         )
 
     async def advance(self, task_id: str, request: AgentAdvanceRequest) -> AgentAdvanceResponse:
+        state = self.inspect(task_id)
+        if request.action == "auto" and not state.can_advance:
+            return AgentAdvanceResponse(**state.model_dump(), performed_action="noop")
+        with self.workspace_operation(task_id):
+            return await self._advance(task_id, request)
+
+    async def _advance(self, task_id: str, request: AgentAdvanceRequest) -> AgentAdvanceResponse:
         state = self.inspect(task_id)
         if request.action == "auto" and not state.can_advance:
             return AgentAdvanceResponse(**state.model_dump(), performed_action="noop")
@@ -186,15 +340,31 @@ class AgentService:
         task = self.tasks.get_by_run(run_id)
         if task.track == "cowork":
             raise RepositoryError("COWORK_NO_LOOP", "Cowork conversations are chat-only; they do not run the coding loop.", {"task_id": task.id})
+        if not task.repository_id:
+            raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Connect a folder before starting the coding loop.")
         self.tasks.assert_recovered(task.id)
         if self._loop_running(task.id):
             raise RepositoryError("LOOP_ALREADY_RUNNING", "An agent loop is already running for this task.", {"task_id": task.id})
-        if request.mode is not None:
-            self.tasks.set_mode(task.id, request.mode)  # first start sets the posture; resumes (mode=None) keep it
-        stop = asyncio.Event()
-        loop_task = asyncio.create_task(self._run_loop(task.id, task.run_id, request.feedback, stop))
-        _ACTIVE_LOOPS[task.id] = _LoopState(task=loop_task, stop=stop)
-        loop_task.add_done_callback(lambda _done, tid=task.id: _ACTIVE_LOOPS.pop(tid, None))
+        self.tasks.clear_agent_block(task.id)
+        repository = self.tasks.repositories.get(task.repository_id)
+        owner = self.workspaces.acquire(repository.path, task.id)
+        try:
+            if request.mode is not None:
+                self.tasks.set_mode(task.id, request.mode)  # resumes (mode=None) keep the posture
+            stop = asyncio.Event()
+            loop_task = asyncio.create_task(self._run_loop(task.id, task.run_id, request.feedback, stop, owner))
+        except BaseException:
+            self.workspaces.release(owner)
+            raise
+        state = _LoopState(task=loop_task, stop=stop)
+        _ACTIVE_LOOPS[task.id] = state
+
+        def finished(_done):
+            if _ACTIVE_LOOPS.get(task.id) is state:
+                _ACTIVE_LOOPS.pop(task.id)
+            self.workspaces.release(owner)
+
+        loop_task.add_done_callback(finished)
         self.audit.record("agent.loop", "started", "Agent loop started", task_id=task.id, run_id=task.run_id, details={"source": "chat", "mode": self.tasks.get(task.id).mode})
         return self.inspect(task.id)
 
@@ -205,10 +375,13 @@ class AgentService:
             state.stop.set()
             if state.draft and not state.draft.done():
                 state.draft.cancel()
-            self.tests.cancel(task.run_id)  # interrupt any in-flight validation so the loop can break promptly
+        for call in tuple(self._model_calls.get(task.id, ())):
+            call.cancel()
+        self.tests.cancel(task.run_id)
         return self.inspect(task.id)
 
-    async def _run_loop(self, task_id: str, run_id: str, feedback: str | None, stop: asyncio.Event) -> None:
+    async def _run_loop(self, task_id: str, run_id: str, feedback: str | None, stop: asyncio.Event, owner: object) -> None:
+        token = self._workspace_owner.set((task_id, owner))
         outcome, detail = "succeeded", "Agent loop finished"
         try:
             for _ in range(_LOOP_MAX_STEPS):
@@ -257,9 +430,12 @@ class AgentService:
                 outcome, detail = "failed", "Agent loop reached its step limit"
         except RepositoryError as exc:
             outcome, detail = "failed", f"Agent loop stopped: {exc.message}"
+            self.tasks.block_agent(task_id, exc.code, exc.message, exc.details)
         except Exception:  # never let a background loop die silently and leave loop_running stuck
             outcome, detail = "failed", "Agent loop stopped on an unexpected error"
+            self.tasks.block_agent(task_id, "AGENT_EXECUTION_FAILED", detail)
         finally:
+            self._workspace_owner.reset(token)
             status = self.tasks.get(task_id).status
             self.audit.record("agent.loop", outcome, detail, task_id=task_id, run_id=run_id, details={"status": status})
 
@@ -277,6 +453,8 @@ class AgentService:
             return AgentDecision("recover", "Confirm recovery before continuing this task.")
         if task.status == "paused":
             return AgentDecision("paused", "Resume the task after reviewing the latest checkpoint.")
+        if task.agent_blocked_reason:
+            return AgentDecision("manual_review", task.next_action or task.error or "Review the blocked coding operation.")
         if self.tests.is_running(task.run_id):
             return AgentDecision("wait_for_tests", "Wait for validation to finish; pause or cancel to stop it.")
         if task.status == "pr_created":
@@ -330,7 +508,19 @@ class AgentService:
             current_hash = self.validation_hash(task)
             if current_hash != result.validation_hash:
                 return AgentDecision("run_tests", "Task files changed after the failure. Rerun tests before creating a repair iteration.", can_advance=True)
+            recent = [item.test_result for item in self.tasks.list_iterations(task.id)[-2:] if not item.rolled_back]
+            if len(recent) == 2 and all(item and item.status == "failed" and item.validation_hash == current_hash for item in recent):
+                if self._failure_labels(recent[0]) == self._failure_labels(recent[1]) and recent[0].stderr == recent[1].stderr:
+                    return AgentDecision("manual_review", "The same code and failure repeated without progress. Review the attempts and supply new evidence before repairing again.")
             return AgentDecision("start_repair", "Start a repair iteration using the latest test failure.", can_advance=True)
+
+        if task.completion_criteria:
+            current_hash = self.validation_hash(task)
+            result = iteration.test_result
+            if not result or result.status != "passed" or result.validation_hash != current_hash or not self.tasks.validation_passed(task.id, current_hash):
+                return AgentDecision("run_tests", "Run all validation checks for the current files before confirming completion.", can_advance=True)
+            if self.tasks.completion_status(task.id, current_hash) != "confirmed":
+                return AgentDecision("review_completion", "Review each original completion condition and record its evidence before committing or publishing.")
 
         # A commit changes HEAD, so its persisted record supersedes the pre-commit validation hash.
         if has_git:
@@ -357,12 +547,17 @@ class AgentService:
         return AgentDecision("review_commit", "Preview the commit and approve its exact scope in the Git panel.", requires_approval=True, approval_type="write")
 
     async def run_tests(self, run_id: str, request: TestRunRequest) -> TestRunResponse:
+        with self.workspace_operation(self.tasks.get_by_run(run_id).id):
+            return await self._run_tests(run_id, request)
+
+    async def _run_tests(self, run_id: str, request: TestRunRequest) -> TestRunResponse:
         """Shared validation path for the manual test API and Agent advancement."""
         task = self.tasks.get_by_run(run_id)
         self.tasks.assert_recovered(task.id)
         self.tasks.assert_budget_available(task.id)
         if not task.repository_id:
             raise RepositoryError("TASK_REPOSITORY_REQUIRED", "Task must be connected to a repository before running tests.")
+        self.assert_validation_unchanged(task.id)
         before = self.validation_hash(task)
         check = None
         if request.check_id:
@@ -374,14 +569,17 @@ class AgentService:
             check = next((item.check for item in statuses if item.status != "passed"), task.validation_checks[0])
         if check:
             request = TestRunRequest(**check.model_dump(exclude={"id", "label"}), check_id=check.id)
+        if request.kind == "auto":
+            runner = self.tasks.validation_runner(task.id, request)
+            if runner:
+                request = request.model_copy(update={"kind": runner})
         self.tests.reserve(run_id)
         try:
             self.tasks.begin_test_run(run_id)
         except Exception:
             self.tests.release(run_id)
             raise
-        options = {"workdir": request.workdir, "script": request.script} if request.workdir != "." or request.script else {}
-        result = await run_in_threadpool(self.tests.run, run_id, task.repository_id, request.kind, request.timeout_seconds, request.target, **options)
+        result = await self._wait_for_validation(task, request)
         result.check_id = check.id if check else None
         result.workdir, result.target, result.script = request.workdir, request.target, request.script
         try:
@@ -393,15 +591,47 @@ class AgentService:
         elif result.status == "passed":
             result.status = "failed"
             result.stderr += "\nTask files changed during testing. Run validation again."
+        try:
+            self.assert_validation_unchanged(task.id)
+        except RepositoryError as exc:
+            result.status, result.validation_hash = "blocked", None
+            result.stderr += "\n" + exc.message
+            self.tasks.record_test_result(run_id, result)
+            self.tasks.block_agent(task.id, exc.code, exc.message)
+            raise
+        result.baseline_comparison = self._baseline_comparison(task.id, result)
+        self.tasks.clear_agent_block(task.id)
         self.tasks.record_test_result(run_id, result)
         self.audit.record("tests.run", "succeeded" if result.status == "passed" else "failed", f"Test run {result.status}", task_id=task.id, run_id=run_id,
                           details={"test_id": result.id, "kind": result.kind, "command": result.command, "exit_code": result.exit_code,
                                    "check_id": result.check_id, "workdir": result.workdir,
-                                   "failed_tests": [failure.model_dump() for failure in result.failed_tests]})
+                                   "failed_tests": [failure.model_dump() for failure in result.failed_tests],
+                                   "baseline_comparison": result.baseline_comparison})
         return result
 
     async def draft_patch(self, run_id: str, request: DraftPatchRequest) -> DraftPatchResponse:
-        """Draft whole-file edits with the model, then preview them through the SAME gate a hand-typed patch uses.
+        with self.workspace_operation(self.tasks.get_by_run(run_id).id):
+            task = self.tasks.get_by_run(run_id)
+            self.tasks.assert_patch_allowed(run_id)
+            try:
+                review_id = self.tasks.validation_review_patch_id(task.id)
+                pending = self.patch._patches.get(review_id)
+                if pending and pending.run_id == run_id and not request.feedback and not request.context_paths:
+                    preview = self.patch.preview(task.repository_id, pending.files, run_id=run_id)
+                    self.tasks.block_agent(task.id, "VALIDATION_REVIEW_REQUIRED", task.error or "Review changes to verification files.",
+                                           {"patch_id": preview.patch_id})
+                    preview = self.annotate_validation_preview(task.id, preview)
+                    return DraftPatchResponse(**preview.model_dump(), rationale="Review the existing draft changes to verification files.")
+                self.tasks.clear_agent_block(task.id)
+                await self._ensure_validation_baseline(task.id)
+                preview = await self._draft_patch(run_id, request)
+                return self.annotate_validation_preview(task.id, preview)
+            except RepositoryError as exc:
+                self.tasks.block_agent(task.id, exc.code, exc.message, exc.details)
+                raise
+
+    async def _draft_patch(self, run_id: str, request: DraftPatchRequest) -> DraftPatchResponse:
+        """Draft edits with the model, then preview them through the SAME gate a hand-typed patch uses.
 
         The model never writes to disk: its output flows into patch.preview (protected-path,
         size and binary checks) and the user still reviews the diff and confirms apply.
@@ -416,16 +646,79 @@ class AgentService:
         failed_iteration = next((item for item in reversed(iterations) if not item.rolled_back and item.test_result and item.test_result.status == "failed"), None)
         failed_test = failed_iteration.test_result if failed_iteration else None
         failure = "\n".join(part for part in (failed_iteration.failure_summary, failed_test.stdout, failed_test.stderr) if part)[:12_000] if failed_iteration else None
-        goal = request.feedback or iteration.goal
-        context_files = self._gather_context(task.repository_id, request.context_paths, task.id, goal, failed_test)
-        repository = self.tasks.repositories.get(task.repository_id)
+        started = time.perf_counter()
+        goal = task.goal
+        if task.completion_criteria:
+            goal += "\n\n# Completion criteria\n" + "\n".join(f"{item.id}: {item.text}" for item in task.completion_criteria)
+            goal += "\nDo not weaken verification to satisfy these criteria; preserve required tests and checks."
+        if iteration.goal != task.goal:
+            goal += f"\n\n# Iteration goal\n{iteration.goal}"
+        if request.feedback:
+            goal += f"\n\n# Draft feedback\n{request.feedback}"
+        context_goal = "\n".join(part for part in (task.goal, iteration.goal if iteration.goal != task.goal else None, request.feedback) if part)
+        baseline = self.tasks.validation_baseline(task.id)
+        if baseline:
+            notes = [f"{item.check_id or item.kind}: {item.status}; failures=" +
+                     (", ".join(sorted(self._failure_labels(item)))[:1_000] or "none") for item in baseline]
+            goal += "\n\n# Pre-change validation baseline\n" + "\n".join(notes)[:3_000]
+            goal += "\nThese results predate your edits. Keep repairs within the original goal; do not weaken verification to pass."
+            if failed_test is None:
+                failed_test = next((item for item in baseline if item.status == "failed"), None)
+                if failed_test:
+                    failure = (failed_test.stdout + "\n" + failed_test.stderr)[:12_000]
+        if failed_iteration and failed_iteration.test_result.baseline_comparison:
+            goal += "\n\n# Failure comparison\n" + str(failed_iteration.test_result.baseline_comparison)[:2_000]
+        recent = [item for item in iterations if not item.rolled_back and (item.changed_files or item.test_result or item.test_runs)][-3:]
+        if recent:
+            attempts = []
+            for item in recent:
+                paths = ", ".join(item.changed_files)[:300] or "none"
+                result = item.test_result.status if item.test_result else item.status
+                summary = " ".join((item.failure_summary or "").split())[:600]
+                attempts.append(f"Iteration {item.number}: files={paths}; validation={result}; failure={summary or 'none'}"[:999])
+            goal += "\n\n# Recent attempts\n" + "\n".join(attempts)[:3_000]
+        context_files = self._gather_context(task.repository_id, request.context_paths, task.id, context_goal, failed_test)
+        context_history = {}
+        context_hashes = {path: self.patch._content_hash(content) for path, content in context_files}
+        prompt_goal = goal
         rounds = 0
+        seen = set()
+        feedback_errors = _FEEDBACK_ERRORS | {"DUPLICATE_PATCH_PATH", "FILE_ALREADY_EXISTS", "PATCH_CONTENT_REQUIRED", "MODEL_NO_CHANGE"}
         while True:
+            model_name = self.models.settings.llm_model
+            context_key = tuple(sorted((path, self.patch._content_hash(content)) for path, content in context_files))
+            proposal = None
             try:
-                proposal = await self._propose(task, goal, context_files, failure)
+                proposal = await self._propose(task, prompt_goal, context_files, failure)
+                if proposal.context_requests:
+                    key = (context_key, "context", tuple(repr(item.model_dump(exclude_none=True)) for item in proposal.context_requests))
+                    if key in seen:
+                        self.tasks.record_remote_result(task.id, False)
+                        raise RepositoryError("AGENT_NO_PROGRESS", "The model repeated the same context request without new evidence. Add relevant context or revise the task.",
+                                              {"requests": [item.model_dump(exclude_none=True) for item in proposal.context_requests]})
+                    seen.add(key)
+                    if rounds >= self.CONTEXT_ROUNDS:
+                        self.tasks.record_remote_result(task.id, False)
+                        raise RepositoryError(
+                            "MODEL_CONTEXT_LIMIT",
+                            "The model kept requesting context without proposing edits. Narrow the goal or add the files to context_paths.",
+                            {"requests": [item.model_dump(exclude_none=True) for item in proposal.context_requests]},
+                        )
+                    rounds += 1
+                    prompt_goal, context_files = await self._resolve_context_requests(task, goal, context_files, proposal.context_requests, context_history, context_hashes)
+                    continue
+                preview = self._preview_draft(task, run_id, proposal, context_files)
+                break
             except RepositoryError as exc:
-                if exc.code not in _FEEDBACK_ERRORS:
+                if exc.code not in feedback_errors:
                     raise
+                reply = tuple((PurePosixPath(item.path.replace("\\", "/")).as_posix(), item.operation, self.patch._content_hash(item.content)) for item in proposal.files) if proposal else (exc.message, repr(exc.details))
+                key = (context_key, "reply", exc.code, reply)
+                if key in seen:
+                    self.tasks.record_remote_result(task.id, False)
+                    raise RepositoryError("AGENT_NO_PROGRESS", "The model repeated an invalid proposal without new evidence. Review the error and revise the task or context.",
+                                          {"error": exc.code, "context_paths": [path for path, _ in context_files]}) from exc
+                seen.add(key)
                 if rounds >= self.CONTEXT_ROUNDS:
                     self.tasks.record_remote_result(task.id, False)  # retries exhausted: now it counts
                     raise
@@ -433,42 +726,54 @@ class AgentService:
                 self.audit.record("patch.draft.retry", "failed", f"Model reply rejected: {exc.code}", task_id=task.id, run_id=task.run_id,
                                   details={"error": exc.code, **exc.details})
                 goal = f"{goal}\n\n# Previous reply rejected\n{exc.code}: {exc.message} Fix this and reply again."
-                missing = exc.details.get("path") if exc.code == "MODEL_CONTEXT_REQUIRED" else None
+                prompt_goal = self._context_prompt(goal, context_history)
+                missing = exc.details.get("path") if exc.code in {"MODEL_CONTEXT_REQUIRED", "FILE_ALREADY_EXISTS"} else None
                 if isinstance(missing, str):  # read the file it wanted to edit instead of making it ask
-                    goal, context_files = await self._resolve_context_requests(task, goal, context_files, [ContextRequest(action="read", path=missing)])
-                continue
-            if not proposal.context_requests:
-                break
-            # Bounded on purpose: a model that keeps asking for context must stop, not loop.
-            if rounds >= self.CONTEXT_ROUNDS:
-                raise RepositoryError(
-                    "MODEL_CONTEXT_LIMIT",
-                    "The model kept requesting context without proposing edits. Narrow the goal or add the files to context_paths.",
-                    {"requests": [item.model_dump(exclude_none=True) for item in proposal.context_requests]},
-                )
-            rounds += 1
-            goal, context_files = await self._resolve_context_requests(task, goal, context_files, proposal.context_requests)
-        # Edits are applied against the content the model actually saw, so hashes come from the final context.
-        baselines = {repository.path / path: self.patch._content_hash(content) for path, content in context_files}
-        files = []
-        for proposed in proposal.files:
-            target = self.tasks.repositories._safe_repo_path(repository, proposed.path.replace("\\", "/"))
-            baseline = baselines.get(target)
-            if baseline is None and proposed.operation != "create":
-                raise RepositoryError("MODEL_CONTEXT_REQUIRED", "Include the file in context_paths and draft again before modifying it.", {"path": proposed.path})
-            files.append(proposed.model_copy(update={
-                "path": target.relative_to(repository.path).as_posix(),
-                "expected_hash": baseline if baseline is not None else self.patch._content_hash(None),
-            }))
-        preview = self.patch.preview(task.repository_id, files, run_id=run_id)
+                    prompt_goal, context_files = await self._resolve_context_requests(task, goal, context_files, [ContextRequest(action="read", path=missing)], context_history, context_hashes)
         self.audit.record(
             "patch.draft", "succeeded", f"Model drafted a patch for {len(preview.files)} file(s)",
             task_id=task.id, run_id=run_id,
             # rationale persisted here (capped) so a chat transcript can show the model's reasoning after the fact.
-            details={"patch_id": preview.patch_id, "files": preview.files, "model": self.models.settings.llm_model,
+            details={"patch_id": preview.patch_id, "files": preview.files, "model": model_name,
+                     "context_paths": [path for path, _ in context_files],
+                     "context_bytes": sum(len(content.encode("utf-8")) for _, content in context_files),
+                     "duration_ms": round((time.perf_counter() - started) * 1_000),
                      "rationale": proposal.rationale[:2_000]},
         )
         return DraftPatchResponse(**preview.model_dump(), rationale=proposal.rationale)
+
+    def _preview_draft(self, task: TaskSummary, run_id: str, proposal, context_files: list[tuple[str, str]]):
+        # Edits are applied against the content the model actually saw, so hashes come from the final context.
+        repository = self.tasks.repositories.get(task.repository_id)
+        baselines = {repository.path / path: self.patch._content_hash(content) for path, content in context_files}
+        files = []
+        paths = set()
+        for proposed in proposal.files:
+            target = self.tasks.repositories._safe_repo_path(repository, proposed.path.replace("\\", "/"))
+            if target in paths:
+                raise RepositoryError("DUPLICATE_PATCH_PATH", "A patch may modify each file only once.")
+            paths.add(target)
+            baseline = baselines.get(target)
+            if baseline is None and proposed.operation != "create":
+                raise RepositoryError("MODEL_CONTEXT_REQUIRED", "Include the file in context_paths and draft again before modifying it.", {"path": proposed.path})
+            if proposed.operation == "update" and baseline == self.patch._content_hash(proposed.content):
+                if self.patch._content_hash(self.patch._read_text(target)) != baseline:
+                    raise RepositoryError("PATCH_CONFLICT", f"File changed since the patch was prepared: {proposed.path}")
+                continue
+            files.append(proposed.model_copy(update={
+                "path": target.relative_to(repository.path).as_posix(),
+                "expected_hash": baseline if baseline is not None else self.patch._content_hash(None),
+            }))
+        if not files:
+            raise RepositoryError("MODEL_NO_CHANGE", "The proposal makes no changes. Inspect the failure and propose an effective edit.")
+        try:
+            return self.patch.preview(task.repository_id, files, run_id=run_id)
+        except RepositoryError as exc:
+            if exc.code == "FILE_ALREADY_EXISTS":
+                path = next((item.path for item in files if item.operation == "create" and (repository.path / item.path).exists()), None)
+                if path:
+                    exc.details["path"] = path
+            raise
 
     async def chat(self, task_id: str, message: str) -> str:
         """One Cowork conversational turn: record the user message, ask the model, record the reply.
@@ -516,8 +821,16 @@ class AgentService:
         """One model turn; a stop or pause while it runs discards the reply instead of applying it."""
         # ponytail: model calls share the task's remote-call budget (one counter with git-host calls); split if it ever matters.
         self.tasks.consume_remote_call(task.id)
+        call = asyncio.create_task(self.models.propose_patch(goal, context_files, failure))
+        calls = self._model_calls.setdefault(task.id, set())
+        calls.add(call)
         try:
-            proposal = await self.models.propose_patch(goal, context_files, failure)
+            proposal = await call
+        except asyncio.CancelledError:
+            current = self.tasks.get(task.id)
+            if current.status in {"paused", "cancelled"}:
+                raise TaskStateError("The task stopped while the model was drafting; the reply was discarded.", {"status": current.status})
+            raise
         except RepositoryError as exc:
             # Protocol errors are fed back to the model by draft_patch; only a final give-up counts.
             self.tasks.record_remote_result(task.id, exc.code in _FEEDBACK_ERRORS)
@@ -525,57 +838,92 @@ class AgentService:
         except Exception:  # CancelledError (a user stop) is a BaseException: not a model failure
             self.tasks.record_remote_result(task.id, False)
             raise
-        self.tasks.record_remote_result(task.id, True)
+        finally:
+            calls.discard(call)
+            if not calls:
+                self._model_calls.pop(task.id, None)
         current = self.tasks.get(task.id)
-        if current.status in {"paused", "cancelled", "done"}:
+        if call.cancelling() or current.status in {"paused", "cancelled", "done"}:
             raise TaskStateError("The task stopped while the model was drafting; the reply was discarded.", {"status": current.status})
+        self.tasks.record_remote_result(task.id, True)
         return proposal
 
-    async def _resolve_context_requests(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], requests: list[ContextRequest]) -> tuple[str, list[tuple[str, str]]]:
+    async def _resolve_context_requests(self, task: TaskSummary, goal: str, context_files: list[tuple[str, str]], requests: list[ContextRequest],
+                                        history: dict[tuple[str, str], tuple[str, list[str]]] | None = None,
+                                        captured: dict[str, str] | None = None) -> tuple[str, list[tuple[str, str]]]:
         """Run the model's search/read/run requests and fold the results into the next prompt.
 
         A request that cannot be served (protected, missing, binary) is reported back to the
         model as a failed note; it never turns into file content, and the caller's round cap
         stops a model that keeps asking for the same thing.
         """
-        notes: list[str] = []
+        history = {} if history is None else history
+        captured = {path: self.patch._content_hash(content) for path, content in context_files} if captured is None else captured
+        requested_paths = []
         for request in requests:
             if request.action == "search":
                 try:
                     matches, _ = self.tasks.repositories.search(task.repository_id, SearchRequest(query=request.query, max_results=10))
                 except RepositoryError as exc:
-                    notes.append(f"Search {request.query!r} failed: {exc.message}")
+                    history[("search", request.query)] = (f"Search {request.query!r} failed: {exc.message}", [])
                     self.audit.record("context.request", "failed", f"Search failed: {request.query}", task_id=task.id, run_id=task.run_id,
                                       details={"action": "search", "query": request.query, "error": exc.code})
                     continue
                 paths = list(dict.fromkeys(match.path for match in matches))
-                notes.append(f"Search {request.query!r} matched: " + (", ".join(paths) if paths else "nothing"))
+                locations = "; ".join(f"{match.path}:{match.line}: {match.text[:200]}" for match in matches)
+                history[("search", request.query)] = (f"Search {request.query!r} matched: " + (locations or "nothing"), paths)
                 self.audit.record("context.request", "succeeded", f"Searched for {request.query}", task_id=task.id, run_id=task.run_id,
                                   details={"action": "search", "query": request.query, "paths": paths[:10]})
                 continue
             if request.action == "run":
-                notes.append(await self._run_for_model(task, request.command))
+                key = ("run", repr(request.command))
+                history.pop(key, None)
+                history[key] = (await self._run_for_model(task, request.command), [])
+                runs = [item for item in history if item[0] == "run"]
+                for item in runs[:-2]:
+                    history.pop(item)
                 continue
             try:
                 source = self.tasks.repositories.read_file(task.repository_id, request.path)
             except RepositoryError as exc:
-                notes.append(f"Read {request.path} failed: {exc.message}")
+                history[("read", request.path)] = (f"Read {request.path} failed: {exc.message}", [])
                 self.audit.record("context.request", "failed", f"Could not read {request.path}", task_id=task.id, run_id=task.run_id,
                                   details={"action": "read", "path": request.path, "error": exc.code})
                 continue
-            if source.path not in {path for path, _ in context_files}:
+            existing = dict(context_files).get(source.path)
+            if source.path in captured and captured[source.path] != source.content_hash:
+                raise RepositoryError("PATCH_CONFLICT", f"File changed since it was read for drafting: {source.path}", {"path": source.path})
+            captured[source.path] = source.content_hash
+            if existing is None:
                 context_files = [*context_files, (source.path, source.content)]
-            notes.append(f"Read {source.path}.")
+            requested_paths.append(source.path)
+            history.pop(("read", source.path), None)
             self.audit.record("context.request", "succeeded", f"Read {source.path}", task_id=task.id, run_id=task.run_id,
                               details={"action": "read", "path": source.path})
-        kept = self._trim_context(context_files)
+        kept = self._trim_context(context_files, requested_paths)
         kept_paths = {name for name, _ in kept}
         dropped = [path for path, _ in context_files if path not in kept_paths]
-        if dropped:
-            notes.append("Dropped from context (size budget), read again before editing: " + ", ".join(dropped))
-        if notes:
-            goal = goal + "\n\n# Context results\n" + "\n".join(notes)
-        return goal, kept
+        for path in dropped:
+            history[("read", path)] = (f"Dropped from context (size budget), read again before editing: {path}", [])
+        for key, (_, paths) in list(history.items()):
+            if (key[0] == "read" and key[1] in kept_paths) or (key[0] == "search" and paths and set(paths) <= kept_paths):
+                history.pop(key)
+        return self._context_prompt(goal, history), kept
+
+    def _context_prompt(self, goal: str, history: dict[tuple[str, str], tuple[str, list[str]]]) -> str:
+        if not history:
+            return goal
+        header = "\n\n# Context results\n"
+        budget = min(self.tasks.settings.llm_max_context_bytes, 12_000) - len(header.encode("utf-8"))
+        notes = []
+        # Unresolved reads and search locations take space before completed command output.
+        for _, (note, _) in sorted(history.items(), key=lambda item: item[0][0] == "run"):
+            if budget <= 0:
+                break
+            note = note.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+            notes.append(note)
+            budget -= len(note.encode("utf-8")) + 1
+        return goal + header + "\n".join(notes)
 
     async def _run_for_model(self, task: TaskSummary, command: list[str]) -> str:
         """Execute one model-requested program and return a note for the next prompt; never raises on command failure."""
@@ -588,62 +936,187 @@ class AgentService:
         # A program outside the allowlist never runs, so it is not charged: the model only wasted a turn.
         if command[0].lower().removesuffix(".exe") in COMMAND_EXECUTABLES:
             self.tasks.consume_remote_call(task.id)
-        result = await run_in_threadpool(self.tests.run_command, task.run_id, task.repository_id, command)
+        reservation_id = task.run_id + self.tests.COMMAND_SUFFIX
+        self.tests.reserve(reservation_id)
+        worker = asyncio.create_task(run_in_threadpool(self.tests.run_command, task.run_id, task.repository_id, command, reserved=True))
+        result = await self._wait_for_worker(task, worker, reservation_id)
         self.audit.record("context.request", "succeeded" if result.status in {"passed", "failed"} else "failed", f"Ran {shown}",
                           task_id=task.id, run_id=task.run_id,
                           details={"action": "run", "command": command, "status": result.status, "exit_code": result.exit_code,
                                    "output": (result.stdout[-2_000:] + ("\n" + result.stderr[-2_000:] if result.stderr else "")).strip()})
+        if result.status == "cancelled":
+            raise TaskStateError("The model command was stopped; the draft was discarded.", {"status": self.tasks.get(task.id).status})
         # ponytail: output capped at 4k chars per stream in the prompt; raise if the model needs longer traces.
         return (f"Run {shown} -> {result.status} (exit {result.exit_code})\n"
                 f"stdout:\n{result.stdout[-4_000:]}\nstderr:\n{result.stderr[-4_000:]}")
 
-    def _trim_context(self, context_files: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        """Keep the newest files within the configured count and byte budget."""
+    def _trim_context(self, context_files: list[tuple[str, str]], requested_paths: list[str] | None = None) -> list[tuple[str, str]]:
+        """Keep repository instructions and current requested files before older context."""
         limit = self.tasks.settings.llm_max_context_files
         budget = self.tasks.settings.llm_max_context_bytes
         kept: list[tuple[str, str]] = []
-        for path, content in reversed(context_files):
+        instructions = [item for item in context_files if item[0] == "AGENTS.md"]
+        requested = set(requested_paths or [])
+        current = [item for item in context_files if item[0] in requested and item[0] != "AGENTS.md"]
+        remaining = [item for item in context_files if item[0] != "AGENTS.md" and item[0] not in requested]
+        for path, content in [*instructions, *current, *reversed(remaining)]:
             size = len(content.encode("utf-8"))
             if len(kept) >= limit or size > budget:
                 continue
             kept.append((path, content))
             budget -= size
-        return list(reversed(kept))
+        kept_paths = {path for path, _ in kept}
+        return [item for item in context_files if item[0] in kept_paths]
 
     def _gather_context(self, repository_id: str, context_paths: list[str], task_id: str, goal: str, failure: TestRunResponse | None) -> list[tuple[str, str]]:
         repositories = self.tasks.repositories
-        explicit = [path.replace("\\", "/") for path in re.findall(r"[\w./\\-]+\.[\w.-]+", goal)]
+        explicit = self._context_paths(repository_id, goal)
         failing = [item.path for item in (failure.failed_tests if failure else []) if item.path]
-        ordered = [*context_paths, *explicit, *failing, *self.tasks.changed_files(task_id)]
-        # ponytail: bounded keyword search plus entry/test fallbacks; no index or model lookup needed.
-        ignored = {"fix", "add", "update", "change", "test", "tests", "file", "files", "return", "with", "that", "from", "this", "code", "local", "the", "for", "and"}
-        terms = dict.fromkeys(word for word in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}|[\u4e00-\u9fff]{2,}", goal.lower()) if word not in ignored)
-        for term in list(terms)[:3]:
-            matches, _ = repositories.search(repository_id, SearchRequest(query=term[:100], max_results=10))
-            ordered.extend(match.path for match in matches)
-        context = repositories.context(repository_id)
-        entries, _ = repositories.tree(repository_id, max_depth=6)
-        tests = [entry.path for entry in entries if entry.kind == "file" and (
-            entry.name.startswith("test_") or any(token in entry.path for token in (".test.", ".spec.", "/tests/", "/__tests__/"))
-        )]
-        ordered.extend([*context.entry_files[:3], *tests[:3], *context.config_files[:2]])
-        ordered.extend(entry.path for entry in entries if entry.kind == "file" and entry.language and PurePosixPath(entry.path).suffix not in {".md", ".json"})
+        if failure:
+            failing.extend(self._context_paths(repository_id, failure.stdout[-12_000:] + "\n" + failure.stderr[-12_000:]))
+        priority = ["AGENTS.md", *context_paths, *explicit, *failing, *self.tasks.changed_files(task_id)]
         files: list[tuple[str, str]] = []
+        seen = set()
+
+        def read(paths):
+            for path in paths:
+                if path in seen:
+                    continue
+                seen.add(path)
+                try:
+                    source = repositories.read_file(repository_id, path)
+                except RepositoryError:
+                    continue
+                yield source.path, source.content
+
+        def candidates():
+            yield from read(priority)
+            yield from self._related_context(repository_id, files)
+            if any(path != "AGENTS.md" for path, _ in files):
+                return
+            # ponytail: one-hop imports and two symbol searches; no persistent index or call graph.
+            ignored = {"fix", "add", "update", "change", "test", "tests", "file", "files", "return", "with", "that", "from", "this", "code", "local", "the", "for", "and"}
+            terms = dict.fromkeys(word for word in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}|[\u4e00-\u9fff]{2,}", goal.lower()) if word not in ignored)
+            for term in list(terms)[:3]:
+                matches, _ = repositories.search(repository_id, SearchRequest(query=term[:100], max_results=10))
+                yield from read(match.path for match in matches)
+            context = repositories.context(repository_id)
+            entries, _ = repositories.tree(repository_id, max_depth=6)
+            tests = [entry.path for entry in entries if entry.kind == "file" and (
+                entry.name.startswith("test_") or any(token in entry.path for token in (".test.", ".spec.", "/tests/", "/__tests__/"))
+            )]
+            yield from read([*context.entry_files[:3], *tests[:3], *context.config_files[:2]])
+            yield from read(entry.path for entry in entries if entry.kind == "file" and entry.language and PurePosixPath(entry.path).suffix not in {".md", ".json"})
+
         budget = self.tasks.settings.llm_max_context_bytes
-        for path in dict.fromkeys(ordered):
-            try:
-                source = repositories.read_file(repository_id, path)
-            except RepositoryError:
-                continue  # missing, protected or binary — skip; the model still gets the goal
-            size = len(source.content.encode("utf-8"))
+        for path, content in candidates():
+            size = len(content.encode("utf-8"))
             # Whole-file edits must see complete files; truncation could silently remove unseen code.
-            if size > budget or any(name == source.path for name, _ in files):
+            if size > budget or any(name == path for name, _ in files):
                 continue
-            files.append((source.path, source.content))
+            files.append((path, content))
             budget -= size
             if len(files) >= self.tasks.settings.llm_max_context_files or budget <= 0:
                 break
         return files
+
+    def _context_paths(self, repository_id: str, text: str) -> list[str]:
+        root = self.tasks.repositories.get(repository_id).path.as_posix() + "/"
+        paths = []
+        quoted = re.findall(r"\bFile\s+[\"']([^\"'\n]+)[\"']", text)
+        for path in [*quoted, *re.findall(r"(?:[A-Za-z]:[\\/])?[\w./\\-]+\.[\w.-]+", text)]:
+            path = path.replace("\\", "/")
+            if path.lower().startswith(root.lower()):
+                path = path[len(root):]
+            paths.append(path)
+        return list(dict.fromkeys(paths))[:30]
+
+    @staticmethod
+    def _import_paths(path: str, content: str) -> list[str]:
+        directory = PurePosixPath(path).parent
+        modules = []
+        if path.endswith(".py"):
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                return []
+            roots = list(dict.fromkeys([directory, *directory.parents[:2], PurePosixPath(".")]))
+            imports = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names if alias.name.split(".")[0] not in sys.stdlib_module_names]
+                    if names:
+                        imports.append((roots, names))
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level > len(directory.parts) + 1:
+                        continue
+                    if not node.level and node.module and node.module.split(".")[0] in sys.stdlib_module_names:
+                        continue
+                    base = directory if node.level else PurePosixPath(".")
+                    for _ in range(max(0, node.level - 1)):
+                        base = base.parent
+                    names = [node.module] if node.module else [alias.name for alias in node.names]
+                    if node.module:
+                        names.extend(node.module + "." + alias.name for alias in node.names[:2] if alias.name != "*")
+                    imports.append(([base] if node.level else roots, names))
+            modules = [(base / name.replace(".", "/")).as_posix() for bases, names in imports[:6] for base in bases for name in names]
+            extensions, indexes = (".py",), ("__init__.py",)
+        elif PurePosixPath(path).suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            imports = re.findall(r"(?:\bfrom\s*|\bimport\s*|\brequire\s*\(\s*)['\"](\.[^'\"]+)['\"]", content)
+            modules = [(directory / module).as_posix() for module in imports]
+            extensions = (".ts", ".tsx", ".js", ".jsx")
+            indexes = tuple("index" + suffix for suffix in extensions)
+        else:
+            return []
+        paths = []
+        for module in modules[:24]:
+            parts = []
+            for part in PurePosixPath(module).parts:
+                if part == "..":
+                    if not parts:
+                        break
+                    parts.pop()
+                else:
+                    parts.append(part)
+            else:
+                target = PurePosixPath(*parts)
+                if target.suffix in extensions:
+                    paths.append(target.as_posix())
+                else:
+                    paths.extend(target.as_posix() + suffix for suffix in extensions)
+                    paths.extend((target / index).as_posix() for index in indexes)
+        return paths
+
+    def _related_context(self, repository_id: str, files: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        repositories = self.tasks.repositories
+        seeds = [item for item in files if item[0] != "AGENTS.md"][:3]
+        related = []
+        seen = {path for path, _ in files}
+
+        def add(paths):
+            for path in paths:
+                if path in seen:
+                    continue
+                seen.add(path)
+                try:
+                    source = repositories.read_file(repository_id, path)
+                except RepositoryError:
+                    continue
+                related.append((source.path, source.content))
+                if len(related) == 3:
+                    return True
+            return False
+
+        for path, content in seeds:
+            if add(self._import_paths(path, content)):
+                return related
+        symbols = [(path, symbol.name) for path, content in seeds
+                   for symbol in repositories._symbols(PurePosixPath(path).suffix, content) if symbol.kind in {"function", "class"}][:2]
+        for path, name in symbols:
+            matches, _ = repositories.search(repository_id, SearchRequest(query=name + "(", extensions=[PurePosixPath(path).suffix], max_results=8))
+            if add(match.path for match in matches):
+                break
+        return related
 
     def _gate(self, task: TaskSummary, approval_type: ApprovalType, scope: str | None) -> bool:
         """Posture gate: True if the loop may proceed through this approval, else pause for a human.
@@ -706,7 +1179,7 @@ class AgentService:
         loop.draft = asyncio.create_task(self.draft_patch(run_id, DraftPatchRequest(feedback=feedback) if feedback else DraftPatchRequest()))
         try:
             preview = await loop.draft
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, TaskStateError):
             if stop.is_set():
                 return
             raise
@@ -715,6 +1188,10 @@ class AgentService:
         if stop.is_set():
             return
         self.tasks.assert_patch_allowed(run_id)
+        changes = self.validation_changes(task.id, self.patch._patches[preview.patch_id].files)
+        if changes:
+            raise RepositoryError("VALIDATION_REVIEW_REQUIRED", "Review and explicitly confirm changes to existing verification files before applying them.",
+                                  {"paths": changes, "patch_id": preview.patch_id})
         result = self.patch.apply(preview.patch_id, True)  # the model's output already passed patch.preview's protected-path/size gate
         self.tasks.mark_patch_applied(run_id, result.patch_id, result.checkpoint.id, result.applied_files)
         self.audit.record("patch.apply", "succeeded", f"Agent applied patch to {len(result.applied_files)} file(s)",
@@ -727,6 +1204,8 @@ class AgentService:
         leaving a pending 'write' approval for the chat to show inline. _decide already verified tests.
         """
         repository_id = task.repository_id
+        self.assert_validation_unchanged(task.id)
+        self.tasks.assert_completion_ready(task.id, self.validation_hash(task))
         files = self.tasks.changed_files(task.id)
         body = (task.goal.strip().splitlines()[0] if task.goal.strip() else "agent change")[:180]
         message = f"{task.id}: {body}"  # ponytail: templated from the goal; a model-drafted commit message can replace this later

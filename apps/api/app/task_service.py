@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import RLock
@@ -7,9 +8,14 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from .approval_service import plan_scope_hash
 from .config import Settings
 from .models import (
     AgentMode,
+    CompletionConfirmation,
+    CompletionConfirmationRequest,
+    CompletionCriterion,
+    CompletionStatus,
     TaskBudget,
     TaskCheckpoint,
     TaskIteration,
@@ -18,12 +24,14 @@ from .models import (
     TaskSummary,
     TaskTrack,
     TestRunResponse,
+    TestRunRequest,
     ValidationCheck,
     ValidationCheckStatus,
 )
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
 from .retention import prune_test_outputs
 from .store import StateStore
+from .validation_guard import capture_validation_guard
 
 
 class TaskStateError(RepositoryError):
@@ -36,6 +44,11 @@ class TaskRecord:
     summary: TaskSummary
     iterations: list[TaskIteration] = field(default_factory=list)
     checkpoints: list[TaskCheckpoint] = field(default_factory=list)
+    validation_guard: dict[str, str] | None = None
+    validation_baseline: list[TestRunResponse] = field(default_factory=list)
+    validation_baseline_hash: str | None = None
+    validation_review_patch_id: str | None = None
+    validation_runners: dict[str, str] = field(default_factory=dict)
 
 
 class PersistedTask(BaseModel):
@@ -44,6 +57,11 @@ class PersistedTask(BaseModel):
     summary: TaskSummary
     iterations: list[TaskIteration] = []
     checkpoints: list[TaskCheckpoint] = []
+    validation_guard: dict[str, str] | None = None
+    validation_baseline: list[TestRunResponse] = []
+    validation_baseline_hash: str | None = None
+    validation_review_patch_id: str | None = None
+    validation_runners: dict[str, str] = {}
 
 
 class TaskService:
@@ -78,7 +96,11 @@ class TaskService:
         self._keys: dict[str, str] = {}
         if store:
             for key, stored in store.models("tasks", PersistedTask):
-                record = TaskRecord(summary=stored.summary, iterations=stored.iterations, checkpoints=stored.checkpoints)
+                record = TaskRecord(summary=stored.summary, iterations=stored.iterations, checkpoints=stored.checkpoints,
+                                    validation_guard=stored.validation_guard, validation_baseline=stored.validation_baseline,
+                                    validation_baseline_hash=stored.validation_baseline_hash,
+                                    validation_review_patch_id=stored.validation_review_patch_id,
+                                    validation_runners=stored.validation_runners)
                 if "budget" not in stored.summary.model_fields_set:
                     record.summary.budget = self._new_budget()
                     if record.iterations:
@@ -92,7 +114,7 @@ class TaskService:
                 if record.summary.status in self.IN_FLIGHT_STATES:
                     record.summary.requires_recovery = True
                     record.summary.next_action = "服务已重启。请确认要继续该任务，或选择回滚与取消。"
-                    store.put("tasks", key, PersistedTask(summary=record.summary, iterations=record.iterations, checkpoints=record.checkpoints), record.summary.updated_at.isoformat())
+                    store.put("tasks", key, self._stored(record), record.summary.updated_at.isoformat())
                 self._tasks[record.summary.id] = record
                 self._keys[record.summary.id] = key
                 self._refresh_budget(record)
@@ -107,9 +129,88 @@ class TaskService:
         self.store.put(
             "tasks",
             key,
-            PersistedTask(summary=record.summary, iterations=record.iterations, checkpoints=record.checkpoints),
+            self._stored(record),
             record.summary.updated_at.isoformat(),
         )
+
+    @staticmethod
+    def _stored(record: TaskRecord) -> PersistedTask:
+        return PersistedTask(summary=record.summary, iterations=record.iterations, checkpoints=record.checkpoints,
+                             validation_guard=record.validation_guard, validation_baseline=record.validation_baseline,
+                             validation_baseline_hash=record.validation_baseline_hash,
+                             validation_review_patch_id=record.validation_review_patch_id,
+                             validation_runners=record.validation_runners)
+
+    def prepare_validation_guard(self, task_id: str) -> dict[str, str]:
+        record = self._record(task_id)
+        if record.validation_guard is None:
+            repository = self.repositories.get(record.summary.repository_id)
+            record.validation_guard = capture_validation_guard(repository, record.summary.validation_checks,
+                                                               max_entries=self.settings.max_tree_entries)
+            self._persist(record)
+        return record.validation_guard
+
+    def replace_validation_guard(self, task_id: str, paths: list[str] | None = None) -> None:
+        record = self._record(task_id)
+        repository = self.repositories.get(record.summary.repository_id)
+        captured = capture_validation_guard(repository, record.summary.validation_checks,
+                                            max_entries=self.settings.max_tree_entries)
+        if paths is not None:
+            restored = set(paths)
+            captured = {**{key: value for key, value in (record.validation_guard or {}).items()
+                           if key.split(":", 2)[1] not in restored},
+                        **{key: value for key, value in captured.items() if key.split(":", 2)[1] in restored}}
+        record.validation_guard = captured
+        # A human-approved change to the checks starts a new comparison baseline.
+        record.validation_baseline = []
+        record.validation_baseline_hash = None
+        self._persist(record)
+
+    def validation_baseline(self, task_id: str) -> list[TestRunResponse]:
+        return self._record(task_id).validation_baseline
+
+    def validation_baseline_hash(self, task_id: str) -> str | None:
+        return self._record(task_id).validation_baseline_hash
+
+    @staticmethod
+    def _validation_runner_key(request: TestRunRequest | TestRunResponse) -> str:
+        return json.dumps([request.check_id, request.workdir, request.target, request.script])
+
+    def validation_runner(self, task_id: str, request: TestRunRequest) -> str | None:
+        return self._record(task_id).validation_runners.get(self._validation_runner_key(request))
+
+    def record_validation_baseline(self, task_id: str, results: list[TestRunResponse], input_hash: str | None) -> None:
+        record = self._record(task_id)
+        record.validation_baseline = [item.model_copy(deep=True) for item in results]
+        for item in record.validation_baseline:
+            item.stdout, item.stderr = item.stdout[-4_000:], item.stderr[-4_000:]
+        record.validation_baseline_hash = input_hash
+        if input_hash:
+            record.validation_runners.update({self._validation_runner_key(item): item.kind for item in results
+                                              if item.kind in {"pytest", "frontend"}})
+        self._persist(record)
+
+    def validation_review_patch_id(self, task_id: str) -> str | None:
+        return self._record(task_id).validation_review_patch_id
+
+    def block_agent(self, task_id: str, code: str, message: str, details: dict | None = None) -> None:
+        record = self._record(task_id)
+        if record.summary.status in {"paused", "cancelled", "completed", "done"}:
+            return
+        record.summary.agent_blocked_reason = code
+        record.validation_review_patch_id = (details or {}).get("patch_id") if code == "VALIDATION_REVIEW_REQUIRED" else None
+        record.summary.error = message
+        record.summary.next_action = message + " Review the files and retry, or restore a checkpoint."
+        record.summary.updated_at = datetime.now(timezone.utc)
+        self._persist(record)
+
+    def clear_agent_block(self, task_id: str) -> None:
+        record = self._record(task_id)
+        if record.summary.agent_blocked_reason:
+            record.summary.agent_blocked_reason = None
+            record.summary.error = None
+            record.validation_review_patch_id = None
+            self._persist(record)
 
     def _new_budget(self) -> TaskBudget:
         return TaskBudget(
@@ -203,7 +304,7 @@ class TaskService:
         self._persist(record)
         return record.summary
 
-    def create(self, goal: str, repository_id: str | None = None, mode: AgentMode = "standard", track: TaskTrack = "code", validation_checks: list[ValidationCheck] | None = None) -> TaskSummary:
+    def create(self, goal: str, repository_id: str | None = None, mode: AgentMode = "standard", track: TaskTrack = "code", validation_checks: list[ValidationCheck] | None = None, completion_criteria: list[CompletionCriterion] | None = None) -> TaskSummary:
         repository: RepositoryRecord | None = None
         if repository_id:
             repository = self.repositories.get(repository_id)
@@ -211,6 +312,8 @@ class TaskService:
             if track != "code" or not repository:
                 raise TaskStateError("Validation checks require a coding task with a repository.")
             self._validate_check_paths(repository, validation_checks)
+        if completion_criteria and track != "code":
+            raise TaskStateError("Completion criteria require a coding task.")
         now = datetime.now(timezone.utc)
         task_id = f"task-{uuid4().hex[:10]}"
         run_id = f"run-{uuid4().hex[:10]}"
@@ -229,6 +332,7 @@ class TaskService:
                 next_action="Review and approve the task plan before the first coding iteration.",
                 budget=self._new_budget(), mode=mode, track="code",
                 validation_checks=validation_checks or [],
+                completion_criteria=completion_criteria or [],
             )
         self._tasks[task_id] = TaskRecord(summary=summary)
         self._persist(self._tasks[task_id])
@@ -273,6 +377,10 @@ class TaskService:
             raise TaskStateError("Validation checks require a repository.")
         self._validate_check_paths(self.repositories.get(record.summary.repository_id), checks)
         record.summary.validation_checks = checks
+        record.validation_guard = None
+        record.validation_baseline = []
+        record.validation_baseline_hash = None
+        record.validation_runners = {}
         record.summary.updated_at = datetime.now(timezone.utc)
         record.summary.next_action = "Review and approve the plan and required validation checks."
         self._persist(record)
@@ -287,6 +395,69 @@ class TaskService:
                 target = self.repositories._safe_repo_path(repository, check.workdir + "/" + check.target.split("::", 1)[0])
                 if not target.is_relative_to(directory):
                     raise RepositoryError("INVALID_TEST_TARGET", "The test target must stay inside its working directory.")
+
+    def set_completion_criteria(self, task_id: str, criteria: list[CompletionCriterion]) -> TaskSummary:
+        self.assert_recovered(task_id)
+        record = self._record(task_id)
+        if record.summary.track != "code" or record.iterations or record.summary.status != "awaiting_approval":
+            raise TaskStateError("Configure completion criteria before the first coding iteration.")
+        record.summary.completion_criteria = criteria
+        record.summary.completion_confirmation = None
+        record.summary.updated_at = datetime.now(timezone.utc)
+        record.summary.next_action = "Review and approve the plan and completion criteria."
+        self._persist(record)
+        return record.summary
+
+    def _completion_validation_passed(self, task_id: str, validation_hash: str | None) -> bool:
+        iterations = self._record(task_id).iterations
+        latest = iterations[-1].test_result if iterations and not iterations[-1].rolled_back else None
+        return bool(latest and latest.status == "passed" and latest.validation_hash == validation_hash
+                    and self.validation_passed(task_id, validation_hash))
+
+    def completion_status(self, task_id: str, validation_hash: str | None) -> CompletionStatus:
+        record = self._record(task_id)
+        if not record.summary.completion_criteria:
+            return "not_required"
+        confirmation = record.summary.completion_confirmation
+        if confirmation is None:
+            return "pending"
+        if (not record.iterations or confirmation.iteration_id != record.iterations[-1].id
+                or confirmation.scope_hash != plan_scope_hash(record.summary)
+                or confirmation.validation_hash != validation_hash
+                or not self._completion_validation_passed(task_id, validation_hash)):
+            return "stale"
+        return "confirmed"
+
+    def confirm_completion(self, task_id: str, payload: CompletionConfirmationRequest, validation_hash: str | None) -> TaskSummary:
+        self.assert_recovered(task_id)
+        record = self._record(task_id)
+        if not record.summary.completion_criteria:
+            raise RepositoryError("COMPLETION_NOT_REQUIRED", "This task has no completion criteria to confirm.")
+        if record.summary.status != "ready_for_pr" or record.summary.agent_blocked_reason:
+            raise RepositoryError("COMPLETION_VALIDATION_REQUIRED", "Passing current validation is required before confirming completion.")
+        if (not record.iterations or payload.iteration_id != record.iterations[-1].id
+                or payload.scope_hash != plan_scope_hash(record.summary)
+                or payload.validation_hash != validation_hash):
+            raise RepositoryError("COMPLETION_CONFIRMATION_STALE", "The task scope, iteration or validation changed. Review completion again.")
+        if not self._completion_validation_passed(task_id, validation_hash):
+            raise RepositoryError("COMPLETION_VALIDATION_REQUIRED", "Passing current validation is required before confirming completion.")
+        expected = {criterion.id for criterion in record.summary.completion_criteria}
+        supplied = [item.criterion_id for item in payload.evidence]
+        if len(supplied) != len(expected) or set(supplied) != expected or any(not item.evidence.strip() for item in payload.evidence):
+            raise RepositoryError("INVALID_COMPLETION_EVIDENCE", "Provide nonempty evidence for every completion criterion exactly once.")
+        now = datetime.now(timezone.utc)
+        record.summary.completion_confirmation = CompletionConfirmation(
+            **payload.model_dump(), confirmed_at=now, confirmed_by="local-user",
+        )
+        record.summary.updated_at = now
+        record.summary.next_action = "Review the final diff and approve commit or PR creation."
+        self._persist(record)
+        return record.summary
+
+    def assert_completion_ready(self, task_id: str, validation_hash: str | None) -> None:
+        status = self.completion_status(task_id, validation_hash)
+        if status not in {"not_required", "confirmed"}:
+            raise RepositoryError("COMPLETION_REQUIRED", "Review and confirm completion evidence for the current task before committing or publishing.", {"status": status})
 
     def validation_status(self, task_id: str, validation_hash: str | None) -> list[ValidationCheckStatus]:
         record = self._record(task_id)
@@ -324,6 +495,9 @@ class TaskService:
         self.assert_recovered(task_id)
         self.assert_budget_available(task_id, new_iteration=True)
         record = self._record(task_id)
+        if record.summary.repository_id and record.summary.status in {"awaiting_approval", "repairing", "failed", "coding"}:
+            self.prepare_validation_guard(task_id)
+        self.clear_agent_block(task_id)
         if record.summary.status == "awaiting_approval":
             self._transition(record, "coding")
         elif record.summary.status in {"repairing", "failed"}:
@@ -362,6 +536,7 @@ class TaskService:
         iteration.updated_at = datetime.now(timezone.utc)
         self._transition(record, "testing")
         record.summary.next_action = "Run the selected tests for this iteration."
+        self.clear_agent_block(record.summary.id)
         self._persist(record)
         return iteration
 
@@ -393,7 +568,7 @@ class TaskService:
             else:
                 iteration.status = "passed"
                 self._transition(record, "ready_for_pr")
-                record.summary.next_action = "Review the final diff and approve commit or PR creation."
+                record.summary.next_action = "Review completion evidence against the task goal." if record.summary.completion_criteria else "Review the final diff and approve commit or PR creation."
         else:
             record.summary.budget.consecutive_failures += 1
             iteration.status = "failed"
@@ -479,6 +654,7 @@ class TaskService:
         self._transition(record, target)
         record.summary.resume_state = None
         record.summary.next_action = "Rerun validation for the current iteration." if target == "testing" else "Continue the current coding iteration."
+        self.clear_agent_block(task_id)
         self._persist(record)
         return record.summary
 
@@ -510,6 +686,7 @@ class TaskService:
         record.summary.resume_state = None
         record.summary.next_action = "Start a new coding iteration after reviewing the restored files."
         record.summary.updated_at = datetime.now(timezone.utc)
+        self.clear_agent_block(record.summary.id)
         self._persist(record)
         return record.summary
 
