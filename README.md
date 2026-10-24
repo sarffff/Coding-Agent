@@ -2,6 +2,8 @@
 
 本地 Coding Agent 的 Monorepo：以文件夹为入口，支持可审计、可恢复的修改与验证，Git 发布为可选能力。
 
+2026-10-24 核心实现与回归已收口：489 个独立 API 用例去重覆盖为 487 通过、2 项 Windows 符号链接环境跳过；真实模型完成单文件修复、两文件修改与故障注入后的修复，并显式确认完成证据。真实 GitHub 链路已完成审批提交、推送、[Draft PR #1](https://github.com/sarffff/ai-agent/pull/1) 创建和远端核对；完整浏览器点击仍被本机权限策略阻断。结果、预算边界与证据口径见 [核心 Agent 验收报告](docs/core-agent-acceptance-20261024.md)。
+
 ## 目录
 
 ```text
@@ -123,7 +125,9 @@ pnpm desktop:electron:smoke  # 隐藏窗口交互自检：14 条断言，全过�
 
 ## 必跑验证清单
 
-一个 Code 任务可以有最多 12 条「必跑检查」，它们共同定义「这个任务算做完了」。清单不是建议：**只有所有检查都跑在当前离线代码上并通过，任务才能提交或进入交付**。
+一个 Code 任务可以有最多 12 条「必跑检查」，它们定义任务必须通过的验证。清单不是建议：**只有所有检查都跑在当前代码上并通过，任务才能提交或进入交付**；配置了完成条件时，还必须逐条提交证据并显式确认。
+
+Code 聊天首次发送后先打开任务准备对话框：确认执行模式、查看或编辑必跑检查，保存后点击「开始任务」才启动后台循环。未保存的修改会阻止启动；关闭对话框后可从该任务的准备入口重新打开，启动失败可以在同一任务上重试。保守模式停在首次计划审批时，尚未开始编码迭代，仍可重新准备；运行中的循环和已开始的首轮不开放该入口。
 
 创建任务时若没显式给 `validation_checks`，服务端按仓库根 `package.json` 的 `scripts` 推导默认清单——`test`、`api:test`（与 `test` 不同时）、`typecheck`/`check`/`lint` 中第一个、`build`。推导出的检查都是 `script` 类型、工作目录 `.`、超时 300 秒，且**只记录脚本名，不记录脚本体**。没有 `package.json` 或没有这些脚本时清单为空，退回原来的自动检测单命令。
 
@@ -147,6 +151,16 @@ pnpm desktop:electron:smoke  # 隐藏窗口交互自检：14 条断言，全过�
 
 命令构造有两条边界：`script` 类型只允许执行 `package.json` 里声明的脚本名（不能拼参数或命令），包管理器按 `workdir` 向上找到的第一个 lockfile 决定（`pnpm-lock.yaml` / `yarn.lock` / `package-lock.json` / `npm-shrinkwrap.json`，到仓库根为止）；Python 检查优先用 `workdir` 或仓库根的 `.venv`/`venv`，虚拟环境存在但没有解释器时报 `PROJECT_PYTHON_UNAVAILABLE`，不会静默回落到系统 Python。
 
+## 完成条件与证据确认
+
+任务准备区可编辑最多 12 条完成条件，每条文本最多 500 字符。它们与原始目标一同持久化并参与计划审批范围；未保存或保存中不能开始任务，首次迭代后条件锁定。留空兼容原有任务流程。
+
+验证通过后，在运行视图逐条填写证据（每条最多 1000 字符），由操作者明确点击「确认完成条件」。确认绑定当前范围哈希、整仓验证哈希和迭代 ID；代码、范围或迭代变化后旧确认失效，需复核并重新确认，提交与发布同时受此门禁约束。测试通过不会自动认定需求完成，文字证据也不由服务端自动判真。
+
+- `PUT /api/v1/tasks/{id}/completion-criteria`：首轮前保存 `{ criteria: [{ id, text }] }`。
+- `POST /api/v1/tasks/{id}/completion-confirmation`：显式提交 `{ scope_hash, validation_hash, iteration_id, evidence: [{ criterion_id, evidence }] }`。
+- `GET /api/v1/tasks/{id}/agent` 返回 `completion_status`（`not_required` / `pending` / `stale` / `confirmed`）、当前哈希与 `can_confirm_completion`；`review_completion` 引导进入验证区复核。
+
 ## Git 演示流程
 
 ```bash
@@ -169,6 +183,8 @@ python scripts/create_demo.py --name my-demo   # 需要其它名字时
 9. 重启 API 进程后重新打开该任务：仓库、轮次、审批、测试日志与检查点都还在，任务会提示「需要确认继续」，确认后才允许继续写入。
 10. 「受控发布」面板：请求并批准推送审批 → 推送任务分支 → 预览 Draft PR → 请求并批准 PR 审批 → 创建 PR，面板展示 PR 编号、状态与链接，并可「对远端核对」。不接外网时用 `FORGE_REMOTE_PROVIDER=fake` 跑完整流程；接真实 GitHub 时按上面的远程变量配置。
 
+推送、PR 预览与创建共用发布快照校验：当前任务分支和 HEAD 必须匹配已审批提交，任务改动须已提交，创建 PR 还须匹配已推送 SHA。PR 预览展示相对 `origin/<target>` 的三点差异（缺少远端引用时使用本地目标分支），包括分支上此前的 seed 文件；目标引用缺失时提示完整范围不可用并禁止就绪。
+
 命令行等价流程见 `docs/phase-1-todolist.md` 的「推荐接口顺序」。
 
 ## 本地 Agent 编排
@@ -185,7 +201,15 @@ python scripts/create_demo.py --name my-demo   # 需要其它名字时
 
 PR 刷新会识别明确的合并结果并完成任务；关闭但未确认合并的 PR 留待人工复核。
 
-Code 聊天还可启动后台循环（`POST /api/v1/runs/{run_id}/loop`），停止接口为同一路径的 `/stop`。计划仍由规则生成；模型起草会带入显式文件路径、最近失败文件、已改文件，以及有限搜索和入口/测试文件的完整内容，受文件数和字节预算约束。修复轮次保留最近失败测试的摘要与输出。
+Code 聊天还可启动后台循环（`POST /api/v1/runs/{run_id}/loop`），停止接口为同一路径的 `/stop`。计划仍由规则生成；模型起草保留原始任务目标，追加轮次目标和反馈，并带入仓库根 `AGENTS.md`、显式文件路径、最近失败文件、已改文件，以及有限搜索和入口/测试文件的完整内容。规则文件与源码共用文件数和字节预算；修复轮次保留最近失败测试的摘要与输出。`patch.draft` 审计记录实际上下文路径、UTF-8 字节数、耗时、请求模型及修改说明。
+
+首次 AI 起草前运行修改前验证，基线单独保存，不计作修复失败或任务完成。已有断言失败可以进入修复；测试收集、配置、命令环境和超时阻塞时先转人工处理。没有检测到验证命令的空项目可以先创建代码和测试，改动后仍必须验证。自动检测出的验证器会固定下来，新增其他语言的测试不会替换原验证命令。结果中的 `baseline_comparison` 区分原有、新增和已解决的失败，只比较同一种验证器；人工批准验收变更后清除旧比较基线。
+
+已有测试、验证配置和所选脚本及其包装文件受保护；新增可能改变验收方式的配置也需要审阅。预览返回 `requires_validation_confirmation` 与 `validation_changes`，应用必须另传 `confirm_validation_changes: true`，普通 `confirm: true` 不代表批准验收变更。自动循环遇到这类补丁会在写盘前停止，可通过手动起草取回当前候选进行确认；预览在服务重启后过期，需要重新生成。无效验收变更应用失败会恢复本次检查点；回滚只恢复对应文件的保护记录，其他外部验收修改继续受门禁约束。
+
+草拟携带最近三轮尝试及失败证据。可恢复的格式、缺失上下文、重复路径和无效操作错误会在原有轮数上限内反馈给模型；上下文没有变化且回复重复时提前返回 `AGENT_NO_PROGRESS`。相同代码与失败连续出现也会转人工复核。外部文件冲突、保护路径、二进制和超大修改直接停止。
+
+执行期间，同目录及父子目录互斥，独立目录可并行。后台循环、手动起草和验证会持续占用目录；补丁预览/应用、回滚、分支和提交等入口遇到占用会返回 `WORKSPACE_BUSY`。暂停或取消 Code 任务也会停止等待中的模型起草和命令，迟到回复不会继续应用补丁；占用在执行退出后释放。
 
 - **保守**：人工批准计划后，在每轮补丁前停下；通过「审阅补丁」进入运行面板，AI 起草或手填补丁、预览 diff、确认应用。Git 提交、推送和 PR 也需人工批准。
 - **标准**：自动完成计划、补丁、测试及 Git 提交；推送与 PR 等待人工批准。普通文件夹在本地验证通过后停止，保留审阅和回滚入口。
@@ -212,7 +236,12 @@ pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅
 - **`GIT_UNAVAILABLE`（HTTP 503）**：API 进程连 `git` 子进程都拉不起来（Windows 上常见退出码 `3221225794` = `STATUS_DLL_INIT_FAILED`）。这属于该进程自身的启动上下文问题，从普通终端重启 API 即可；子进程环境块已由 `process_env.child_env()` 统一补全并清洗 `GIT_*`，因此不再依赖启动时的临时目录与 git 配置。
 - **界面显示 0 仓库 0 任务但 API 有数据**：多为 CORS 或 API 地址不匹配，检查 `FORGE_CORS_ORIGINS` 与 `VITE_API_BASE_URL`。
 - **`WORKTREE_NOT_CLEAN`**：任务分支必须在干净工作区上创建，先提交或还原本地改动。
+- **`WORKSPACE_BUSY`**：该目录或其父子目录仍有执行中的任务、起草或验证。先停止执行并等待退出，再修改、回滚或启动其他任务。
+- **`VALIDATION_BASELINE_BLOCKED`**：修改前验证不可执行或环境阻塞。先解决报告中的命令、依赖或配置问题，再重试起草。
+- **`VALIDATION_REVIEW_REQUIRED`**：验收文件或脚本发生变化。预览受影响文件并单独确认；补丁之外的外部验收变更不能顺带批准。
+- **`AGENT_NO_PROGRESS`**：相同上下文中重复无效请求或补丁。补充定位证据或修改反馈后重试，也可恢复检查点。
 - **`COMMIT_PREVIEW_STALE` / `TEST_RESULTS_STALE`**：审批绑定的是具体的 diff 与验证结果；改动文件或消息后需重新预览、重新审批。
+- **`COMPLETION_REQUIRED` / `COMPLETION_CONFIRMATION_STALE`**：完成条件尚未确认，或确认绑定的范围、迭代、验证已改变。通过当前必跑检查后逐条复核证据，并明确重新确认。
 - **桌面壳启动即退出，报 `Cannot read properties of undefined (reading 'setName')`**：`ELECTRON_RUN_AS_NODE=1` 被父进程继承了（IDE、VS Code、WorkBuddy 这类 Electron 宿主都会设），`electron.exe` 于是按纯 Node 运行 `main.cjs`，`require("electron").app` 为 undefined。`scripts/electron.js` 启动时已剥离该变量；若绕过启动器直接跑 `electron .`，自己 `unset` 掉。
 - **`APPROVAL_REQUIRED`**：首次编码轮次需要方案审批，创建提交需要写入审批。
 - **`RECOVERY_CONFIRMATION_REQUIRED`**：API 在该任务执行期间重启过。先在桌面端「确认继续」，或调用 `POST /api/v1/tasks/{id}/recover`；回滚、取消与查询不受此限制。
@@ -228,17 +257,20 @@ pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅
 
 ## 当前状态与已知限制
 
-Phase 1（单仓库理解 → 计划 → 低风险修改 → 测试 → 审计 → 回滚）已完成并在浏览器与 API 两端验证。
+Phase 1（单仓库理解 → 计划 → 低风险修改 → 测试 → 审计 → 回滚）已实现，保留此前浏览器与 API 验证记录；本轮完整浏览器点击验收仍未完成。
 Phase 2 的本地部分与远程代码路径均已完成：多轮编码、验证循环、审批门禁、任务分支、提交、推送、GitHub Provider 与 Draft PR、幂等键、持久化与恢复。
 
 - 状态保存在本地 sqlite（默认 `.forge/state`，含检查点文件与提交/远程分支/PR 记录）；API 重启后未完成任务必须显式确认才继续写入。审计与测试输出有保留期限与上限（`FORGE_AUDIT_*` / `FORGE_TEST_OUTPUT_*`）。
-- 远程段已接通并带完整门禁，但**尚未对真实 GitHub 验证过**：测试与演示走 `FORGE_REMOTE_PROVIDER=fake`，真实令牌与演示仓库仍缺（见 `docs/todo.md` 的 P1）。
+- 真实 GitHub 验收已在 `sarffff/ai-agent` 完成独立夹具修复、完成确认、精确审批提交、任务分支推送与 [Draft PR #1](https://github.com/sarffff/ai-agent/pull/1) 创建/刷新；GitHub 独立核对 head、main 基点和两个夹具文件。离线回归仍使用 fake Provider，主应用和远端 main 未修改。
 - 幂等键覆盖 Agent 推进、推送和创建 PR；提交仍需审批与预览确认。
 - 任务预算熔断已接入：最大轮次、总耗时、远程调用次数、连续失败阈值（`FORGE_TASK_MAX_*`），任一触顶即锁定并转人工复核。
+- 本轮单文件验收任务在测试通过、重新确认后因等待超过一小时耗尽 wall-time 预算；已有证据保留，但复跑需新建任务，不能把历史 `confirmed` 当成仍可继续执行的状态。
 - 任务可配置必跑验证清单（默认按 `package.json` 推导），清单全绿才允许提交；验证结果绑定整仓输入哈希，任何文件变化都会把它标成过期。首轮开始后清单锁定。
+- 完成条件与逐条证据确认已接入任务准备、运行视图和提交/发布门禁；单文件、两文件与故障注入修复的真实模型场景均已通过原测试并由操作者显式确认。
 - 已有本地 Agent 单步编排和后台循环；计划由规则/模板生成，模型通过 Anthropic 或 OpenAI 兼容接口起草，支持 `edits` 精确替换与 `context_requests` 自查上下文。实际写入权限取决于上述模式。无沙箱容器，命令在主机上以受控白名单方式执行。
-- 审批中心的拒绝、要求修改、过期列表与预算视图已接入。产物冒烟与组件渲染检查不能替代浏览器交互；设置等扩展入口仍未完成。
+- 起草上下文优先显式路径和失败定位，找到目标后只补有限关联文件；真实 GitHub 夹具的上下文由 119930 缩至 452 字节。单行 `edits` 引导使用不带换行的最小唯一匹配，多行替换保留 CRLF；复杂调用关系选择和跨轮证据压缩仍待完善。
+- 审批中心的拒绝、要求修改、过期列表与预算视图已接入。产物冒烟与组件渲染检查不能替代浏览器交互；本轮 `127.0.0.1:15173` 页面保存被权限/managed policy 拒绝，完整点击回放仍待完成。
 - 桌面壳（Electron）已接入并与浏览器路径并存：壳托管本地 API、状态落在 `userData`、原生目录选择器。窗口层已真机验收（`pnpm desktop:electron:smoke` 14 条断言全过，见上面的桌面壳小节）；没有打包分发配置，`apps/api` 仍以源码方式运行。
 - 单文件夹任务；仓库可在磁盘任意位置，`FORGE_WORKSPACE_ROOT` 只提供默认起点；Git 子目录保留所选范围并使用本地流程。多仓库、CI 交互、Review 评论、冲突处理与自动合并属于后续阶段。
 
-各阶段勾选与验收口径以 `docs/phase-1-todolist.md`、`docs/phase-2-todolist.md` 为准；Phase 3（CI 交互、自动修复、冲突处理与治理）的范围见 `docs/phase-3-todolist.md`，其第 0 节列出了开工前必须先收口的 Phase 2 遗留项。
+当前核心状态以 [2026-10-24 验收报告](docs/core-agent-acceptance-20261024.md) 和 `docs/todo.md` 为准；阶段清单保留历史口径。Phase 3（CI 交互、自动修复、冲突处理与治理）的范围见 `docs/phase-3-todolist.md`。
