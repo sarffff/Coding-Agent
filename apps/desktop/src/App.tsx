@@ -8,20 +8,13 @@ import {
   Check,
   CircleDot,
   Clock3,
-  Code2,
   Command,
   FileCode2,
   FolderOpen,
   FolderSync,
   GitBranch,
   GitPullRequest,
-  LayoutDashboard,
-  Languages,
-  ListChecks,
   LockKeyhole,
-  Menu,
-  Monitor,
-  MoreHorizontal,
   PackageCheck,
   Plus,
   Rocket,
@@ -30,10 +23,7 @@ import {
   Settings2,
   ShieldCheck,
   Sparkles,
-  Sun,
-  Moon,
   TerminalSquare,
-  X,
   Zap,
 } from "lucide-react";
 import {
@@ -50,6 +40,7 @@ import {
   listRunEvents,
   listTasks,
   draftPatch,
+  getConfig,
   deleteTask,
   deleteRepository,
   ApiRequestError,
@@ -99,7 +90,7 @@ import {
   type PatchFileInput,
   type WorkspaceSummary,
 } from "./lib/api";
-import { usePreferences, type Language, type ThemeMode } from "./lib/preferences";
+import { usePreferences, type Language } from "./lib/preferences";
 import { desktopBridge, desktopStatus, isDesktopShell, type DesktopStatus } from "./lib/desktop";
 
 import { Dialog, AsyncMessage } from "@coding-agent/ui";
@@ -111,8 +102,8 @@ import { ChatPanel } from "./components/ChatPanel";
 import { ValidationChecklist } from "./components/ValidationChecklist";
 import { CompletionCriteria } from "./components/CompletionCriteria";
 import { SettingsPanel } from "./components/SettingsPanel";
-
-type NavKey = "chat" | "overview" | "tasks" | "repositories" | "runs" | "approvals" | "settings";
+import { Sidebar, type NavKey } from "./components/Sidebar";
+import { WorkspaceHeader } from "./components/WorkspaceHeader";
 
 type Task = {
   id: string;
@@ -181,13 +172,6 @@ function taskFromApi(task: AgentTask): Task {
   };
 }
 
-const navItems: Array<{ key: NavKey; icon: typeof LayoutDashboard }> = [
-  { key: "overview", icon: LayoutDashboard },
-  { key: "repositories", icon: FolderOpen },
-  { key: "runs", icon: TerminalSquare },
-  { key: "approvals", icon: ShieldCheck },
-  { key: "settings", icon: Settings2 },
-];
 
 function eventToStreamEvent(event: AuditEvent, t: (key: string) => string, locale: Language): StreamEvent {
   const action = event.action.toLowerCase();
@@ -214,8 +198,9 @@ const iconForEvent = (icon: StreamEvent["icon"]) => {
 };
 
 function App() {
-  const { language, theme, setLanguage, setTheme, t } = usePreferences();
+  const { language, t } = usePreferences();
   const [activeNav, setActiveNav] = useState<NavKey>("chat");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [tasks, setTasks] = useState(initialTasks);
   const [activeTaskId, setActiveTaskId] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -228,6 +213,7 @@ function App() {
   const [taskCriteriaDirty, setTaskCriteriaDirty] = useState(false);
   const [taskSetupError, setTaskSetupError] = useState<string | null>(null);
   const [chatMode, setChatMode] = useState<AgentMode>("standard");
+  const [modelName, setModelName] = useState("");
   const [chatPending, setChatPending] = useState<Approval | null>(null);
   const [chatBudget, setChatBudget] = useState<TaskBudget | null>(null);
   const [chatComposingNew, setChatComposingNew] = useState(false);
@@ -235,8 +221,8 @@ function App() {
   const chatSendingRef = useRef(false);
   const [chatAction, setChatAction] = useState<AgentAction | null>(null);
   const [railTab, setRailTab] = useState<"cowork" | "code">("cowork");
-  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const closeSidebar = useCallback(() => setSidebarOpen(false), []);
   const [apiStatus, setApiStatus] = useState<"checking" | "connected" | "offline">("checking");
   const [repositories, setRepositories] = useState<Repository[]>([]);
   const [repositoryError, setRepositoryError] = useState<string | null>(null);
@@ -563,6 +549,18 @@ function App() {
   const writeApproval = approvals.find((item) => item.type === "write" && item.scope_hash === commitPreviewResult?.scope_hash);
   const pushApproval = approvals.find((item) => item.type === "push");
   const pullRequestApproval = approvals.find((item) => item.type === "pr");
+
+  const refreshModelName = async () => {
+    try {
+      setModelName((await getConfig()).model);
+    } catch {
+      /* the chip is decoration; a failed read must not surface as an error */
+    }
+  };
+
+  useEffect(() => {
+    void refreshModelName();
+  }, []);
 
   const removeRepository = async (repositoryId: string) => {
     const repository = repositories.find((item) => item.id === repositoryId);
@@ -1274,6 +1272,9 @@ function App() {
         {confirmAction === "validation" ? <pre>{patchPreviewResult?.validation_changes?.join("\n")}</pre> : confirmAction === "delete" ? <pre>{patchPreviewResult?.files.join("\n")}</pre> : null}
         <div className="dialog-actions"><button className="small-action small-action--muted" onClick={closeConfirmation}>{t("common.back")}</button><button className="small-action" onClick={() => confirmAction === "delete" || confirmAction === "validation" ? void applyActivePatch(confirmAction) : void changeTaskState("cancel", true)}>{t("common.confirm")}</button></div>
       </Dialog>
+      <Dialog open={settingsOpen} title={t("settings.title")} onClose={() => { setSettingsOpen(false); void refreshModelName(); }}>
+        <SettingsPanel />
+      </Dialog>
       <Dialog open={taskSetup !== null} title={t("chat.setupTitle")} onClose={() => { if (!chatSending && !validationSaving && !completionSaving) setTaskSetup(null); }}>
         {setupTask && taskSetup ? <>
           <p>{setupTask.title}</p>
@@ -1286,96 +1287,29 @@ function App() {
           <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={chatSending || validationSaving || completionSaving} onClick={() => setTaskSetup(null)}>{t("common.back")}</button><button type="button" className="small-action" disabled={chatSending || validationSaving || completionSaving || taskSetupDirty || taskCriteriaDirty} onClick={() => void startPreparedTask()}>{t(chatSending ? "working" : "chat.startPrepared")}</button></div>
         </> : null}
       </Dialog>
-      <aside className={`sidebar rail ${sidebarOpen ? "sidebar--open" : ""}`}>
-        <div className="rail-brand"><Code2 size={19} /><span>Coding Agent</span></div>
-        <div className="rail-head">
-          <div className="rail-tabs" role="tablist" aria-label={t("workspace")}>
-            <button role="tab" aria-selected={railTab === "cowork"} className={railTab === "cowork" ? "is-active" : ""} onClick={() => { if (railTab !== "cowork") { setRailTab("cowork"); startNewChatSession(); } }}>
-              <ListChecks size={14} /> {t("rail.cowork")}
-            </button>
-            <button role="tab" aria-selected={railTab === "code"} className={railTab === "code" ? "is-active" : ""} onClick={() => { if (railTab !== "code") { setRailTab("code"); startNewChatSession(); } }}>
-              <Code2 size={14} /> {t("rail.code")}
-            </button>
-          </div>
-          <button className="icon-button mobile-close" aria-label={t("closeNavigation")} onClick={() => setSidebarOpen(false)}>
-            <X size={17} />
-          </button>
-        </div>
+      <Sidebar
+        open={sidebarOpen}
+        activeNav={activeNav}
+        track={railTab}
+        activeSessionId={chatComposingNew ? "" : activeTaskId}
+        sessions={coworkTasks}
+        groups={railGroups}
+        approvalCount={approvalCount}
+        folderOpening={repositorySaving}
+        onClose={closeSidebar}
+        onTrackChange={track => { if (railTab !== track) { setRailTab(track); startNewChatSession(); } }}
+        onNavigate={setActiveNav}
+        onNewSession={startNewChatSession}
+        onOpenFolder={addRepository}
+        onSelectSession={selectChatSession}
+        onOpenRegisteredFolder={openRegisteredFolder}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
 
-        <button className="rail-new" onClick={() => { startNewChatSession(); setSidebarOpen(false); }}>
-          <Plus size={15} /> {t("rail.new")}
-        </button>
-        <button className="rail-open-folder" onClick={addRepository} disabled={repositorySaving}><FolderOpen size={16} />{repositorySaving ? t("folder.opening") : t("folder.openLocal")}</button>
+      <main className="main-content" inert={sidebarOpen}>
+        <WorkspaceHeader title={activeNav === "chat" ? t(`rail.${chatTrack}`) : pageTitle} apiStatus={apiStatus} navigationOpen={sidebarOpen} folderOpening={repositorySaving} onOpenNavigation={() => setSidebarOpen(true)} onOpenFolder={addRepository} />
 
-        <nav className="rail-nav" aria-label={t("primaryNavigation")}>
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            return (
-              <button key={item.key} className={`rail-nav-item ${activeNav === item.key ? "is-active" : ""}`} onClick={() => { setActiveNav(item.key); setSidebarOpen(false); }}>
-                <Icon size={16} strokeWidth={1.8} />
-                <span>{t(`nav.${item.key}`)}</span>
-                {item.key === "approvals" && approvalCount ? <span className="nav-count">{approvalCount}</span> : null}
-              </button>
-            );
-          })}
-        </nav>
-
-        <div className="rail-section"><span>{railTab === "cowork" ? t("rail.chats") : t("rail.folders")}</span>{railTab === "code" ? <button className="icon-button" aria-label={t("folder.openLocal")} onClick={addRepository} disabled={repositorySaving}><Plus size={15} /></button> : null}</div>
-        <div className="rail-conversations">
-          {railTab === "cowork" ? (
-            coworkTasks.length ? (
-              coworkTasks.map((task) => <RailSession key={task.id} task={task} active={task.id === activeTaskId && !chatComposingNew} onClick={() => { selectChatSession(task.id); setSidebarOpen(false); }} />)
-            ) : <p className="rail-empty">{t("chat.noSessions")}</p>
-          ) : (
-            railGroups.length ? (
-              railGroups.map(({ id, name, path, rows }) => (
-                <div className="rail-group" key={id}>
-                  <details className="rail-folder-group" open><summary title={path || name}><FolderOpen size={14} /><span>{name}</span><span className="rail-folder-count">{rows.length}</span></summary><div className="rail-folder-sessions">
-                  {rows.map((task) => <RailSession key={task.id} task={task} active={task.id === activeTaskId && !chatComposingNew} onClick={() => { selectChatSession(task.id); setSidebarOpen(false); }} />)}
-                  {path ? <button className="rail-folder-new" onClick={() => openRegisteredFolder(id)}><Plus size={13} />{t("rail.newInFolder")}</button> : null}
-                  </div></details>
-                </div>
-              ))
-            ) : <p className="rail-empty">{t("rail.emptyFolders")}</p>
-          )}
-        </div>
-
-        <div className="rail-footer">
-          <div className="rail-local"><span className="pulse-dot" /> {t("localExecution")}</div>
-          <div className="rail-account-wrap">
-            {accountMenuOpen ? (
-              <>
-                <button className="rail-backdrop" aria-hidden tabIndex={-1} onClick={() => setAccountMenuOpen(false)} />
-                <div className="rail-menu" role="menu">
-                  <label className="preference-control"><Languages size={14} /><select value={language} onChange={(event) => setLanguage(event.target.value as Language)} aria-label={t("language")}><option value="zh-CN">{t("chinese")}</option><option value="en-US">{t("english")}</option></select></label>
-                  <label className="preference-control"><span className="preference-theme-icon">{theme === "light" ? <Sun size={14} /> : theme === "dark" ? <Moon size={14} /> : <Monitor size={14} />}</span><select value={theme} onChange={(event) => setTheme(event.target.value as ThemeMode)} aria-label={t("theme")}><option value="system">{t("system")}</option><option value="light">{t("light")}</option><option value="dark">{t("dark")}</option></select></label>
-                  <button className="rail-menu-item" onClick={() => { setActiveNav("settings"); setAccountMenuOpen(false); }}><Settings2 size={14} /> {t("settings")}</button>
-                </div>
-              </>
-            ) : null}
-            <button className="rail-account" aria-label={t("rail.account")} aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((open) => !open)}>
-              <div className="avatar"><Monitor size={16} /></div>
-              <div className="user-copy"><strong>{t("rail.localAccount")}</strong><span>{t("rail.preferences")}</span></div>
-              <MoreHorizontal size={16} />
-            </button>
-          </div>
-        </div>
-      </aside>
-
-      <main className="main-content">
-        <header className="topbar">
-          <div className="topbar-left">
-          <button className="icon-button menu-toggle" aria-label={t("openNavigation")} onClick={() => setSidebarOpen(true)}><Menu size={18} /></button>
-            <div className="breadcrumbs"><span>{t("workspace")}</span><span className="breadcrumb-slash">/</span><strong>{activeNav === "chat" ? t(`rail.${chatTrack}`) : pageTitle}</strong></div>
-          </div>
-          <div className="topbar-actions">
-            <div className={`connection-status connection-status--${apiStatus}`}><span className="pulse-dot" /> {apiStatus === "connected" ? t("apiConnected") : apiStatus === "offline" ? t("apiOffline") : t("checkingApi")}</div>
-            <button className="topbar-folder" onClick={addRepository} disabled={repositorySaving}><FolderOpen size={15} /><span>{t("folder.openLocal")}</span></button>
-          </div>
-        </header>
-
-        <div className="page-wrap" data-view={activeNav}>
-          {activeNav === "settings" ? <SettingsPanel /> : null}
+        <div id="workspace-content" className="page-wrap" data-view={activeNav} role={activeNav === "chat" ? "tabpanel" : undefined} aria-labelledby={activeNav === "chat" ? `track-${chatTrack}` : undefined}>
           <ChatPanel
             goal={chatComposingNew || chatTrack === "cowork" ? null : (activeTask?.title ?? null)}
             plan={chatComposingNew || chatTrack === "cowork" ? undefined : (activeTask?.plan ?? undefined)}
@@ -1406,6 +1340,7 @@ function App() {
             pending={chatComposingNew ? null : chatPending}
             onDecide={decideChatApproval}
             budget={chatComposingNew ? null : chatBudget}
+            modelName={modelName}
             onDelete={activeTask && !loopRunning && !chatComposingNew ? removeActiveTask : undefined}
           />
           {activeNav === "repositories" ? <RepositoryBrowser repositories={repositories} repositoryId={selectedRepositoryId} onRepositoryChange={(id) => { setSelectedRepositoryId(id); setSourceLocation(null); }} onOpenFolder={addRepository} onEdit={prepareSourceChange} canEdit={Boolean(activeTask?.repositoryId === selectedRepositoryId && activeTask.lifecycleStatus === "coding")} initialFile={sourceLocation} onDelete={removeRepository} /> : null}
@@ -1587,15 +1522,6 @@ function TaskRow({ task, active, onClick }: { task: Task; active: boolean; onCli
   const { t } = usePreferences();
   const statusLabel = task.status === "running" ? t("running") : task.status === "review" ? t("review") : task.status === "failed" ? t("failed") : task.status === "done" ? t("done") : task.status === "paused" ? t("paused") : task.status === "cancelled" ? t("cancelled") : t("queued");
   return <button className={`task-row ${active ? "task-row--active" : ""}`} onClick={onClick}><span className={`task-accent task-accent--${task.accent}`} /><span className="task-main"><span className="task-title">{task.title}</span><span className="task-meta"><span>{task.repo}</span><span className="meta-separator">·</span><span>{task.branch}</span></span></span><span className={`task-status task-status--${task.status}`}>{task.status === "running" ? <><span className="pulse-dot" />{statusLabel}</> : statusLabel}</span><span className="task-time">{task.time === "now" ? t("now") : task.time}</span></button>;
-}
-
-function RailSession({ task, active, onClick }: { task: Task; active: boolean; onClick: () => void }) {
-  return (
-    <button className={`chat-session ${active ? "is-active" : ""}`} onClick={onClick} title={task.title}>
-      <span className={`chat-session-dot chat-session-dot--${task.track === "cowork" ? "cowork" : task.status}`} />
-      <span className="chat-session-title">{task.title}</span>
-    </button>
-  );
 }
 
 function RepoRow({ repository, tone, t }: { repository: Repository; tone: string; t: (key: string) => string }) {

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#111313" />
+    <meta name="theme-color" content="#0b0b0b" />
     <script>
       (() => {
         const language = localStorage.getItem('forge.language');
@@ -16,7 +16,7 @@
           ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
           : validTheme;
         document.documentElement.dataset.theme = resolvedTheme;
-        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolvedTheme === 'dark' ? '#111313' : '#eef1ed');
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolvedTheme === 'dark' ? '#0b0b0b' : '#f9f9f7');
       })();
     </script>
     <title>Forge / Coding Agent</title>

@@ -122,11 +122,54 @@ const MESSAGES: Record<string, Entry> = {
   CONFIG_INVALID_VALUE: { zh: "这个值不合法。", en: "That value is invalid." },
 };
 
+type ValidationIssue = {
+  loc?: Array<string | number>;
+  type?: string;
+  msg?: string;
+  ctx?: Record<string, unknown>;
+};
+
+/** "goal needs at least 3 characters" is what the user needs; "请求参数不合法" alone is not. */
+function describeIssue(issue: ValidationIssue): string {
+  const zh = current !== "en-US";
+  const ctx = issue.ctx ?? {};
+  switch (issue.type) {
+    case "string_too_short":
+      return zh ? `至少 ${ctx.min_length} 个字符` : `needs at least ${ctx.min_length} characters`;
+    case "string_too_long":
+      return zh ? `最多 ${ctx.max_length} 个字符` : `allows at most ${ctx.max_length} characters`;
+    case "missing":
+      return zh ? "缺失" : "is required";
+    case "literal_error":
+      return zh ? "取值不在允许范围" : "is not an allowed value";
+    case "greater_than_equal":
+      return zh ? `不能小于 ${ctx.ge}` : `must be >= ${ctx.ge}`;
+    case "less_than_equal":
+      return zh ? `不能大于 ${ctx.le}` : `must be <= ${ctx.le}`;
+    default:
+      return issue.msg ?? (zh ? "不合法" : "is invalid");
+  }
+}
+
+function describeValidationDetails(details: unknown): string {
+  const errors = (details as { errors?: ValidationIssue[] } | undefined)?.errors;
+  if (!Array.isArray(errors) || !errors.length) return "";
+  return errors
+    .slice(0, 2)
+    .map((issue) => {
+      const field = (issue.loc ?? []).filter((part) => part !== "body" && part !== "query").join(".");
+      const reason = describeIssue(issue);
+      return field ? `${field} ${reason}` : reason;
+    })
+    .join(current === "en-US" ? "; " : "；");
+}
+
 export function describeError(error: unknown, fallback: string): string {
   if (error instanceof ApiRequestError) {
     const entry = MESSAGES[error.code];
-    if (entry) return current === "en-US" ? entry.en : entry.zh;
-    return error.message || fallback;
+    const base = entry ? (current === "en-US" ? entry.en : entry.zh) : error.message || fallback;
+    const issues = describeValidationDetails(error.details);
+    return issues ? `${base.replace(/[。.]$/, "")}：${issues}` : base;
   }
   if (error instanceof Error && error.message) return error.message;
   return fallback;

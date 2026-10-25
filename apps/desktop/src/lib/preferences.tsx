@@ -411,6 +411,17 @@ const dictionaries: Record<Language, Dictionary> = {
     "chat.codeChooseFolder": "打开本地文件夹，开始修改、测试与审阅。",
     "chat.usedTools": "使用了 {n} 个工具",
     "chat.details": "详情",
+    "chat.copy": "复制消息",
+    "chat.mode.label": "权限模式",
+    "chat.attach": "上传文件",
+    "chat.removeAttachment": "移除附件",
+    "chat.attachmentLimit": "最多附加 5 个文件。",
+    "chat.attachmentTooLarge": "{name} 超过 {size} KB，已跳过。",
+    "chat.attachmentOnly": "请阅读附加文件。",
+    "chat.modelChip": "当前模型",
+    "chat.copied": "已复制",
+    "chat.copyError": "复制失败，请重试",
+    "chat.jumpLatest": "回到最新消息",
     "chat.placeholder": "描述要做的事，例如：修复失败的测试",
     "chat.send": "发送",
     "chat.hint": "Enter 发送 · Shift+Enter 换行",
@@ -933,6 +944,17 @@ const dictionaries: Record<Language, Dictionary> = {
     "chat.codeChooseFolder": "Open a local folder to edit, test and review your work.",
     "chat.usedTools": "Used {n} tools",
     "chat.details": "Details",
+    "chat.copy": "Copy message",
+    "chat.mode.label": "Permission mode",
+    "chat.attach": "Attach files",
+    "chat.removeAttachment": "Remove attachment",
+    "chat.attachmentLimit": "Attach at most 5 files.",
+    "chat.attachmentTooLarge": "{name} is larger than {size} KB and was skipped.",
+    "chat.attachmentOnly": "Please read the attached files.",
+    "chat.modelChip": "Current model",
+    "chat.copied": "Copied",
+    "chat.copyError": "Copy failed; try again",
+    "chat.jumpLatest": "Jump to latest",
     "chat.placeholder": "Describe what to do, e.g. fix the failing test.",
     "chat.send": "Send",
     "chat.hint": "Enter to send · Shift+Enter for a newline",
@@ -1107,7 +1129,7 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const resolved = theme === "system" ? (systemDark ? "dark" : "light") : theme;
     document.documentElement.dataset.theme = resolved;
-    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "dark" ? "#111313" : "#eef1ed");
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "dark" ? "#0b0b0b" : "#f9f9f7");
   }, [systemDark, theme]);
 
   const value = useMemo<PreferencesContextValue>(() => ({

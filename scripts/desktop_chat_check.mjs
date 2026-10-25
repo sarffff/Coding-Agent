@@ -128,8 +128,13 @@ try {
   const firstFailure = render({ error: "Cannot open this folder" });
   assert.match(firstFailure, /role="alert">Cannot open this folder/);
   assert.match(firstFailure, /D:\/work\/Notes/);
-  assert.match(firstFailure, /Browse files/);
-  assert.match(firstFailure, /AI edits, tests and rollback are available/);
+  // Code mode keeps the composer to model + permission + send: the folder is an icon-only trigger.
+  assert.match(firstFailure, /chat-composer-meta--compact/);
+  assert.doesNotMatch(firstFailure, /Browse files/);
+  assert.doesNotMatch(firstFailure, /chat-folder-chip/);
+  assert.match(firstFailure, /chat-mode-select--standard/);
+  assert.match(firstFailure, /class="chat-attach"/);
+  assert.doesNotMatch(firstFailure, /AI edits, tests and rollback are available/);
 
   const localResult = render({ goal: "Fix tests", status: "ready_for_pr", hasActiveRun: true });
   assert.match(localResult, /Review local results/);
@@ -700,7 +705,73 @@ try {
   gitChat.saved.loopRunning = false;
   await gitChat.stopChatLoop();
   assert.equal(gitChat.saved.loopRunning, true, "A stopping backend keeps the composer locked");
-  console.log("Desktop chat checks passed: folder flows, rendering, checkpoint diffs, startup checks, completion criteria and explicit evidence confirmation, acceptance/deletion confirmation and cancellation, empty-file patches, bilingual errors, stop handling, and polling recovery.");
+  const composerCode = (await server.transformRequest("/src/components/ChatPanel.tsx", { ssr: true })).code;
+  const sendHandler = composerCode.slice(composerCode.indexOf("const send ="), composerCode.indexOf("const fillIdea ="));
+  const compose = { draft: "Keep this goal", busy: false, sendingRef: { current: false }, submitting: false, calls: 0 };
+  const composeContext = {
+    ...compose, attachments: [], t: key => key, withAttachments: message => message,
+    setAttachments() {}, setAttachmentError() {},
+    setDraft: value => { compose.draft = typeof value === "function" ? value(compose.draft) : value; },
+    setSubmitting: value => { compose.submitting = value; }, scrollToBottom() {},
+    props: { onSend: async () => { compose.calls++; return false; } },
+  };
+  const send = runInNewContext(`${sendHandler}; send`, composeContext);
+  await send();
+  assert.equal(compose.draft, "Keep this goal", "A failed send must retain the full draft");
+  assert.equal(compose.submitting, false, "Failed sends must release the composer");
+  let finishSend;
+  composeContext.props.onSend = () => { compose.calls++; return new Promise(resolve => { finishSend = resolve; }); };
+  const firstSend = send();
+  await send();
+  assert.equal(compose.calls, 2, "Repeated clicks while awaiting a send must not duplicate the request");
+  finishSend(true);
+  await firstSend;
+  assert.equal(compose.draft, "", "Only an accepted send clears the draft");
+
+  const scrollCode = (await server.transformRequest("/src/components/useChatScrollPinning.ts", { ssr: true })).code;
+  const scrollStart = scrollCode.indexOf("function useChatScrollPinning(");
+  const scrollBody = scrollCode.slice(scrollStart, scrollCode.indexOf("\n}", scrollStart) + 2);
+  const scrollReact = scrollBody.match(/([\w$]+)\.useRef/)[1];
+  const effects = [];
+  let clock = 1000, jumpVisible = false, resize;
+  const scrollHooks = {
+    useRef: value => ({ current: value }), useCallback: callback => callback,
+    useState: value => [value, next => { jumpVisible = next; }],
+    useEffect: callback => { effects.push(callback); },
+  };
+  const pinned = runInNewContext(`${scrollBody}; useChatScrollPinning(0, "conversation")`, {
+    [scrollReact]: scrollHooks, performance: { now: () => clock },
+    ResizeObserver: class { constructor(callback) { resize = callback; } observe() {} disconnect() {} },
+  });
+  const viewport = { scrollTop: 600, scrollHeight: 1000, clientHeight: 400, calls: 0,
+    scrollTo({ top }) { this.scrollTop = top - this.clientHeight; this.calls++; } };
+  pinned.containerRef.current = viewport;
+  pinned.contentRef.current = {};
+  effects.forEach(effect => effect());
+  const initialScrolls = viewport.calls;
+  viewport.scrollTop = 100;
+  pinned.markUserInput();
+  pinned.updatePosition();
+  viewport.scrollHeight = 1400;
+  clock += 200;
+  resize();
+  assert.equal(viewport.calls, initialScrolls, "Incoming content must not pull a reader away from older messages");
+  assert.equal(jumpVisible, true);
+  pinned.scrollToBottom();
+  assert.equal(viewport.scrollTop, 1000);
+  assert.equal(jumpVisible, false, "Jumping to the latest message must restore following");
+  viewport.scrollTop -= 40;
+  pinned.markUserInput();
+  pinned.updatePosition();
+  viewport.scrollHeight += 80;
+  const beforeCooldown = viewport.calls;
+  clock += 100;
+  resize();
+  assert.equal(viewport.calls, beforeCooldown, "The 150ms user-input guard must win over content growth");
+  clock += 100;
+  resize();
+  assert.equal(viewport.calls, beforeCooldown + 1, "Within 40px of the bottom, following resumes after the input guard");
+  console.log("Desktop chat checks passed: folder flows, rendering, checkpoint diffs, startup checks, completion criteria and explicit evidence confirmation, acceptance/deletion confirmation and cancellation, empty-file patches, bilingual errors, stop handling, polling recovery, composer send recovery and scroll pinning.");
 } finally {
   await server.close();
 }

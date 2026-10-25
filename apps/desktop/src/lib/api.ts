@@ -18,7 +18,7 @@ function resolveApiBaseUrl(): string {
 const API_BASE_URL = resolveApiBaseUrl();
 
 export class ApiRequestError extends Error {
-  constructor(public code: string, message: string, public traceId?: string) {
+  constructor(public code: string, message: string, public traceId?: string, public details?: unknown) {
     super(message);
     this.name = "ApiRequestError";
   }
@@ -30,8 +30,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "content-type": "application/json", ...init?.headers },
   });
   if (!response.ok) {
-    const payload = (await response.json().catch(() => null)) as { code?: string; message?: string; trace_id?: string } | null;
-    throw new ApiRequestError(payload?.code ?? "API_ERROR", payload?.message ?? `Request failed: ${response.status}`, payload?.trace_id);
+    const payload = (await response.json().catch(() => null)) as { code?: string; message?: string; trace_id?: string; details?: unknown } | null;
+    throw new ApiRequestError(payload?.code ?? "API_ERROR", payload?.message ?? `Request failed: ${response.status}`, payload?.trace_id, payload?.details);
   }
   return response.json() as Promise<T>;
 }
