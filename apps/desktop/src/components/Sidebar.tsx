@@ -1,5 +1,5 @@
 import { useEffect, useRef, type KeyboardEvent } from "react";
-import { Code2, FolderOpen, Languages, LayoutDashboard, ListChecks, Monitor, Moon, MoreHorizontal, Plus, Settings2, ShieldCheck, Sun, TerminalSquare, X } from "lucide-react";
+import { Code2, FolderOpen, Languages, LayoutDashboard, ListChecks, Monitor, Moon, MoreHorizontal, Plus, Settings2, ShieldCheck, Sun, TerminalSquare, Trash2, X } from "lucide-react";
 import type { TaskTrack } from "../lib/api";
 import { usePreferences, type Language, type ThemeMode } from "../lib/preferences";
 
@@ -23,6 +23,7 @@ type SidebarProps = {
   onOpenFolder: () => void | Promise<void>;
   onOpenSettings: () => void;
   onSelectSession: (id: string) => void;
+  onDeleteSession: (session: Session) => void;
   onOpenRegisteredFolder: (id: string) => void;
 };
 
@@ -91,10 +92,15 @@ export function Sidebar(props: SidebarProps) {
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
   };
   const renderSession = (session: Session) => (
-    <button key={session.id} type="button" className={`chat-session ${session.id === props.activeSessionId ? "is-active" : ""}`} aria-current={session.id === props.activeSessionId ? "true" : undefined} onClick={() => selectSession(session.id)} title={session.title}>
-      <span className={`chat-session-dot chat-session-dot--${session.track === "cowork" ? "cowork" : session.status}`} />
-      <span className="chat-session-title">{session.title}</span>
-    </button>
+    <div key={session.id} className={`chat-session-row ${session.id === props.activeSessionId ? "is-active" : ""}`}>
+      <button type="button" className={`chat-session ${session.id === props.activeSessionId ? "is-active" : ""}`} aria-current={session.id === props.activeSessionId ? "true" : undefined} onClick={() => selectSession(session.id)} title={session.title}>
+        <span className={`chat-session-dot chat-session-dot--${session.track === "cowork" ? "cowork" : session.status}`} />
+        <span className="chat-session-title">{session.title}</span>
+      </button>
+      <button type="button" className="chat-session-delete" aria-label={t("rail.deleteChat")} title={t("rail.deleteChat")} onClick={(event) => { event.stopPropagation(); props.onDeleteSession(session); }}>
+        <Trash2 size={13} />
+      </button>
+    </div>
   );
 
   return <>
@@ -116,7 +122,7 @@ export function Sidebar(props: SidebarProps) {
       <div className="rail-section"><span>{t(props.track === "cowork" ? "rail.chats" : "rail.folders")}</span>{props.track === "code" ? <button type="button" className="icon-button" aria-label={t("folder.openLocal")} onClick={props.onOpenFolder} disabled={props.folderOpening}><Plus size={15} /></button> : null}</div>
       <div className="rail-conversations">
         {props.track === "cowork" ? props.sessions.length ? props.sessions.map(renderSession) : <p className="rail-empty">{t("chat.noSessions")}</p>
-          : props.groups.length ? props.groups.map(({ id, name, path, rows }) => <div className="rail-group" key={id}><details className="rail-folder-group" open><summary title={path || name}><FolderOpen size={14} /><span>{name}</span><span className="rail-folder-count">{rows.length}</span></summary><div className="rail-folder-sessions">{rows.map(renderSession)}{path ? <button type="button" className="rail-folder-new" onClick={() => { props.onOpenRegisteredFolder(id); props.onClose(); }}><Plus size={13} />{t("rail.newInFolder")}</button> : null}</div></details></div>) : <p className="rail-empty">{t("rail.emptyFolders")}</p>}
+          : props.groups.length ? props.groups.map(({ id, name, path, rows }) => <div className="rail-group" key={id}><div className="rail-group-head"><details className="rail-folder-group" open><summary title={path || name}><FolderOpen size={14} /><span>{name}</span><span className="rail-folder-count">{rows.length}</span></summary><div className="rail-folder-sessions">{rows.map(renderSession)}</div></details>{path ? <button type="button" className="rail-folder-add" aria-label={t("rail.newInFolder")} title={t("rail.newInFolder")} onClick={() => { props.onOpenRegisteredFolder(id); props.onClose(); }}><Plus size={13} /></button> : null}</div></div>) : <p className="rail-empty">{t("rail.emptyFolders")}</p>}
       </div>
       <div className="rail-footer">
         <div className="rail-local"><span className="pulse-dot" />{t("localExecution")}</div>

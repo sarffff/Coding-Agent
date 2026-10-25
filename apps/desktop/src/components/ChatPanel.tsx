@@ -44,8 +44,6 @@ type ChatPanelProps = {
   onOpenPublish: () => void;
   reviewPatch: boolean;
   onReviewPatch: () => void;
-  prepareTask?: boolean;
-  onPrepareTask?: () => void;
   error: string | null;
   mode: AgentMode;
   modeLocked: boolean;
@@ -424,7 +422,6 @@ export function ChatPanel(props: ChatPanelProps) {
       {props.reviewCompletion ? <div className="chat-handoff"><ShieldCheck size={14} /><span>{t("completion.reviewHint")}</span><button className="small-action" onClick={props.onOpenCompletion}>{t("completion.review")}</button></div> : null}
       {readyToPublish && !props.reviewCompletion ? <div className="chat-handoff"><Rocket size={14} /><span>{t("chat.handoff")}</span><button className="small-action" onClick={props.onOpenPublish}>{t("chat.openPublish")}</button></div> : null}
       {localReady && !props.reviewCompletion ? <div className="chat-handoff"><FileSearch size={14} /><span>{t("chat.localComplete")}</span><button className="small-action" onClick={props.onReviewPatch}>{t("chat.reviewLocal")}</button></div> : null}
-      {props.prepareTask ? <div className="chat-handoff"><ShieldCheck size={14} /><span>{t("chat.setupHint")}</span><button className="small-action" onClick={props.onPrepareTask} disabled={busy}>{t("chat.setupTitle")}</button></div> : null}
       {props.reviewPatch ? <div className="chat-handoff"><FileSearch size={14} /><span>{t("chat.reviewPatchHint")}</span><button className="small-action" onClick={props.onReviewPatch}>{t("chat.reviewPatch")}</button></div> : null}
 
             {composer}

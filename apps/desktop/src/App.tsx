@@ -208,10 +208,6 @@ function App() {
   const [loopRunning, setLoopRunning] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatPollError, setChatPollError] = useState<string | null>(null);
-  const [taskSetup, setTaskSetup] = useState<{ taskId: string; mode: AgentMode; feedback?: string } | null>(null);
-  const [taskSetupDirty, setTaskSetupDirty] = useState(false);
-  const [taskCriteriaDirty, setTaskCriteriaDirty] = useState(false);
-  const [taskSetupError, setTaskSetupError] = useState<string | null>(null);
   const [chatMode, setChatMode] = useState<AgentMode>("standard");
   const [modelName, setModelName] = useState("");
   const [chatPending, setChatPending] = useState<Approval | null>(null);
@@ -297,7 +293,6 @@ function App() {
   );
   const activeRepository = repositories.find(repository => repository.id === activeTask?.repositoryId);
   const activeTaskHasGit = activeRepository?.has_git === true;
-  const setupTask = tasks.find(task => task.id === taskSetup?.taskId);
   const activeTaskStarted = (activeTask?.currentIteration ?? 0) > 0;
 
   // Two stores: Cowork (chat, flat by recency) and Code (coding, grouped by folder).
@@ -564,6 +559,20 @@ function App() {
     void refreshModelName();
   }, []);
 
+  const deleteSession = async (session: { id: string; title: string }) => {
+    if (!window.confirm(t("chat.deleteConfirm").replace("{title}", session.title))) return;
+    try {
+      await deleteTask(session.id);
+      setTasks((current) => current.filter((task) => task.id !== session.id));
+      if (activeTaskId === session.id) {
+        setActiveTaskId("");
+        startNewChatSession();
+      }
+    } catch (reason) {
+      setChatError(describeError(reason, t("chat.error")));
+    }
+  };
+
   const removeRepository = async (repositoryId: string) => {
     const repository = repositories.find((item) => item.id === repositoryId);
     if (!repository || !window.confirm(t("browser.removeConfirm").replace("{name}", repository.name))) return;
@@ -586,20 +595,6 @@ function App() {
       setTasks((current) => current.filter((task) => task.repositoryId !== repositoryId));
     } catch (reason) {
       setRepositoryError(describeError(reason, t("repositoryError")));
-    }
-  };
-
-  const removeActiveTask = async () => {
-    if (!activeTask) return;
-    if (!window.confirm(t("chat.deleteConfirm").replace("{title}", activeTask.title))) return;
-    setChatError(null);
-    try {
-      await deleteTask(activeTask.id);
-      setTasks((current) => current.filter((task) => task.id !== activeTask.id));
-      setActiveTaskId("");
-      startNewChatSession();
-    } catch (reason) {
-      setChatError(describeError(reason, t("chat.error")));
     }
   };
 
@@ -663,16 +658,17 @@ function App() {
         setActiveTaskId(newTask.id);
         setChatComposingNew(false);
         setChatPending(null);
-        setTaskSetup({ taskId: newTask.id, mode });
-        setTaskSetupDirty(false);
-        setTaskCriteriaDirty(false);
-        setTaskSetupError(null);
+        // Start immediately: the composer already carries mode and goal, a setup dialog adds a step.
+        const started = await startAgentLoop(created.run_id, { mode, feedback: trimmed });
+        updateTaskFromApi(started.task);
+        setLoopRunning(started.loop_running);
+        setChatAction(started.action);
         return true;
-      } else if (!activeTaskStarted && !activeTask?.requiresRecovery) {
-        setTaskSetup({ taskId: activeTask!.id, mode: activeTask!.mode, feedback: trimmed });
-        setTaskSetupDirty(false);
-        setTaskCriteriaDirty(false);
-        setTaskSetupError(null);
+      } else if (!activeTaskStarted && !activeTask?.requiresRecovery && activeTask?.runId) {
+        const started = await startAgentLoop(activeTask.runId, { feedback: trimmed });
+        updateTaskFromApi(started.task);
+        setLoopRunning(started.loop_running);
+        setChatAction(started.action);
         return true;
       } else {
         await startAgentLoop(runId, { feedback: trimmed });
@@ -683,25 +679,6 @@ function App() {
     } catch (error) {
       setChatError(describeError(error, t("chat.error")));
       return false;
-    } finally {
-      chatSendingRef.current = false;
-      setChatSending(false);
-    }
-  };
-
-  const startPreparedTask = async () => {
-    if (!taskSetup || !setupTask?.runId || taskSetupDirty || taskCriteriaDirty || validationSaving || completionSaving || chatSendingRef.current) return;
-    chatSendingRef.current = true;
-    setChatSending(true);
-    setTaskSetupError(null);
-    try {
-      const state = await startAgentLoop(setupTask.runId, { mode: taskSetup.mode, feedback: taskSetup.feedback });
-      updateTaskFromApi(state.task);
-      setLoopRunning(state.loop_running);
-      setChatAction(state.action);
-      setTaskSetup(null);
-    } catch (error) {
-      setTaskSetupError(describeError(error, t("chat.error")));
     } finally {
       chatSendingRef.current = false;
       setChatSending(false);
@@ -1277,18 +1254,6 @@ function App() {
       <Dialog open={settingsOpen} title={t("settings.title")} onClose={() => { setSettingsOpen(false); void refreshModelName(); }}>
         <SettingsPanel embedded />
       </Dialog>
-      <Dialog open={taskSetup !== null} title={t("chat.setupTitle")} onClose={() => { if (!chatSending && !validationSaving && !completionSaving) setTaskSetup(null); }}>
-        {setupTask && taskSetup ? <>
-          <p>{setupTask.title}</p>
-          <p className="empty-detail">{t("chat.setupHint")}</p>
-          <div className="chat-mode">{(["conservative", "standard", "autonomous"] as AgentMode[]).map(mode => <button key={mode} type="button" className={`chat-mode-opt chat-mode-opt--${mode} ${taskSetup.mode === mode ? "is-active" : ""}`} disabled={chatSending || validationSaving || completionSaving} aria-pressed={taskSetup.mode === mode} title={t(`chat.mode.${mode}.hint`)} onClick={() => setTaskSetup(current => current ? { ...current, mode } : null)}><span className="chat-mode-dot" />{t(`chat.mode.${mode}`)}</button>)}</div>
-          <p className="empty-detail">{t(`chat.mode.${taskSetup.mode}.hint`)}</p>
-          <ValidationChecklist key={setupTask.id} taskId={setupTask.id} checks={setupTask.validationChecks} currentIteration={setupTask.currentIteration} revision={setupTask.updatedAt} hidden={false} disabled={chatSending || completionSaving} onSaved={updateTaskFromApi} onBusyChange={setValidationSaving} onDirtyChange={setTaskSetupDirty} />
-          <CompletionCriteria key={`criteria-${setupTask.id}`} taskId={setupTask.id} goal={setupTask.title} criteria={setupTask.completionCriteria} confirmation={setupTask.completionConfirmation} currentIteration={setupTask.currentIteration} preparation disabled={chatSending || validationSaving} onSaved={updateTaskFromApi} onBusyChange={setCompletionSaving} onDirtyChange={setTaskCriteriaDirty} />
-          {taskSetupError ? <p className="inline-error" role="alert">{taskSetupError}</p> : null}
-          <div className="dialog-actions"><button type="button" className="small-action small-action--muted" disabled={chatSending || validationSaving || completionSaving} onClick={() => setTaskSetup(null)}>{t("common.back")}</button><button type="button" className="small-action" disabled={chatSending || validationSaving || completionSaving || taskSetupDirty || taskCriteriaDirty} onClick={() => void startPreparedTask()}>{t(chatSending ? "working" : "chat.startPrepared")}</button></div>
-        </> : null}
-      </Dialog>
       <Sidebar
         open={sidebarOpen}
         activeNav={activeNav}
@@ -1306,6 +1271,7 @@ function App() {
         onSelectSession={selectChatSession}
         onOpenRegisteredFolder={openRegisteredFolder}
         onOpenSettings={() => setSettingsOpen(true)}
+        onDeleteSession={deleteSession}
       />
 
       <main className="main-content" inert={sidebarOpen}>
@@ -1333,8 +1299,6 @@ function App() {
             onOpenCompletion={openCompletionReview}
             reviewPatch={!chatComposingNew && activeTask?.mode === "conservative" && chatAction === "review_patch" && !loopRunning}
             onReviewPatch={openChatRun}
-            prepareTask={!chatComposingNew && activeTask?.track === "code" && !activeTaskStarted && !activeTask.requiresRecovery && !loopRunning && !["paused", "cancelled", "done", "failed"].includes(activeTask.status)}
-            onPrepareTask={() => { if (activeTask) { setTaskSetup({ taskId: activeTask.id, mode: activeTask.mode }); setTaskSetupDirty(false); setTaskCriteriaDirty(false); setTaskSetupError(null); } }}
             error={chatError ?? chatPollError}
             mode={chatComposingNew || !activeTask ? chatMode : activeTask.mode}
             modeLocked={!chatComposingNew && Boolean(activeTask)}
@@ -1343,7 +1307,6 @@ function App() {
             onDecide={decideChatApproval}
             budget={chatComposingNew ? null : chatBudget}
             modelName={modelName}
-            onDelete={activeTask && !loopRunning && !chatComposingNew ? removeActiveTask : undefined}
           />
           {activeNav === "repositories" ? <RepositoryBrowser repositories={repositories} repositoryId={selectedRepositoryId} onRepositoryChange={(id) => { setSelectedRepositoryId(id); setSourceLocation(null); }} onOpenFolder={addRepository} onEdit={prepareSourceChange} canEdit={Boolean(activeTask?.repositoryId === selectedRepositoryId && activeTask.lifecycleStatus === "coding")} initialFile={sourceLocation} onDelete={removeRepository} /> : null}
           <section className="hero-block">
@@ -1455,6 +1418,12 @@ function App() {
               {patchError ? <div className="inline-error">{patchError}</div> : null}
             </section>
           </section>
+
+          {activeTask && activeTask.currentIteration === 0 && activeNav === "runs" ? (
+            <section className="panel completion-panel">
+              <CompletionCriteria key={`criteria-${activeTask.id}`} taskId={activeTask.id} goal={activeTask.title} criteria={activeTask.completionCriteria} confirmation={activeTask.completionConfirmation} currentIteration={0} preparation disabled={operationBusy} onSaved={updateTaskFromApi} onBusyChange={setCompletionSaving} />
+            </section>
+          ) : null}
 
           {activeTaskHasGit ? <><section className="operations-grid git-grid" inert={Boolean(agentBusyAction) || approvalRunning}>
             <section className="panel git-panel">

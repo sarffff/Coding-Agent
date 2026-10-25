@@ -5053,3 +5053,88 @@ h2 {
   margin-bottom: 4px;
   padding-bottom: 8px;
 }
+
+/* ---------- 侧边栏：会话删除与文件夹新建 ---------- */
+
+.chat-session-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: var(--radius-md, 8px);
+}
+
+.chat-session-row:hover,
+.chat-session-row:focus-within {
+  background: var(--surface-2);
+}
+
+.chat-session-row .chat-session {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  background: transparent;
+}
+
+.chat-session-row .chat-session:hover {
+  background: transparent;
+}
+
+.chat-session-delete {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-faint);
+  opacity: 0;
+  transition: opacity var(--cds-duration-fast, 120ms) var(--ease-swift, ease);
+}
+
+.chat-session-row:hover .chat-session-delete,
+.chat-session-row:focus-within .chat-session-delete {
+  opacity: 1;
+}
+
+.chat-session-delete:hover {
+  color: var(--danger, #b4453a);
+  background: var(--surface-1);
+}
+
+.rail-group-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.rail-group-head .rail-folder-group {
+  flex: 1;
+  min-width: 0;
+}
+
+.rail-folder-add {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.rail-folder-add:hover {
+  color: var(--text-secondary);
+  background: var(--surface-2);
+}
+
+.completion-panel {
+  margin-top: 18px;
+}

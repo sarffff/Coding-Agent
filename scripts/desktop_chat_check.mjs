@@ -147,8 +147,7 @@ try {
   const review = render({ goal: "Fix tests", status: "coding", hasActiveRun: true,
     mode: "conservative", reviewPatch: true });
   assert.match(review, />Review patch</);
-  const prepared = render({ goal: "Fix tests", status: "awaiting_approval", hasActiveRun: true, prepareTask: true });
-  assert.match(prepared, /Review before starting/);
+  // The setup dialog is gone: sending a goal starts the task, so no handoff button is rendered.
 
   const cowork = render({ track: "cowork", selectedRepositoryId: "", sending: true });
   assert.match(cowork, /<details class="folder-picker">/);
@@ -157,23 +156,14 @@ try {
 
   const { default: App } = await server.ssrLoadModule("/src/App.tsx");
   const app = renderToStaticMarkup(React.createElement(PreferencesProvider, null, React.createElement(App)));
-  assert.match(app, /Review before starting/);
-  const preparationHandoffs = markup => (markup.match(/<div class="chat-handoff">[\s\S]*?<\/div>/g) ?? []).filter(item => item.includes("Review before starting"));
-  const { default: WaitingPlanApp } = await server.ssrLoadModule("/src/App.tsx?pre-iteration");
-  const waitingPlan = renderToStaticMarkup(React.createElement(PreferencesProvider, null, React.createElement(WaitingPlanApp)));
-  assert.equal(preparationHandoffs(waitingPlan).length, 1, "A loop waiting for first plan approval must still allow editing completion criteria");
-  const { default: StartedIterationApp } = await server.ssrLoadModule("/src/App.tsx?pre-iteration-started");
-  const startedIteration = renderToStaticMarkup(React.createElement(PreferencesProvider, null, React.createElement(StartedIterationApp)));
-  assert.equal(preparationHandoffs(startedIteration).length, 0, "Beginning the first coding iteration must remove the preparation entry");
-  const { default: RunningPreparationApp } = await server.ssrLoadModule("/src/App.tsx?pre-iteration-running");
-  const runningPreparation = renderToStaticMarkup(React.createElement(PreferencesProvider, null, React.createElement(RunningPreparationApp)));
-  assert.equal(preparationHandoffs(runningPreparation).length, 0, "A running loop must finish before preparation can be edited");
+  // The setup dialog is gone: sending a goal starts the loop, so no preparation handoff exists.
+  assert.doesNotMatch(app, /Review before starting/);
   const emptyFolder = app.match(/<details class="rail-folder-group"[\s\S]*?<\/details>/)?.[0];
   assert.ok(emptyFolder, "An opened folder must appear before it has any tasks");
   assert.match(emptyFolder, /<summary title="D:\/work\/Notes">/);
   assert.match(emptyFolder, /<span>Notes<\/span>/);
   assert.match(emptyFolder, /class="rail-folder-count">0<\/span>/);
-  assert.match(emptyFolder, /<button[^>]*class="rail-folder-new"/);
+  assert.match(app, /<button[^>]*class="rail-folder-add"/);  // new-chat sits beside the folder, not inside it
   const apiModule = await server.ssrLoadModule("/src/lib/api.ts");
   const errorsModule = await server.ssrLoadModule("/src/lib/errorMessages.ts");
   for (const errorCode of ["MODEL_NO_CHANGE", "AGENT_NO_PROGRESS", "AGENT_EXECUTION_FAILED", "VALIDATION_REVIEW_REQUIRED", "VALIDATION_BASELINE_BLOCKED", "VALIDATION_INPUT_UNAVAILABLE", "VALIDATION_SCOPE_TOO_LARGE", "COMPLETION_REQUIRED", "COMPLETION_NOT_REQUIRED", "COMPLETION_CONFIRMATION_STALE", "COMPLETION_VALIDATION_REQUIRED", "INVALID_COMPLETION_EVIDENCE"]) {
@@ -647,7 +637,7 @@ try {
     for (const key of ["taskSetup", "taskSetupDirty", "taskCriteriaDirty", "taskSetupError"]) {
       context[`set${key[0].toUpperCase()}${key.slice(1)}`] = value => { saved[key] = value; context[key] = value; };
     }
-    const callbacks = runInNewContext(`${handlers}; ({ sendChatMessage, startPreparedTask, stopChatLoop });`, context);
+    const callbacks = runInNewContext(`${handlers}; ({ sendChatMessage, stopChatLoop });`, context);
     return { ...callbacks, saved, original, context, api };
   };
   const localChat = checkCallbacks(false);
@@ -655,47 +645,23 @@ try {
   assert.equal(localChat.saved.created.length, 1);
   assert.equal(localChat.saved.created[0][1], "original-folder");
   assert.equal(localChat.saved.created[0][2], "conservative");
-  assert.equal(localChat.saved.started.length, 0, "Creating a Code task must leave time to configure its checks");
-  assert.equal(localChat.saved.taskSetup.taskId, "new-task");
-  assert.equal(localChat.saved.taskSetup.mode, "conservative");
-  assert.ok(localChat.saved.tasks.includes(localChat.original));
-  localChat.context.setupTask = { id: "new-task", runId: "new-run" };
-  localChat.context.taskSetupDirty = true;
-  await localChat.startPreparedTask();
-  assert.equal(localChat.saved.started.length, 0, "Unsaved checks must block task execution");
-  localChat.context.taskSetupDirty = false;
-  localChat.context.validationSaving = true;
-  await localChat.startPreparedTask();
-  assert.equal(localChat.saved.started.length, 0, "Saving checks must finish before execution");
-  localChat.context.validationSaving = false;
-  localChat.context.taskCriteriaDirty = true;
-  await localChat.startPreparedTask();
-  assert.equal(localChat.saved.started.length, 0, "Unsaved completion criteria must block task execution independently of saved checks");
-  localChat.context.taskCriteriaDirty = false;
-  localChat.context.completionSaving = true;
-  await localChat.startPreparedTask();
-  assert.equal(localChat.saved.started.length, 0, "Saving completion criteria must finish before task execution");
-  localChat.context.completionSaving = false;
-  localChat.api.startAgentLoop = async () => { throw new Error("model unavailable"); };
-  await localChat.startPreparedTask();
-  assert.equal(localChat.saved.taskSetupError, "model unavailable");
-  assert.equal(localChat.saved.taskSetup.taskId, "new-task", "A failed start must keep the prepared task for retry");
-  localChat.api.startAgentLoop = async (...args) => { localChat.saved.started.push(args); return { loop_running: true, task: {}, action: "review_patch" }; };
-  localChat.context.taskSetup.mode = "standard";
-  await localChat.startPreparedTask();
+  assert.equal(localChat.saved.started.length, 1, "A Code task starts as soon as it is created");
   assert.equal(localChat.saved.started[0][0], "new-run");
-  assert.equal(localChat.saved.started[0][1].mode, "standard");
-  assert.equal(localChat.saved.taskSetup, null);
-  assert.equal(localChat.saved.loopRunning, true);
+  assert.equal(localChat.saved.started[0][1].mode, "conservative");
+  assert.ok(localChat.saved.tasks.includes(localChat.original));
+
+  // A failing start reports back to the composer so the draft can be restored.
+  localChat.api.startAgentLoop = async () => { throw new Error("model unavailable"); };
+  assert.equal(await localChat.sendChatMessage("A third goal"), false);
 
   const queuedChat = checkCallbacks(true);
   queuedChat.original.currentIteration = 0;
   queuedChat.context.activeTaskStarted = false;
-  await queuedChat.sendChatMessage("Use these acceptance checks");
+  assert.equal(await queuedChat.sendChatMessage("Use these acceptance checks"), true);
   assert.equal(queuedChat.saved.created.length, 0, "Reopening an unstarted task must reuse it");
-  assert.equal(queuedChat.saved.started.length, 0);
-  assert.equal(queuedChat.saved.taskSetup.taskId, "old-task");
-  assert.equal(queuedChat.saved.taskSetup.feedback, "Use these acceptance checks");
+  assert.equal(queuedChat.saved.started.length, 1);
+  assert.equal(queuedChat.saved.started[0][0], "old-run");
+  assert.equal(queuedChat.saved.started[0][1].feedback, "Use these acceptance checks");
 
   const gitChat = checkCallbacks(true);
   assert.equal(await gitChat.sendChatMessage("Continue this PR"), true);
