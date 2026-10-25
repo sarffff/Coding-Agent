@@ -8,7 +8,7 @@ from typing import Callable
 
 from .config import Settings
 from .model_provider import ModelProvider, build_model_provider
-from .models import ConfigResponse, ConfigUpdateRequest
+from .models import ConfigResponse, ConfigUpdateRequest, ModelProfile, ModelProfileView
 from .repository_service import RepositoryError
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,45 @@ EDITABLE_FIELDS = (
     "llm_max_context_bytes",
     "command_timeout_seconds",
 )
+
+
+MODEL_LIST_KEY = "models"
+ACTIVE_MODEL_KEY = "active_model_id"
+
+
+def apply_model_profile(settings: Settings, profile: ModelProfile) -> None:
+    """Point the flat settings at one saved profile; empty base_url/key leave the current value."""
+    settings.llm_provider = profile.provider
+    settings.llm_model = profile.model
+    if profile.provider == "openai":
+        if profile.base_url:
+            settings.openai_api_url = profile.base_url
+        if profile.api_key is not None:
+            settings.openai_api_key = profile.api_key
+    elif profile.provider == "anthropic":
+        if profile.base_url:
+            settings.anthropic_api_url = profile.base_url
+        if profile.api_key is not None:
+            settings.anthropic_api_key = profile.api_key
+
+
+def _load_saved_models(path: Path) -> tuple[list[ModelProfile], str | None]:
+    if not path.is_file():
+        return [], None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [], None
+    if not isinstance(data, dict):
+        return [], None
+    models: list[ModelProfile] = []
+    for item in data.get(MODEL_LIST_KEY) or []:
+        try:
+            models.append(ModelProfile(**item))
+        except (TypeError, ValueError):
+            logger.warning("Skipping an invalid saved model entry in %s", path)
+    active = data.get(ACTIVE_MODEL_KEY)
+    return models, active if isinstance(active, str) else None
 
 
 def overrides_path(settings: Settings) -> Path:
@@ -57,6 +96,11 @@ def apply_overrides(settings: Settings) -> list[str]:
         if isinstance(value, (str, int)) and not isinstance(value, bool):
             setattr(settings, name, value)
             applied.append(name)
+    models, active = _load_saved_models(path)
+    profile = next((item for item in models if item.id == active), None)
+    if profile is not None:
+        apply_model_profile(settings, profile)
+        applied.append(ACTIVE_MODEL_KEY)
     return applied
 
 
@@ -67,6 +111,7 @@ class ConfigService:
         self.settings = settings
         self._on_provider_change = on_provider_change
         self._restart_required = False
+        self._models, self._active_model_id = _load_saved_models(overrides_path(settings))
 
     def describe(self) -> ConfigResponse:
         s = self.settings
@@ -92,11 +137,19 @@ class ConfigService:
             audit_retention_days=s.audit_retention_days,
             test_output_retention_days=s.test_output_retention_days,
             restart_required=self._restart_required,
+            models=[
+                ModelProfileView(id=item.id, label=item.label, provider=item.provider, model=item.model,
+                                 base_url=item.base_url, api_key_configured=bool(item.api_key))
+                for item in self._models
+            ],
+            active_model_id=self._active_model_id,
         )
 
     def update(self, payload: ConfigUpdateRequest) -> ConfigResponse:
         changes = payload.model_dump(exclude_none=True)
-        if not changes:
+        models = changes.pop(MODEL_LIST_KEY, None)
+        active = changes.pop(ACTIVE_MODEL_KEY, None)
+        if not changes and models is None and active is None:
             raise RepositoryError("CONFIG_EMPTY", "No setting was provided.")
         for name, value in changes.items():
             if isinstance(value, str) and not value.strip() and name in {"anthropic_api_url", "openai_api_url"}:
@@ -105,9 +158,34 @@ class ConfigService:
         previous_provider = self.settings.llm_provider
         for name, value in changes.items():
             setattr(self.settings, name, value)
-        self._persist(changes)
 
-        if self.settings.llm_provider != previous_provider:
+        saved: dict[str, object] = dict(changes)
+        if models is not None:
+            # The UI never sees stored keys, so an entry without one keeps the key it already had.
+            # Sending an explicit empty string is how a key gets cleared.
+            existing_keys = {item.id: item.api_key for item in self._models}
+            incoming = [ModelProfile(**item) for item in models]
+            for item in incoming:
+                if item.api_key is None and item.id in existing_keys:
+                    item.api_key = existing_keys[item.id]
+            self._models = incoming
+            saved[MODEL_LIST_KEY] = [item.model_dump() for item in self._models]
+            if self._active_model_id not in {item.id for item in self._models}:
+                # The active entry was removed (or renamed): fall back to the flat settings.
+                self._active_model_id = None
+                saved[ACTIVE_MODEL_KEY] = None
+        if active is not None:
+            if active not in {item.id for item in self._models}:
+                raise RepositoryError("CONFIG_INVALID_VALUE", "The selected model is not in the saved list.", {"field": ACTIVE_MODEL_KEY})
+            self._active_model_id = active
+            saved[ACTIVE_MODEL_KEY] = active
+
+        self._persist(saved)
+
+        profile = next((item for item in self._models if item.id == self._active_model_id), None)
+        if profile is not None:
+            apply_model_profile(self.settings, profile)
+        if profile is not None or self.settings.llm_provider != previous_provider:
             if self._on_provider_change is not None:
                 # The provider object is built from settings once; swap it so the change takes effect now.
                 self._on_provider_change(build_model_provider(self.settings))
@@ -126,7 +204,8 @@ class ConfigService:
                     existing = loaded
             except (OSError, json.JSONDecodeError):
                 existing = {}
-        existing.update({name: value for name, value in changes.items() if name in EDITABLE_FIELDS})
+        existing.update({name: value for name, value in changes.items()
+                         if name in EDITABLE_FIELDS or name in (MODEL_LIST_KEY, ACTIVE_MODEL_KEY)})
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.tmp")
         tmp.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")

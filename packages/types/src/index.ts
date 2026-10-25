@@ -433,6 +433,30 @@ export type AppConfig = {
   audit_retention_days: number;
   test_output_retention_days: number;
   restart_required: boolean;
+  models: ModelProfileView[];
+  active_model_id: string | null;
+};
+
+export type ModelProviderKind = "anthropic" | "openai" | "fake";
+
+/** A saved provider/model pair as the API reports it: the key is write-only. */
+export type ModelProfileView = {
+  id: string;
+  label: string;
+  provider: ModelProviderKind;
+  model: string;
+  base_url: string;
+  api_key_configured: boolean;
+};
+
+/** What the client sends when saving the list; omit api_key to keep the stored one. */
+export type ModelProfileInput = {
+  id: string;
+  label: string;
+  provider: ModelProviderKind;
+  model: string;
+  base_url: string;
+  api_key?: string;
 };
 
 /** Request shape uses the backend field names; AppConfig is the response shape. */
@@ -448,6 +472,8 @@ export type ConfigUpdate = {
   llm_max_context_files?: number;
   llm_max_context_bytes?: number;
   command_timeout_seconds?: number;
+  models?: ModelProfileInput[];
+  active_model_id?: string;
 };
 
 export type DeleteResult = {

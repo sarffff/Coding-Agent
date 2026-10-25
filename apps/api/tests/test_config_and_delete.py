@@ -105,3 +105,62 @@ def test_delete_repository_needs_cascade_and_never_touches_disk(api_client, demo
     assert api_client.delete(f"/api/v1/repositories/{repository['id']}").status_code == 404
     # Unregistering a folder must never delete the user's files.
     assert (demo_repository / "app.py").is_file()
+
+
+def test_saved_models_switch_the_active_provider(api_client):
+    models = [
+        {"id": "local", "label": "Qwen local", "provider": "openai", "model": "Qwen3.8-27B",
+         "base_url": "https://local.example/v1", "api_key": "sk-local-secret"},
+        {"id": "claude", "label": "Claude", "provider": "anthropic", "model": "claude-test-x",
+         "base_url": "", "api_key": "sk-ant-secret"},
+    ]
+    updated = api_client.put("/api/v1/config", json={"models": models, "active_model_id": "local"}).json()
+
+    assert updated["active_model_id"] == "local"
+    assert [item["id"] for item in updated["models"]] == ["local", "claude"]
+    assert all(item["api_key_configured"] for item in updated["models"])
+    # Saved keys are write-only, exactly like the flat fields.
+    assert "sk-local-secret" not in json.dumps(updated)
+    assert "sk-ant-secret" not in json.dumps(updated)
+    assert (updated["provider"], updated["model"]) == ("openai", "Qwen3.8-27B")
+    assert type(main.agent_service.models).__name__ == "OpenAIModelProvider"
+
+    switched = api_client.put("/api/v1/config", json={"active_model_id": "claude"}).json()
+    assert (switched["provider"], switched["model"]) == ("anthropic", "claude-test-x")
+    assert type(main.agent_service.models).__name__ == "AnthropicModelProvider"
+
+    # The choice survives a restart: apply_overrides points the flat settings at the active profile.
+    fresh = Settings(_env_file=None, state_dir=main.settings.state_dir)
+    assert apply_overrides(fresh) == ["active_model_id"]
+    assert (fresh.llm_provider, fresh.llm_model) == ("anthropic", "claude-test-x")
+    assert fresh.anthropic_api_key == "sk-ant-secret"
+
+    # Dropping the active entry falls back to the flat settings instead of pointing at a ghost.
+    removed = api_client.put("/api/v1/config", json={"models": [models[0]]}).json()
+    assert removed["active_model_id"] is None
+    assert [item["id"] for item in removed["models"]] == ["local"]
+
+    unknown = api_client.put("/api/v1/config", json={"active_model_id": "ghost"})
+    assert unknown.status_code == 422
+    assert unknown.json()["code"] == "CONFIG_INVALID_VALUE"
+
+
+def test_editing_the_model_list_keeps_keys_the_ui_cannot_see(api_client):
+    models = [{"id": "local", "label": "Qwen", "provider": "openai", "model": "qwen", "base_url": "", "api_key": "sk-keep"}]
+    api_client.put("/api/v1/config", json={"models": models, "active_model_id": "local"})
+
+    # The UI only has the masked view; saving the list again must not wipe the key.
+    edited = api_client.put("/api/v1/config", json={"models": [
+        {"id": "local", "label": "Qwen renamed", "provider": "openai", "model": "qwen", "base_url": ""},
+        {"id": "second", "label": "Second", "provider": "anthropic", "model": "claude-y", "base_url": "", "api_key": "sk-new"},
+    ]}).json()
+
+    assert [item["label"] for item in edited["models"]] == ["Qwen renamed", "Second"]
+    assert all(item["api_key_configured"] for item in edited["models"])
+    assert main.settings.openai_api_key == "sk-keep"
+
+    # An explicit empty key clears it.
+    cleared = api_client.put("/api/v1/config", json={"models": [
+        {"id": "local", "label": "Qwen renamed", "provider": "openai", "model": "qwen", "base_url": "", "api_key": ""},
+    ]}).json()
+    assert cleared["models"][0]["api_key_configured"] is False

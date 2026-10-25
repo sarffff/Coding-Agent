@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { KeyRound, Save } from "lucide-react";
-import { getConfig, updateConfig, type AppConfig, type ConfigUpdate } from "../lib/api";
+import { getConfig, updateConfig, type AppConfig, type ConfigUpdate, type ModelProfileInput, type ModelProviderKind } from "../lib/api";
 import { describeError } from "../lib/errorMessages";
 import { usePreferences } from "../lib/preferences";
 
@@ -66,6 +66,10 @@ export function SettingsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
+  const [modelBusy, setModelBusy] = useState(false);
+  const models = config?.models ?? [];
+  const [newModel, setNewModel] = useState({ label: "", provider: "openai" as ModelProviderKind, model: "", base_url: "", api_key: "" });
 
   useEffect(() => {
     const controller = new AbortController();
@@ -109,6 +113,50 @@ export function SettingsPanel() {
     }
   };
 
+  const saveModels = async (models: ModelProfileInput[], activeModelId?: string) => {
+    setModelBusy(true);
+    setModelError(null);
+    try {
+      const next = await updateConfig({ models, ...(activeModelId ? { active_model_id: activeModelId } : {}) });
+      setConfig(next);
+      setDraft(toDraft(next));
+    } catch (reason) {
+      setModelError(describeError(reason, t("settings.models.saveError")));
+    } finally {
+      setModelBusy(false);
+    }
+  };
+
+  const modelInput = (item: AppConfig["models"][number]): ModelProfileInput => ({
+    id: item.id, label: item.label, provider: item.provider, model: item.model, base_url: item.base_url,
+  });
+
+  const addModel = async () => {
+    if (!config || modelBusy) return;
+    if (!newModel.label.trim() || !newModel.model.trim()) {
+      setModelError(t("settings.models.required"));
+      return;
+    }
+    const id = `m-${Date.now().toString(36)}`;
+    const entry: ModelProfileInput = {
+      id, label: newModel.label.trim(), provider: newModel.provider, model: newModel.model.trim(),
+      base_url: newModel.base_url.trim(), api_key: newModel.api_key || undefined,
+    };
+    await saveModels([...models.map(modelInput), entry], id);
+    setNewModel({ label: "", provider: "openai", model: "", base_url: "", api_key: "" });
+  };
+
+  const removeModel = async (item: AppConfig["models"][number]) => {
+    if (!config || modelBusy) return;
+    if (!window.confirm(t("settings.models.confirmRemove").replace("{name}", item.label))) return;
+    await saveModels(models.filter((entry) => entry.id !== item.id).map(modelInput));
+  };
+
+  const activateModel = async (id: string) => {
+    if (!config || modelBusy || config.active_model_id === id) return;
+    await saveModels(models.map(modelInput), id);
+  };
+
   if (!config || !draft) {
     return (
       <section className="panel settings-panel">
@@ -130,7 +178,48 @@ export function SettingsPanel() {
       {error ? <div className="inline-error" role="alert">{error}</div> : null}
       {config.restart_required ? <p className="settings-note">{t("settings.restartRequired")}</p> : null}
 
+      <section className="settings-models">
+        <div className="settings-models-head">
+          <h3>{t("settings.models.title")}</h3>
+          <span>{t("settings.models.hint")}</span>
+        </div>
+        {models.length ? (
+          <ul className="settings-model-list">
+            {models.map((item) => (
+              <li key={item.id} className={item.id === config.active_model_id ? "is-active" : ""}>
+                <div className="settings-model-copy">
+                  <strong>{item.label}</strong>
+                  <span>{item.provider} · {item.model}</span>
+                  <small>{item.base_url || t("settings.models.defaultUrl")} · {item.api_key_configured ? t("settings.models.keySet") : t("settings.models.keyMissing")}</small>
+                </div>
+                <div className="settings-model-actions">
+                  {item.id === config.active_model_id
+                    ? <span className="settings-model-badge">{t("settings.models.active")}</span>
+                    : <button type="button" className="small-action small-action--muted" disabled={modelBusy} onClick={() => void activateModel(item.id)}>{t("settings.models.use")}</button>}
+                  <button type="button" className="text-button" disabled={modelBusy} onClick={() => void removeModel(item)}>{t("settings.models.remove")}</button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : <p className="settings-note">{t("settings.models.empty")}</p>}
+        <div className="settings-model-add">
+          <input value={newModel.label} onChange={(event) => setNewModel({ ...newModel, label: event.target.value })} placeholder={t("settings.models.label")} aria-label={t("settings.models.label")} maxLength={80} />
+          <select value={newModel.provider} onChange={(event) => setNewModel({ ...newModel, provider: event.target.value as ModelProviderKind })} aria-label={t("settings.models.provider")}>
+            <option value="openai">openai</option>
+            <option value="anthropic">anthropic</option>
+            <option value="fake">{t("settings.fake")}</option>
+          </select>
+          <input value={newModel.model} onChange={(event) => setNewModel({ ...newModel, model: event.target.value })} placeholder={t("settings.models.model")} aria-label={t("settings.models.model")} maxLength={200} />
+          <input value={newModel.base_url} onChange={(event) => setNewModel({ ...newModel, base_url: event.target.value })} placeholder={t("settings.models.baseUrl")} aria-label={t("settings.models.baseUrl")} maxLength={500} />
+          <input type="password" autoComplete="off" value={newModel.api_key} onChange={(event) => setNewModel({ ...newModel, api_key: event.target.value })} placeholder={t("settings.models.apiKey")} aria-label={t("settings.models.apiKey")} maxLength={500} />
+          <button type="button" className="small-action" disabled={modelBusy} onClick={() => void addModel()}>{t("settings.models.add")}</button>
+        </div>
+        {modelError ? <p className="inline-error" role="alert">{modelError}</p> : null}
+      </section>
+
       <div className="settings-grid">
+        {models.length ? <p className="settings-note settings-note--span">{t("settings.models.controls")}</p> : null}
+        {models.length ? null : <>
         <label className="settings-field">
           <span>{t("settings.provider")}</span>
           <select value={draft.llm_provider} onChange={set("llm_provider")} disabled={busy}>
@@ -144,6 +233,7 @@ export function SettingsPanel() {
           <input value={draft.llm_model} onChange={set("llm_model")} disabled={busy} spellCheck={false} />
         </label>
 
+        {models.length ? null : <>
         <label className="settings-field settings-field--wide">
           <span>{t("settings.anthropicKey")}</span>
           <input
@@ -166,6 +256,7 @@ export function SettingsPanel() {
             placeholder={config.openai_key_configured ? t("settings.keyConfigured") : t("settings.keyMissing")}
           />
         </label>
+        </>}
 
         <label className="settings-field">
           <span>{t("settings.anthropicUrl")}</span>
@@ -175,6 +266,7 @@ export function SettingsPanel() {
           <span>{t("settings.openaiUrl")}</span>
           <input value={draft.openai_api_url} onChange={set("openai_api_url")} disabled={busy} spellCheck={false} />
         </label>
+        </>}
 
         <label className="settings-field">
           <span>{t("settings.llmTimeout")}</span>

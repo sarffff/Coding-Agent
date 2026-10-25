@@ -65,6 +65,7 @@ pnpm dev            # 只启动 Desktop：http://127.0.0.1:5173
 | `FORGE_REMOTE_TIMEOUT_SECONDS` | 同上 | 远程 REST 调用与推送超时 | 30 |
 | `FORGE_IDEMPOTENCY_TTL_HOURS` | 同上 | `Idempotency-Key` 记录保留时长 | 24 |
 | `FORGE_CHECKPOINT_MAX_PER_TASK` | 同上 | 每个任务保留的检查点数；超出的最旧检查点删除备份、保留记录并标记「已清理」，不可再回滚 | 20 |
+| 输入长度 | — | 任务目标/聊天消息 1–32,000 字符（空串拒绝），分支名 1–100，提交信息 1–2,000，补丁说明 ≤4,000；前后端同一口径 | — |
 | `FORGE_LLM_PROVIDER` | 同上 | 补丁起草 Provider：`anthropic` / `openai` / 离线 `fake`（仅测试，需显式 seed） | `anthropic` |
 | `FORGE_ANTHROPIC_API_KEY` / `FORGE_OPENAI_API_KEY` | 同上 | 对应 Provider 的 API key，用于补丁起草；只进请求头 | 空 |
 | `FORGE_LLM_MODEL` | 同上 | 起草模型，须与 provider 匹配（anthropic 可设 `claude-opus-5-5`，openai 设 gpt 模型；其余 `FORGE_LLM_*`/`FORGE_OPENAI_API_URL` 见 `.env.example`） | `claude-sonnet-5-5` |
@@ -73,7 +74,7 @@ pnpm dev            # 只启动 Desktop：http://127.0.0.1:5173
 
 复制 `apps/api/.env.example` 与 `apps/desktop/.env.example` 为 `.env` 后再修改。
 
-设置页（侧栏「设置」）可以直接改 Provider、模型名、API Key、接口地址、模型/命令超时和上下文上限。改动写入 `FORGE_STATE_DIR/config.json`（仅本人可读），启动时覆盖 `.env`；密钥只回显「已配置 / 未配置」，不会出现在界面、审计事件或错误响应里。保留期限、任务预算和工作区根仍是只读项，需要改环境变量并重启。
+设置页（账号菜单「设置」弹窗）可以保存多组「供应商 + 模型」，随时切换使用中的一组；切换会立即重建模型实例并写入 `config.json`，下次启动沿用。同一弹窗里还能改 API Key、接口地址、模型/命令超时和上下文上限。改动写入 `FORGE_STATE_DIR/config.json`（仅本人可读），启动时覆盖 `.env`；密钥只回显「已配置 / 未配置」，不会出现在界面、审计事件或错误响应里。保留期限、任务预算和工作区根仍是只读项，需要改环境变量并重启。
 
 > CORS 默认只放行 5173。Desktop 运行在其他端口时必须把该端口加入 `FORGE_CORS_ORIGINS`，否则请求会被浏览器拦截，界面表现为“没有仓库、没有任务”。桌面壳不需要这一步——它会把自己的来源注入 `FORGE_CORS_ORIGINS`。
 

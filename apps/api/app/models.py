@@ -248,7 +248,7 @@ CompletionStatus = Literal["not_required", "pending", "stale", "confirmed"]
 
 
 class TaskCreateRequest(BaseModel):
-    goal: str = Field(min_length=3, max_length=4_000)
+    goal: str = Field(min_length=1, max_length=32_000)
     repository_id: str | None = None
     mode: AgentMode = "standard"
     track: TaskTrack = "code"
@@ -263,7 +263,7 @@ class TaskCreateRequest(BaseModel):
 
 
 class ChatMessageRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=8_000)
+    message: str = Field(min_length=1, max_length=32_000)
 
 
 class ChatMessageResponse(BaseModel):
@@ -356,7 +356,7 @@ class TaskIterationListResponse(BaseModel):
 
 
 class IterationCreateRequest(BaseModel):
-    goal: str | None = Field(default=None, min_length=3, max_length=4_000)
+    goal: str | None = Field(default=None, min_length=1, max_length=32_000)
 
 
 class RepairCreateRequest(BaseModel):
@@ -383,7 +383,7 @@ class TaskCheckpointListResponse(BaseModel):
 
 
 class BranchCreateRequest(BaseModel):
-    name: str = Field(min_length=3, max_length=100)
+    name: str = Field(min_length=1, max_length=100)
 
 
 class GitSnapshotResponse(BaseModel):
@@ -394,7 +394,7 @@ class GitSnapshotResponse(BaseModel):
 
 
 class CommitPreviewRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=2_000)
 
 
 class CommitPreviewResponse(BaseModel):
@@ -768,6 +768,28 @@ class AuditEventListResponse(BaseModel):
     total: int
 
 
+class ModelProfile(BaseModel):
+    """One saved provider/model pair the user can switch between."""
+
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    label: str = Field(min_length=1, max_length=80)
+    provider: Literal["anthropic", "openai", "fake"]
+    model: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(default="", max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+
+
+class ModelProfileView(BaseModel):
+    """A saved model as the UI sees it: the key is reported as configured or not."""
+
+    id: str
+    label: str
+    provider: str
+    model: str
+    base_url: str
+    api_key_configured: bool
+
+
 class ConfigResponse(BaseModel):
     """Runtime configuration with secrets reduced to "configured or not"."""
 
@@ -792,6 +814,8 @@ class ConfigResponse(BaseModel):
     audit_retention_days: int
     test_output_retention_days: int
     restart_required: bool = False
+    models: list[ModelProfileView] = Field(default_factory=list)
+    active_model_id: str | None = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -811,6 +835,9 @@ class ConfigUpdateRequest(BaseModel):
     llm_max_context_files: int | None = Field(default=None, ge=1, le=64)
     llm_max_context_bytes: int | None = Field(default=None, ge=1_000, le=1_000_000)
     command_timeout_seconds: int | None = Field(default=None, ge=1, le=3_600)
+    # The saved model list and which entry is active; activating one applies it to the settings.
+    models: list[ModelProfile] | None = Field(default=None, max_length=20)
+    active_model_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class DeleteResponse(BaseModel):

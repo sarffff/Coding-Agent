@@ -62,6 +62,8 @@ const MODES: AgentMode[] = ["conservative", "standard", "autonomous"];
 // Attachments ride along in the message text; keep them small enough that the prompt still fits.
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_BYTES = 64 * 1024;
+// Matches the API: a pasted file fits, an accidental log dump does not.
+const MAX_MESSAGE_CHARS = 32_000;
 
 const IDEAS: Array<{ key: string; icon: typeof FileSearch }> = [
   { key: "chat.idea.organize", icon: Workflow },
@@ -315,7 +317,7 @@ export function ChatPanel(props: ChatPanelProps) {
       <textarea ref={inputRef} value={draft} onChange={event => setDraft(event.target.value)} onCompositionStart={() => { composingRef.current = true; }} onCompositionEnd={() => { composingRef.current = false; }} onKeyDown={event => {
         if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
         if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); }
-      }} placeholder={t(isCode ? "chat.placeholder" : "chat.coworkPlaceholder")} rows={1} disabled={busy} aria-label={t("chat.subtitle")} />
+      }} placeholder={t(isCode ? "chat.placeholder" : "chat.coworkPlaceholder")} rows={1} disabled={busy} aria-label={t("chat.subtitle")} maxLength={MAX_MESSAGE_CHARS} />
       <div className="chat-composer-bar">
         <div className="chat-composer-controls">{composerMeta}{isCode ? modeSelector : null}</div>
         <div className="chat-composer-actions">
@@ -331,7 +333,7 @@ export function ChatPanel(props: ChatPanelProps) {
   const composer = (
     <div className={`chat-composer chat-composer--${props.track}${isStart && !isCode ? " chat-composer--start" : ""}`}>
       {composerCard}
-      <div className="chat-composer-footer"><span className="chat-composer-hint">{t("chat.hint")}</span></div>
+      <div className="chat-composer-footer"><span className="chat-composer-hint">{t("chat.hint")}</span>{draft.length > MAX_MESSAGE_CHARS - 2_000 ? <span className="chat-composer-count">{draft.length} / {MAX_MESSAGE_CHARS}</span> : null}</div>
     </div>
   );
 
