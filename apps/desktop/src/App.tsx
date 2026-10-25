@@ -1275,7 +1275,7 @@ function App() {
         <div className="dialog-actions"><button className="small-action small-action--muted" onClick={closeConfirmation}>{t("common.back")}</button><button className="small-action" onClick={() => confirmAction === "delete" || confirmAction === "validation" ? void applyActivePatch(confirmAction) : void changeTaskState("cancel", true)}>{t("common.confirm")}</button></div>
       </Dialog>
       <Dialog open={settingsOpen} title={t("settings.title")} onClose={() => { setSettingsOpen(false); void refreshModelName(); }}>
-        <SettingsPanel />
+        <SettingsPanel embedded />
       </Dialog>
       <Dialog open={taskSetup !== null} title={t("chat.setupTitle")} onClose={() => { if (!chatSending && !validationSaving && !completionSaving) setTaskSetup(null); }}>
         {setupTask && taskSetup ? <>

@@ -5047,3 +5047,9 @@ h2 {
   font-family: var(--font-mono);
   font-size: 10.5px;
 }
+
+.panel-header--embedded {
+  justify-content: flex-end;
+  margin-bottom: 4px;
+  padding-bottom: 8px;
+}

@@ -59,7 +59,8 @@ function diff(config: AppConfig, draft: Draft): ConfigUpdate {
   return patch;
 }
 
-export function SettingsPanel() {
+/** `embedded` drops the panel's own heading: the dialog already says "运行配置". */
+export function SettingsPanel({ embedded = false }: { embedded?: boolean } = {}) {
   const { t } = usePreferences();
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -160,7 +161,7 @@ export function SettingsPanel() {
   if (!config || !draft) {
     return (
       <section className="panel settings-panel">
-        <div className="panel-header"><div><div className="section-kicker"><KeyRound size={13} /> {t("settings.title")}</div><h2>{t("settings.subtitle")}</h2></div></div>
+        {embedded ? null : <div className="panel-header"><div><div className="section-kicker"><KeyRound size={13} /> {t("settings.title")}</div><h2>{t("settings.subtitle")}</h2></div></div>}
         {error ? <div className="inline-error" role="alert">{error}</div> : <p className="settings-note">{t("common.loading")}</p>}
       </section>
     );
@@ -168,8 +169,8 @@ export function SettingsPanel() {
 
   return (
     <section className="panel settings-panel">
-      <div className="panel-header">
-        <div><div className="section-kicker"><KeyRound size={13} /> {t("settings.title")}</div><h2>{t("settings.subtitle")}</h2></div>
+      <div className={`panel-header${embedded ? " panel-header--embedded" : ""}`}>
+        {embedded ? null : <div><div className="section-kicker"><KeyRound size={13} /> {t("settings.title")}</div><h2>{t("settings.subtitle")}</h2></div>}
         <button className="small-action" onClick={() => void save()} disabled={busy}>
           <Save size={13} /> {saved ? t("settings.saved") : t("settings.save")}
         </button>
