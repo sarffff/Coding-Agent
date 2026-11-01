@@ -1,10 +1,10 @@
 /**
- * 前后端一键启动脚本
+ * 桌面端/后端启动脚本
  *
  * 用法:
- *   node run.js            - 同时启动前后端
+ *   node run.js            - 启动桌面端（自动托管后端）
  *   node run.js backend    - 只启动后端
- *   node run.js frontend   - 只启动前端
+ *   node run.js frontend   - 启动桌面端（自动托管后端）
  */
 
 const { spawn } = require("child_process");
@@ -104,58 +104,46 @@ function startBackend() {
     });
 }
 
-// 启动前端服务
+// 启动 Electron 桌面端
 function startFrontend() {
     return new Promise((resolve, reject) => {
-        const frontendDir = path.join(__dirname, "apps/desktop");
-
-        // 检测包管理器
-        let packageManager = "pnpm";
-
-        // pnpm dev
-        const frontend = spawn(packageManager, ["dev"], {
-            cwd: frontendDir,
-            shell: true,
+        const frontend = spawn(process.execPath, [path.join(__dirname, "scripts", "electron.js"), "dev"], {
+            cwd: __dirname,
+            shell: false,
             stdio: "pipe",
         });
+
+        frontend.on("spawn", () => resolve(frontend));
 
         // 监听输出
         frontend.stdout.on("data", (data) => {
             const output = data.toString().trim();
-            // 检测启动成功信号
-            if (output.includes("ready in") || output.includes("Local:")) {
-                resolve(frontend);
+            if (output) {
+                log("桌面端", output, colors.green);
             }
         });
 
         frontend.stderr.on("data", (data) => {
             const output = data.toString().trim();
             if (output) {
-                // Vite 的某些日志也会输出到 stderr
                 if (output.includes("error") || output.includes("Error")) {
-                    log("前端", output, colors.red);
+                    log("桌面端", output, colors.red);
                 } else {
-                    log("前端", output, colors.yellow);
+                    log("桌面端", output, colors.yellow);
                 }
             }
         });
 
         frontend.on("error", (error) => {
-            log("前端", `启动失败: ${error.message}`, colors.red);
+            log("桌面端", `启动失败: ${error.message}`, colors.red);
             reject(error);
         });
 
         frontend.on("close", (code) => {
             if (code !== 0 && code !== null) {
-                log("前端", `进程退出，代码: ${code}`, colors.red);
+                log("桌面端", `进程退出，代码: ${code}`, colors.red);
             }
         });
-
-        // 超时处理
-        setTimeout(() => {
-            log("前端", "启动完成", colors.green);
-            resolve(frontend);
-        }, 5000);
     });
 }
 
@@ -179,26 +167,25 @@ async function main() {
         }
 
         // 启动后端
-        if (mode === "all" || mode === "backend") {
+        if (mode === "backend") {
             const backend = await startBackend();
             processes.push(backend);
             log("系统", "后端服务已启动: http://localhost:8000", colors.green);
         }
 
-        // 启动前端
+        // 桌面端自行托管后端
         if (mode === "all" || mode === "frontend") {
-            // 如果是 all 模式，等待后端先启动
-            if (mode === "all") {
-                log("系统", "等待后端完全启动...", colors.yellow);
-                await new Promise((resolve) => setTimeout(resolve, 2000));
-            }
-
             const frontend = await startFrontend();
             processes.push(frontend);
-            log("系统", "前端服务已启动: http://localhost:5173", colors.green);
+            frontend.on("close", (code) => {
+                if (code !== null) {
+                    process.exit(code);
+                }
+            });
+            log("系统", "桌面端启动器已运行", colors.green);
         }
 
-        log("系统", "所有服务已启动完成！", colors.bright + colors.green);
+        log("系统", "启动命令已执行！", colors.bright + colors.green);
         console.log(
             colors.bright + colors.green + "=".repeat(60) + colors.reset + "\n",
         );
@@ -218,9 +205,9 @@ async function main() {
         console.log("\n");
         log("系统", "正在停止所有服务...", colors.yellow);
 
-        processes.forEach((proc, index) => {
+        processes.forEach((proc) => {
             if (proc && !proc.killed) {
-                const serviceName = index === 0 ? "后端" : "前端";
+                const serviceName = mode === "backend" ? "后端" : "桌面端";
                 log(serviceName, "正在停止...", colors.yellow);
                 proc.kill("SIGTERM");
 

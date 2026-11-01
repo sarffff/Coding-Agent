@@ -3,9 +3,8 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "pnpm --filter @coding-agent/desktop dev",
+    "dev": "node scripts/electron.js dev",
     "build": "pnpm --filter @coding-agent/desktop build",
-    "preview": "pnpm --filter @coding-agent/desktop preview",
     "api:dev": "node scripts/py.js -m uvicorn app.main:app --reload --reload-dir apps/api/app --app-dir apps/api",
     "api:test": "node scripts/py.js -m pytest apps/api/tests -q",
     "api:init": "node scripts/py.js scripts/init_state.py",
@@ -16,6 +15,15 @@
     "check": "pnpm --filter @coding-agent/desktop typecheck",
     "desktop:smoke": "node scripts/desktop_smoke.js",
     "desktop:chat-check": "node scripts/desktop_chat_check.mjs",
+    "desktop:session-check": "node scripts/desktop_session_check.mjs",
+    "desktop:runtime-check": "node scripts/desktop_runtime_check.cjs",
+    "desktop:run-summary-check": "node scripts/desktop_run_summary_check.mjs",
+    "desktop:markdown-check": "node scripts/desktop_markdown_check.mjs",
+    "desktop:event-details-check": "node scripts/desktop_event_details_check.mjs",
+    "desktop:presentation-check": "node scripts/desktop_chat_presentation_check.mjs",
+    "desktop:sidebar-sessions-check": "node scripts/desktop_sidebar_sessions_check.mjs",
+    "desktop:chat-stream-check": "node scripts/desktop_chat_stream_check.mjs",
+    "desktop:chat-features-check": "node scripts/desktop_chat_features_check.mjs",
     "demo:init": "node scripts/py.js scripts/create_demo.py"
   }
 }

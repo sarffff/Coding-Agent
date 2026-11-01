@@ -41,9 +41,10 @@ class TestService:
     OUTPUT_LIMIT = 20_000
     COMMAND_SUFFIX = ":command"  # model commands get their own slot so is_running(run_id) stays validation-only
 
-    def __init__(self, repositories: RepositoryService, settings: Settings):
+    def __init__(self, repositories: RepositoryService, settings: Settings, runtime_source=None):
         self.repositories = repositories
         self.settings = settings
+        self.runtime_source = runtime_source
         self._active: dict[str, Event] = {}
         self._lock = Lock()
 
@@ -380,10 +381,15 @@ class TestService:
                 break
         return "npm"
 
-    @staticmethod
-    def _python_executable(repository: RepositoryRecord, directory: Path | None = None) -> str:
+    def _python_executable(self, repository: RepositoryRecord, directory: Path | None = None) -> str:
         relative = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
         directories = [directory, repository.path] if directory and directory != repository.path else [repository.path]
+        source_id = self.runtime_source(repository.id) if self.runtime_source else None
+        if source_id:
+            source = self.repositories.get(source_id)
+            if directory and directory != repository.path:
+                directories.append(source.path / directory.relative_to(repository.path))
+            directories.append(source.path)
         for current in directories:
             for name in (".venv", "venv"):
                 environment = current / name

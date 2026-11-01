@@ -2,6 +2,8 @@ import type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, Tre
 export type { ApiHealth, WorkspaceSummary, Repository, RepositoryValidation, TreeEntry, SearchMatch, TaskPlanStep, AgentTask, AgentAction, AgentAdvanceAction, AgentState, AgentLoopRequest, AgentMode, TaskTrack, TaskBudget, AgentAdvanceRequest, AgentAdvanceResponse, TestFailure, TaskIteration, TestKind, TestRunResult, ValidationCheck, CompletionCriterion, CompletionConfirmation, ValidationCheckStatus, PatchFileInput, PatchPreview, DraftPatch, GitSnapshot, CommitPreview, Approval, AuditEvent, SourceFile, RepositoryContext, RunCheckpoint, TestHistoryItem, PublishCommit, RemoteBranch, RemoteCall, PullRequest, PullRequestPreview, RemoteTarget, PublishState, AppConfig, ConfigUpdate, DeleteResult, ModelProfileView, ModelProfileInput, ModelProviderKind } from "@coding-agent/types";
 
 import { desktopBridge } from "./desktop";
+import type { ChatAttachment } from "@coding-agent/types";
+export type { ChatAttachment } from "@coding-agent/types";
 
 /**
  * The Electron shell owns the API process and picks an ephemeral port, so its
@@ -9,13 +11,14 @@ import { desktopBridge } from "./desktop";
  */
 function resolveApiBaseUrl(): string {
   const injected = desktopBridge?.status.apiBaseUrl;
+  if (desktopBridge && (!injected || desktopBridge.status.backendReady === false)) {
+    throw new ApiRequestError("BACKEND_UNAVAILABLE", "The desktop backend is unavailable. Restart it and retry.");
+  }
   if (injected) return injected;
   const configured = import.meta.env.VITE_API_BASE_URL as string | undefined;
   if (configured) return configured;
   return "http://127.0.0.1:8000";
 }
-
-const API_BASE_URL = resolveApiBaseUrl();
 
 export class ApiRequestError extends Error {
   constructor(public code: string, message: string, public traceId?: string, public details?: unknown) {
@@ -25,7 +28,7 @@ export class ApiRequestError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  const response = await fetch(`${resolveApiBaseUrl()}${path}`, {
     ...init,
     headers: { "content-type": "application/json", ...init?.headers },
   });
@@ -66,18 +69,88 @@ export function getRepositoryTree(repositoryId: string, signal?: AbortSignal): P
   return request<{ items: TreeEntry[]; truncated: boolean }>(`/api/v1/repositories/${repositoryId}/tree?max_depth=6`, { signal });
 }
 
-export function createTask(goal: string, repositoryId?: string, mode?: AgentMode, track?: TaskTrack, validationChecks?: ValidationCheck[], completionCriteria?: CompletionCriterion[]): Promise<AgentTask> {
+export function createTask(goal: string, repositoryId?: string, mode?: AgentMode, track?: TaskTrack, validationChecks?: ValidationCheck[], completionCriteria?: CompletionCriterion[], attachments?: ChatAttachment[], messageText?: string, isolatedWorkspace = (track ?? "code") === "code"): Promise<AgentTask> {
   return request<AgentTask>("/api/v1/tasks", {
     method: "POST",
-    body: JSON.stringify({ goal, repository_id: repositoryId, mode, track, validation_checks: validationChecks, completion_criteria: completionCriteria }),
+    body: JSON.stringify({ goal, repository_id: repositoryId, mode, track, validation_checks: validationChecks, completion_criteria: completionCriteria, attachments, message_text: messageText, isolated_workspace: isolatedWorkspace }),
   });
 }
 
-export function sendCoworkChat(taskId: string, message: string): Promise<{ reply: string }> {
-  return request<{ reply: string }>(`/api/v1/tasks/${taskId}/chat`, {
-    method: "POST",
-    body: JSON.stringify({ message }),
+export function setTaskMode(taskId: string, mode: AgentMode): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/tasks/${taskId}/mode`, {
+    method: "PUT",
+    body: JSON.stringify({ mode }),
   });
+}
+
+export function renameTask(taskId: string, name: string): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/tasks/${taskId}/name`, { method: "PUT", body: JSON.stringify({ name }) });
+}
+
+export async function sendCoworkChat(taskId: string, message: string, requestId?: string, signal?: AbortSignal, onDelta?: (text: string) => void, attachments?: ChatAttachment[], messageText?: string): Promise<{ reply: string }> {
+  const init = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ message, request_id: requestId, attachments, message_text: messageText }),
+    signal,
+  };
+  if (!onDelta) return request<{ reply: string }>(`/api/v1/tasks/${taskId}/chat`, init);
+  const response = await fetch(`${resolveApiBaseUrl()}/api/v1/tasks/${taskId}/chat/stream`, init);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new ApiRequestError(payload?.code ?? "API_ERROR", payload?.message ?? `Request failed: ${response.status}`, payload?.trace_id, payload?.details);
+  }
+  if (!response.body || response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "text/event-stream") throw new ApiRequestError("CHAT_STREAM_INVALID", "The chat response is not a readable event stream.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "", ended = false;
+  let reply: string | undefined;
+  const consume = (frame: string) => {
+    if (signal?.aborted) throw new DOMException("The chat request was cancelled.", "AbortError");
+    if (frame.length > 1_048_576) throw new ApiRequestError("CHAT_STREAM_INVALID", "A chat stream event exceeded the size limit.");
+    const lines = frame.split("\n");
+    const kind = lines.find(line => line.startsWith("event:"))?.slice(6).trim();
+    const data = lines.filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+    if (!data || !["start", "delta", "done", "error"].includes(kind ?? "")) return;
+    let payload;
+    try { payload = JSON.parse(data); }
+    catch { throw new ApiRequestError("CHAT_STREAM_INVALID", "The chat stream contained invalid event data."); }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload) || (requestId && payload.request_id !== requestId)) throw new ApiRequestError("CHAT_STREAM_INVALID", "The chat stream belongs to a different request.");
+    if (kind === "error") throw new ApiRequestError(typeof payload.code === "string" ? payload.code : "MODEL_ERROR", typeof payload.message === "string" ? payload.message : "The chat request failed.");
+    if (kind === "delta") {
+      if (typeof payload.text !== "string") throw new ApiRequestError("CHAT_STREAM_INVALID", "The chat stream contained invalid reply text.");
+      onDelta(payload.text);
+    }
+    if (kind === "done") {
+      if (typeof payload.reply !== "string" || (requestId && payload.request_id !== requestId)) throw new ApiRequestError("CHAT_STREAM_INVALID", "The chat stream contained an invalid completion.");
+      reply = payload.reply;
+    }
+  };
+  try {
+    while (reply === undefined) {
+      const chunk = await reader.read();
+      ended = chunk.done;
+      buffer += decoder.decode(chunk.value, { stream: !chunk.done });
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) >= 0 && reply === undefined) {
+        consume(buffer.slice(0, boundary));
+        buffer = buffer.slice(boundary + 2);
+      }
+      if (buffer.length > 1_048_576) throw new ApiRequestError("CHAT_STREAM_INVALID", "A chat stream event exceeded the size limit.");
+      if (chunk.done) break;
+    }
+    if (signal?.aborted) throw new DOMException("The chat request was cancelled.", "AbortError");
+    if (reply === undefined) throw new ApiRequestError("CHAT_STREAM_INCOMPLETE", "The reply stream ended before completion. Retry the request.");
+    return { reply };
+  } finally {
+    if (!ended) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+export function cancelCoworkChat(taskId: string, requestId?: string): Promise<{ cancelled: boolean }> {
+  return request(`/api/v1/tasks/${taskId}/chat/cancel`, { method: "POST", body: JSON.stringify({ request_id: requestId }) });
 }
 
 export function startIteration(taskId: string, goal?: string): Promise<TaskIteration> {
@@ -184,17 +257,27 @@ export function saveValidationChecks(taskId: string, checks: ValidationCheck[]):
   });
 }
 
-export function saveCompletionCriteria(taskId: string, criteria: CompletionCriterion[]): Promise<AgentTask> {
+export function saveCompletionCriteria(taskId: string, criteria: CompletionCriterion[], signal?: AbortSignal): Promise<AgentTask> {
   return request<AgentTask>(`/api/v1/tasks/${taskId}/completion-criteria`, {
     method: "PUT",
     body: JSON.stringify({ criteria }),
+    signal,
   });
 }
 
-export function confirmCompletion(taskId: string, payload: Pick<CompletionConfirmation, "scope_hash" | "validation_hash" | "iteration_id" | "evidence">): Promise<AgentTask> {
+export function saveTaskPlan(taskId: string, plan: NonNullable<AgentTask["plan"]>, signal?: AbortSignal): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/tasks/${taskId}/plan`, { method: "PUT", body: JSON.stringify(plan), signal });
+}
+
+export function completeLocalTask(taskId: string, signal?: AbortSignal): Promise<AgentTask> {
+  return request<AgentTask>(`/api/v1/tasks/${taskId}/complete-local`, { method: "POST", signal });
+}
+
+export function confirmCompletion(taskId: string, payload: Pick<CompletionConfirmation, "scope_hash" | "validation_hash" | "iteration_id" | "evidence">, signal?: AbortSignal): Promise<AgentTask> {
   return request<AgentTask>(`/api/v1/tasks/${taskId}/completion-confirmation`, {
     method: "POST",
     body: JSON.stringify(payload),
+    signal,
   });
 }
 

@@ -30,6 +30,7 @@ class PersistedCheckpoint(BaseModel):
 
     summary: CheckpointSummary
     applied_hashes: dict[str, str] = {}
+    snapshot_hashes: dict[str, str] = {}
     missing: list[str] = []
 
 
@@ -74,15 +75,17 @@ class PatchService:
                     )
                     self._keys[persisted.summary.id] = key
                     continue
-                if not backup_dir.is_dir():
-                    continue
                 snapshots: dict[str, bytes | None] = {}
                 for name in persisted.summary.files:
                     if name in persisted.missing:
                         snapshots[name] = None
                     else:
                         snapshot = self._backup_path(backup_dir, name)
-                        snapshots[name] = snapshot.read_bytes() if snapshot.is_file() else b""
+                        if snapshot.is_file():
+                            content = snapshot.read_bytes()
+                            expected = persisted.snapshot_hashes.get(name)
+                            if expected is None or self._content_hash(content) == expected:
+                                snapshots[name] = content
                 checkpoint = Checkpoint(
                     summary=persisted.summary,
                     backup_dir=backup_dir,
@@ -102,6 +105,7 @@ class PatchService:
             PersistedCheckpoint(
                 summary=checkpoint.summary,
                 applied_hashes=checkpoint.applied_hashes,
+                snapshot_hashes={name: self._content_hash(content) for name, content in checkpoint.snapshots.items()},
                 missing=[name for name, content in checkpoint.snapshots.items() if content is None],
             ),
             checkpoint.summary.created_at.isoformat(),
@@ -245,6 +249,8 @@ class PatchService:
                 self._atomic_write(target, patch_file.content or "")
         except OSError as exc:
             self._restore_checkpoint(checkpoint)
+            checkpoint.summary.restored = True
+            self._persist(checkpoint)
             raise RepositoryError("PATCH_APPLY_FAILED", "Patch application failed and was rolled back.") from exc
         if prune:
             self._prune(checkpoint.summary.run_id)
@@ -272,13 +278,18 @@ class PatchService:
         simulated: dict[str, bytes | None] = {}
         original: dict[str, bytes | None] = {}
         for item in chain:
+            unavailable = [name for name in item.summary.files if name not in item.snapshots or name not in item.applied_hashes]
+            if unavailable:
+                raise RepositoryError("CHECKPOINT_UNAVAILABLE", "Checkpoint backups are missing or damaged; restore the original backup files before rolling back.",
+                                      {"checkpoint_id": item.summary.id, "paths": unavailable})
+        for item in chain:
             for name, saved in item.snapshots.items():
                 target = self._safe_target(repository, name)
                 if name not in simulated:
                     simulated[name] = target.read_bytes() if target.exists() else None
                     original[name] = simulated[name]
                 current = simulated[name]
-                if self._content_hash(current.decode("utf-8") if current is not None else None) != item.applied_hashes[name]:
+                if self._content_hash(current) != item.applied_hashes[name]:
                     raise RepositoryError("ROLLBACK_CONFLICT", "A file changed outside this task. Preserve the external edits before rolling back.", {"path": name})
                 simulated[name] = saved
         try:
@@ -386,13 +397,19 @@ class PatchService:
         return content.decode("utf-8", errors="replace")
 
     @staticmethod
-    def _content_hash(content: str | None) -> str:
-        return hashlib.sha256(content.encode("utf-8") if content is not None else b"\xffmissing").hexdigest()
+    def _content_hash(content: str | bytes | None) -> str:
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        return hashlib.sha256(data if data is not None else b"\xffmissing").hexdigest()
 
     @staticmethod
     def _atomic_write(path: Path, content: str | bytes) -> None:
         data = content.encode("utf-8") if isinstance(content, str) else content
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
-            temporary.write(data)
-            temporary_path = Path(temporary.name)
-        os.replace(temporary_path, path)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(data)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)

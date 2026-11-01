@@ -1,0 +1,20 @@
+.rail-session-search { display: flex; align-items: center; gap: 6px; margin: 0 8px 8px; min-height: 30px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--text-faint); background: var(--surface-sidebar); }
+.rail-session-search > svg { flex-shrink: 0; }
+.rail-session-search > input { flex: 1; min-width: 0; width: 100%; border: 0; outline: 0; background: transparent; color: var(--text-primary); font-size: 11px; }
+.rail-session-search > input::placeholder { color: var(--text-faint); }
+.rail-session-search > input::-webkit-search-cancel-button { display: none; }
+.rail-session-search:focus-within { border-color: var(--cyan); }
+.rail-session-search > button, .chat-session-rename, .rail-rename-actions > button { display: grid; place-items: center; flex-shrink: 0; width: 24px; height: 24px; padding: 0; border-radius: 5px; background: transparent; color: var(--text-faint); }
+.rail-session-search > button:hover, .chat-session-rename:hover, .rail-rename-actions > button:hover { color: var(--text-primary); background: var(--surface-hover); }
+.chat-session-rename { opacity: 0; }
+.chat-session-row:hover .chat-session-rename, .chat-session-row:focus-within .chat-session-rename { opacity: 1; }
+.chat-session-rename:disabled, .rail-rename-actions > button:disabled { opacity: .4; cursor: not-allowed; }
+.rail-session-rename { flex: 1; min-width: 0; display: grid; gap: 3px; padding: 6px; }
+.rail-session-rename > input { min-width: 0; width: 100%; padding: 5px 6px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--surface-input); color: var(--text-primary); font-size: 12px; }
+.rail-session-rename > input:focus-visible { outline: 1px solid var(--cyan); border-color: var(--cyan); }
+.rail-session-rename > input[aria-invalid="true"] { border-color: var(--rose); }
+.rail-rename-actions { display: flex; align-items: center; justify-content: flex-end; gap: 3px; }
+.rail-rename-actions > span { margin-right: auto; color: var(--text-faint); font-size: 10px; }
+.rail-session-rename > p { margin: 2px 0 0; color: var(--rose); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.rail-session-search > button:focus-visible, .chat-session-rename:focus-visible, .rail-rename-actions > button:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
+@media (max-width: 900px), (hover: none) { .chat-session-rename { opacity: 1; } }

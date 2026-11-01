@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 import logging
 import time
 from uuid import uuid4
@@ -6,7 +7,8 @@ from uuid import uuid4
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from .models import (
     ApiError,
@@ -36,7 +38,10 @@ from .models import (
     RepositoryContext,
     FileContentResponse,
     TaskCreateRequest,
+    TaskModeRequest,
+    TaskNameRequest,
     ChatMessageRequest,
+    ChatCancelRequest,
     ChatMessageResponse,
     IterationCreateRequest,
     RepairCreateRequest,
@@ -69,6 +74,7 @@ from .models import (
     TaskPushRequest,
     TaskListResponse,
     TaskSummary,
+    TaskPlan,
     TaskBudget,
     AgentAdvanceRequest,
     AgentAdvanceResponse,
@@ -150,6 +156,11 @@ ERROR_STATUS_BY_CODE = {
     "AGENT_ACTION_NOT_AVAILABLE": 409,
     "LOOP_ALREADY_RUNNING": 409,
     "TASK_BUDGET_EXHAUSTED": 409,
+    "COMMAND_WORKSPACE_CHANGED": 409,
+    "MODEL_CONFIG_BUSY": 409,
+    "CHAT_CANCELLED": 409,
+    "CHAT_REQUEST_CONFLICT": 409,
+    "CHAT_CONTEXT_TOO_LARGE": 422,
     "APPROVAL_NOT_FOUND": 404,
     "APPROVAL_REASON_REQUIRED": 422,
     "APPROVAL_CONTINUATION_UNAVAILABLE": 409,
@@ -192,10 +203,20 @@ ERROR_STATUS_BY_CODE = {
     "VALIDATION_BASELINE_BLOCKED": 409,
     "AGENT_NO_PROGRESS": 409,
     "CHECKPOINT_PRUNED": 409,
+    "CHECKPOINT_UNAVAILABLE": 409,
     "COMPLETION_REQUIRED": 409,
     "COMPLETION_NOT_REQUIRED": 409,
     "COMPLETION_CONFIRMATION_STALE": 409,
     "COMPLETION_VALIDATION_REQUIRED": 409,
+    "LOCAL_COMPLETION_NOT_READY": 409,
+    "WORKSPACE_UNAVAILABLE": 409,
+    "WORKSPACE_OWNERSHIP_INVALID": 409,
+    "WORKSPACE_RESTORE_CONFLICT": 409,
+    "WORKSPACE_RESTORE_FAILED": 409,
+    "WORKSPACE_SNAPSHOT_STALE": 409,
+    "COMMAND_SNAPSHOT_PENDING": 409,
+    "COMMAND_SNAPSHOT_UNAVAILABLE": 409,
+    "PUBLISH_INPUTS_OUT_OF_SCOPE": 409,
     "CONFIG_EMPTY": 422,
     "CONFIG_INVALID_VALUE": 422,
 }
@@ -224,7 +245,7 @@ async def health() -> HealthResponse:
 
 @app.get("/api/v1/workspace/summary", response_model=WorkspaceSummary)
 async def workspace_summary() -> WorkspaceSummary:
-    repositories = repository_service.list()
+    repositories = _source_repositories()
     tasks = task_service.list()
     return WorkspaceSummary(
         repositories=len(repositories),
@@ -247,8 +268,14 @@ async def create_repository(payload: RepositoryCreateRequest) -> RepositorySumma
 
 @app.get("/api/v1/repositories", response_model=RepositoryListResponse)
 async def list_repositories() -> RepositoryListResponse:
-    items = repository_service.list()
+    items = _source_repositories()
     return RepositoryListResponse(items=items, total=len(items))
+
+
+def _source_repositories() -> list[RepositorySummary]:
+    execution_ids = {task.repository_id for task in task_service.list()
+                     if task.source_repository_id and task.repository_id != task.source_repository_id}
+    return [repository_service.summary(record) for record in repository_service._repositories.values() if record.id not in execution_ids]
 
 
 @app.get("/api/v1/repositories/{repository_id}", response_model=RepositorySummary)
@@ -291,11 +318,76 @@ async def create_task(payload: TaskCreateRequest) -> TaskSummary:
     if "validation_checks" not in payload.model_fields_set and payload.track == "code" and payload.repository_id:
         checks = test_service.default_checks(payload.repository_id)
     task = task_service.create(payload.goal, payload.repository_id, payload.mode, payload.track, checks, payload.completion_criteria)
-    if payload.track == "code" and payload.repository_id and repository_service.get(payload.repository_id).has_git:
-        snapshot = git_service.snapshot(payload.repository_id)
+    if payload.isolated_workspace:
+        if payload.track != "code" or not payload.repository_id:
+            task_service.delete(task.id)
+            raise RepositoryError("TASK_REPOSITORY_REQUIRED", "An isolated workspace requires a coding task and a source folder.")
+        try:
+            with agent_service.workspace_operation(task.id):
+                if repository_service.get(payload.repository_id).has_git:
+                    task.base_branch = git_service.snapshot(payload.repository_id).branch
+                task.source_repository_id = payload.repository_id
+                task_service._persist(task_service._record(task.id))
+                workspace = await run_in_threadpool(agent_service.isolated_workspaces.create, task.id, payload.repository_id)
+                task_service.bind_workspace(task.id, workspace.repository_id, payload.repository_id, str(workspace.path), workspace.kind)
+                task.task_branch = workspace.branch
+        except BaseException:
+            agent_service.isolated_workspaces.delete(task.id)
+            task_service.delete(task.id)
+            raise
+    if payload.track == "code" and task.repository_id and repository_service.get(task.repository_id).has_git:
+        snapshot = git_service.snapshot(task.repository_id)
         task_service.update_git_snapshot(task.id, snapshot.branch, snapshot.head, snapshot.changed_files)
-    audit_service.record("task.create", "succeeded", "Created task", task_id=task.id, run_id=task.run_id, details={"repository_id": task.repository_id, "track": task.track})
+    metadata = {"message_text": payload.message_text, "attachments": [item.model_dump() for item in payload.attachments or []]} if payload.message_text is not None else {}
+    audit_service.record("task.create", "succeeded", "Created task", task_id=task.id, run_id=task.run_id, details={"repository_id": task.repository_id, "source_repository_id": task.source_repository_id, "workspace_path": task.workspace_path, "track": task.track, **metadata})
     return task
+
+
+@app.put("/api/v1/tasks/{task_id}/plan", response_model=TaskSummary)
+async def set_task_plan(task_id: str, payload: TaskPlan) -> TaskSummary:
+    with agent_service.workspace_operation(task_id):
+        task = task_service.get(task_id)
+        if agent_service._loop_running(task_id) or test_service.is_running(task.run_id):
+            raise RepositoryError("WORKSPACE_BUSY", "Stop execution before editing the task plan.")
+        task = task_service.set_plan(task_id, payload)
+        audit_service.record("plan.configure", "succeeded", "Updated task steps and their completion criteria", task_id=task.id, run_id=task.run_id,
+                             details={"step_ids": [step.id for step in task.plan.steps], "scope_hash": plan_scope_hash(task)})
+        return task
+
+
+@app.post("/api/v1/tasks/{task_id}/complete-local", response_model=TaskSummary)
+async def complete_task_locally(task_id: str) -> TaskSummary:
+    with agent_service.workspace_operation(task_id):
+        task = task_service.get(task_id)
+        if agent_service._loop_running(task_id) or test_service.is_running(task.run_id):
+            raise RepositoryError("WORKSPACE_BUSY", "Stop execution before completing a task locally.")
+        agent_service.assert_validation_unchanged(task_id)
+        task = task_service.complete_local(task_id, agent_service.validation_hash(task))
+        audit_service.record("completion.local", "succeeded", "Task explicitly completed locally", task_id=task.id, run_id=task.run_id,
+                             details={"workspace_path": task.workspace_path, "changed_files": task_service.changed_files(task.id)})
+        return task
+
+
+@app.put("/api/v1/tasks/{task_id}/name", response_model=TaskSummary)
+async def rename_task(task_id: str, payload: TaskNameRequest) -> TaskSummary:
+    task = task_service.rename(task_id, payload.name)
+    audit_service.record("task.rename", "succeeded", "Renamed session", task_id=task.id, run_id=task.run_id,
+                         details={"display_name": task.display_name})
+    return task
+
+
+@app.put("/api/v1/tasks/{task_id}/mode", response_model=TaskSummary)
+async def set_task_mode(task_id: str, payload: TaskModeRequest) -> TaskSummary:
+    with agent_service.workspace_operation(task_id):
+        task = task_service.get(task_id)
+        if task.track != "code" or task.status in {"done", "completed", "cancelled", "pr_created"}:
+            raise RepositoryError("INVALID_TASK_STATE", "Permission mode can only change for an unfinished coding task.")
+        if agent_service._loop_running(task_id) or test_service.is_running(task.run_id):
+            raise RepositoryError("WORKSPACE_BUSY", "Stop execution before changing permission mode.")
+        task = task_service.set_mode(task_id, payload.mode)
+        audit_service.record("task.mode", "succeeded", "Updated task permission mode", task_id=task.id, run_id=task.run_id,
+                             details={"mode": task.mode})
+        return task
 
 
 @app.put("/api/v1/tasks/{task_id}/completion-criteria", response_model=TaskSummary)
@@ -327,8 +419,29 @@ async def confirm_task_completion(task_id: str, payload: CompletionConfirmationR
 
 @app.post("/api/v1/tasks/{task_id}/chat", response_model=ChatMessageResponse)
 async def cowork_chat(task_id: str, payload: ChatMessageRequest) -> ChatMessageResponse:
-    reply = await agent_service.chat(task_id, payload.message.strip())
+    metadata = {"message_text": payload.message_text, "attachments": [item.model_dump() for item in payload.attachments or []]} if payload.message_text is not None else {}
+    reply = await agent_service.chat(task_id, payload.message.strip(), payload.request_id, metadata)
     return ChatMessageResponse(reply=reply)
+
+
+@app.post("/api/v1/tasks/{task_id}/chat/stream")
+async def stream_cowork_chat(task_id: str, payload: ChatMessageRequest) -> StreamingResponse:
+    task = task_service.get(task_id)
+    if task.track != "cowork":
+        raise RepositoryError("CHAT_NOT_ALLOWED", "Chat is only available for Cowork conversations.")
+    metadata = {"message_text": payload.message_text, "attachments": [item.model_dump() for item in payload.attachments or []]} if payload.message_text is not None else {}
+
+    async def events():
+        async for event in agent_service.chat_stream(task_id, payload.message.strip(), payload.request_id, metadata):
+            data = {key: value for key, value in event.items() if key != "event"}
+            yield f"event: {event['event']}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/v1/tasks/{task_id}/chat/cancel")
+async def cancel_cowork_chat(task_id: str, payload: ChatCancelRequest) -> dict[str, bool]:
+    return {"cancelled": agent_service.cancel_chat(task_id, payload.request_id)}
 
 
 @app.get("/api/v1/tasks", response_model=TaskListResponse)
@@ -418,6 +531,20 @@ async def cancel_task(task_id: str) -> TaskActionResponse:
 @app.post("/api/v1/tasks/{task_id}/recover", response_model=TaskActionResponse)
 async def recover_task(task_id: str) -> TaskActionResponse:
     agent_service.assert_workspace_available(task_id)
+    if not task_service.get(task_id).requires_recovery:
+        raise RepositoryError("INVALID_TASK_STATE", "Only tasks restored from a restart need recovery.")
+    workspace_service = agent_service.isolated_workspaces
+    if workspace_service:
+        snapshot = workspace_service.pending_snapshot(task_id)
+        if snapshot:
+            try:
+                files = workspace_service.diff(snapshot)
+                if files:
+                    workspace_service.save_command_draft(task_id, files)
+            finally:
+                workspace_service.restore(snapshot)
+            audit_service.record("command.recover", "succeeded", "Recovered command writes as a saved patch draft", task_id=task_id,
+                                 details={"files": [item.path for item in files]})
     task = task_service.recover(task_id)
     audit_service.record("task.recover", "succeeded", "Confirmed task recovery after restart", task_id=task.id, run_id=task.run_id)
     return TaskActionResponse(task=task, action="recovered")
@@ -540,15 +667,16 @@ async def preview_task_commit(task_id: str, payload: CommitPreviewRequest) -> Co
     repository_id = repository_id_for_task(task_id)
     task = task_service.get(task_id)
     prepared = git_service.preview(repository_id, task_service.changed_files(task_id), f"{task.id}: {payload.message.strip()}")
-    ready = prepared.ready
+    blocked_files = git_service.out_of_scope_inputs(prepared) if task.source_repository_id else []
+    ready = prepared.ready and not blocked_files
     try:
-        task_service.assert_completion_ready(task_id, agent_service.validation_hash(task) if task.completion_criteria else None)
+        task_service.assert_completion_ready(task_id, agent_service.validation_hash(task) if task.completion_criteria or task.completion_confirmation else None)
     except RepositoryError as exc:
         if exc.code != "COMPLETION_REQUIRED":
             raise
         ready = False
     audit_service.record("git.commit.preview", "succeeded", "Prepared task-scoped commit preview", task_id=task_id, run_id=task.run_id, details={"branch": prepared.branch, "changed_files": prepared.changed_files, "scope_hash": prepared.scope_hash})
-    return CommitPreviewResponse(branch=prepared.branch, head=prepared.head, diff=prepared.diff, changed_files=prepared.changed_files, excluded_files=prepared.excluded_files, commit_message=payload.message.strip(), scope_hash=prepared.scope_hash, ready=ready)
+    return CommitPreviewResponse(branch=prepared.branch, head=prepared.head, diff=prepared.diff, changed_files=prepared.changed_files, excluded_files=prepared.excluded_files, commit_message=payload.message.strip(), scope_hash=prepared.scope_hash, ready=ready, scope_blocked_files=blocked_files)
 
 
 @app.post("/api/v1/tasks/{task_id}/commits", response_model=GitSnapshotResponse)
@@ -562,6 +690,8 @@ async def create_task_commit(task_id: str, payload: CommitCreateRequest) -> GitS
         if task.status != "ready_for_pr" or not iterations or not iterations[-1].test_result or iterations[-1].test_result.status != "passed":
             raise RepositoryError("COMMIT_NOT_READY", "A task commit requires passing tests for the latest iteration.", {"status": task.status})
         files = task_service.changed_files(task_id)
+        if task.source_repository_id:
+            git_service.assert_scoped_inputs(repository_id, files)
         message = f"{task.id}: {payload.message.strip()}"
         prepared = git_service.preview(repository_id, files, message)
         if prepared.scope_hash != payload.scope_hash:
@@ -730,6 +860,8 @@ async def apply_patch(run_id: str, payload: PatchApplyRequest) -> PatchApplyResp
             raise
         patch_service._prune(run_id)
     task_service.mark_patch_applied(run_id, result.patch_id, result.checkpoint.id, result.applied_files)
+    if agent_service.isolated_workspaces:
+        agent_service.isolated_workspaces.clear_command_draft(task.id)
     audit_service.record("patch.apply", "succeeded", f"Applied patch to {len(result.applied_files)} file(s)", task_id=task.id, run_id=run_id, details={"patch_id": result.patch_id, "checkpoint_id": result.checkpoint.id})
     return result
 
@@ -798,37 +930,48 @@ async def update_config(payload: ConfigUpdateRequest) -> ConfigResponse:
 @app.delete("/api/v1/tasks/{task_id}", response_model=DeleteResponse)
 async def delete_task(task_id: str) -> DeleteResponse:
     """Delete a task with its checkpoints and approvals. Audit events stay immutable."""
-    agent_service.assert_workspace_available(task_id)
     task = task_service.get(task_id)
-    if agent_service._loop_running(task_id) or test_service.is_running(task.run_id):
-        raise RepositoryError("WORKSPACE_BUSY", "Stop the task before deleting it.", {"task_id": task_id})
+    _assert_task_deletion_available(task)
+    if agent_service._loop_running(task_id) or test_service.is_running(task.run_id) or agent_service.is_chat_running(task_id):
+        raise RepositoryError("WORKSPACE_BUSY", "Stop execution or wait for the chat reply before deleting it.", {"task_id": task_id})
+    agent_service.isolated_workspaces.delete(task_id)
     checkpoints = patch_service.delete_for_run(task.run_id)
     approvals = approval_service.delete_for_task(task_id)
+    audit_service.delete_chat_for_run(task.run_id)
     task_service.delete(task_id)
     audit_service.record("task.delete", "succeeded", "Task deleted", task_id=task_id, run_id=task.run_id,
                          details={"checkpoints": checkpoints, "approvals": approvals})
     return DeleteResponse(deleted=task_id, checkpoints=checkpoints, approvals=approvals)
 
 
+def _assert_task_deletion_available(task: TaskSummary) -> None:
+    if task.repository_id:
+        repository = repository_service.get(task.repository_id)
+        owner = agent_service.workspaces.acquire(repository.path, task.id)
+        agent_service.workspaces.release(owner)
+
+
 @app.delete("/api/v1/repositories/{repository_id}", response_model=DeleteResponse)
 async def delete_repository(repository_id: str, cascade: bool = Query(False)) -> DeleteResponse:
     """Unregister a folder. Files on disk are never touched; `cascade` also drops its tasks."""
     repository_service.get(repository_id)
-    owned = [task for task in task_service.list() if task.repository_id == repository_id]
+    owned = [task for task in task_service.list() if task.repository_id == repository_id or task.source_repository_id == repository_id]
     if owned and not cascade:
         raise RepositoryError(
             "REPOSITORY_IN_USE", "This folder still has tasks; pass cascade=true to delete them with it.",
             {"tasks": len(owned)},
         )
     for task in owned:
-        agent_service.assert_workspace_available(task.id)
-    busy = [task.id for task in owned if agent_service._loop_running(task.id) or test_service.is_running(task.run_id)]
+        _assert_task_deletion_available(task)
+    busy = [task.id for task in owned if agent_service._loop_running(task.id) or test_service.is_running(task.run_id) or agent_service.is_chat_running(task.id)]
     if busy:
-        raise RepositoryError("WORKSPACE_BUSY", "Stop the running tasks before deleting the folder.", {"tasks": busy})
+        raise RepositoryError("WORKSPACE_BUSY", "Stop execution or wait for chat replies before deleting the folder.", {"tasks": busy})
     removed = 0
     for task in owned:
+        agent_service.isolated_workspaces.delete(task.id)
         patch_service.delete_for_run(task.run_id)
         approval_service.delete_for_task(task.id)
+        audit_service.delete_chat_for_run(task.run_id)
         task_service.delete(task.id)
         removed += 1
     repository_service.delete(repository_id)

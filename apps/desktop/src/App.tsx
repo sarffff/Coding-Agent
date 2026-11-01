@@ -30,6 +30,8 @@ import {
   applyPatch,
   createTask,
   sendCoworkChat,
+  cancelCoworkChat,
+  renameTask,
   getApiHealth,
   getTask,
   getTaskGitSnapshot,
@@ -41,11 +43,13 @@ import {
   listTasks,
   draftPatch,
   getConfig,
+  updateConfig,
   deleteTask,
   deleteRepository,
   ApiRequestError,
   startAgentLoop,
   stopAgentLoop,
+  setTaskMode,
   getAgentState,
   previewPatch,
   previewCommit,
@@ -71,11 +75,14 @@ import {
   type AgentMode,
   type TaskTrack,
   type TaskBudget,
+  type AppConfig,
   type AgentAdvanceAction,
   type AgentAction,
   type AgentState,
   type AuditEvent,
   type CommitPreview,
+  type CompletionCriterion,
+  type ChatAttachment,
   type GitSnapshot,
   type Approval,
   type PatchPreview,
@@ -98,17 +105,23 @@ import { RepositoryBrowser } from "./components/RepositoryBrowser";
 import { RunHistory } from "./components/RunHistory";
 import { AgentPanel } from "./components/AgentPanel";
 import { ApprovalPanel } from "./components/ApprovalPanel";
-import { ChatPanel } from "./components/ChatPanel";
+import { ChatPanel, type ChatStreamingReply } from "./components/ChatPanel";
 import { ValidationChecklist } from "./components/ValidationChecklist";
 import { CompletionCriteria } from "./components/CompletionCriteria";
-import { SettingsPanel } from "./components/SettingsPanel";
+import { TaskPlanEditor } from "./components/TaskPlanEditor";
+import { PlanProgress } from "./components/PlanProgress";
+import { SettingsPage } from "./components/SettingsPage";
 import { Sidebar, type NavKey } from "./components/Sidebar";
 import { WorkspaceHeader } from "./components/WorkspaceHeader";
+import { createNewChatDraftId, getNewChatDraftId, removeChatDraft } from "./lib/chatDrafts";
 
 type Task = {
   id: string;
   runId?: string;
   repositoryId?: string | null;
+  sourceRepositoryId?: string | null;
+  workspacePath?: string | null;
+  workspaceKind?: "git" | "local" | null;
   lifecycleStatus: AgentTask["status"];
   taskBranch: string | null;
   currentIteration: number;
@@ -118,6 +131,7 @@ type Task = {
   error: string | null;
   requiresRecovery: boolean;
   updatedAt: string;
+  goal: string;
   title: string;
   repo: string;
   branch: string;
@@ -143,11 +157,19 @@ type StreamEvent = {
 
 const initialTasks: Task[] = [];
 
+function mergeRunEvents(current: AuditEvent[], incoming: AuditEvent[]): AuditEvent[] {
+  // Audit events are append-only; a late refresh must not remove newer entries.
+  return [...new Map([...current, ...incoming].map(event => [event.id, event])).values()];
+}
+
 function taskFromApi(task: AgentTask): Task {
   return {
     id: task.id,
     runId: task.run_id,
     repositoryId: task.repository_id,
+    sourceRepositoryId: task.source_repository_id ?? task.repository_id,
+    workspacePath: task.workspace_path,
+    workspaceKind: task.workspace_kind,
     lifecycleStatus: task.status,
     taskBranch: task.task_branch,
     currentIteration: task.current_iteration,
@@ -157,7 +179,8 @@ function taskFromApi(task: AgentTask): Task {
     error: task.error,
     requiresRecovery: task.requires_recovery,
     updatedAt: task.updated_at,
-    title: task.goal,
+    goal: task.goal,
+    title: task.display_name ?? task.goal.split(/\r?\n/)[0],
     repo: task.plan?.repository_summary ?? "workspace",
     branch: task.branch ?? task.run_id,
     status: task.status === "planning" || task.status === "queued" ? "queued" : task.status === "failed" ? "failed" : task.status === "cancelled" ? "cancelled" : task.status === "paused" ? "paused" : task.status === "done" || task.status === "completed" || task.status === "pr_created" ? "done" : task.status === "review" || task.status === "awaiting_approval" || task.status === "ready_for_pr" ? "review" : "running",
@@ -201,6 +224,7 @@ function App() {
   const { language, t } = usePreferences();
   const [activeNav, setActiveNav] = useState<NavKey>("chat");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsCategory, setSettingsCategory] = useState<"general" | "models">("general");
   const [tasks, setTasks] = useState(initialTasks);
   const [activeTaskId, setActiveTaskId] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -210,11 +234,39 @@ function App() {
   const [chatPollError, setChatPollError] = useState<string | null>(null);
   const [chatMode, setChatMode] = useState<AgentMode>("standard");
   const [modelName, setModelName] = useState("");
+  const [chatModelConfig, setChatModelConfig] = useState<AppConfig | null>(null);
+  const [chatModelSaving, setChatModelSaving] = useState(false);
+  const chatModelSavingRef = useRef(false);
   const [chatPending, setChatPending] = useState<Approval | null>(null);
   const [chatBudget, setChatBudget] = useState<TaskBudget | null>(null);
+  const [chatAgentState, setChatAgentState] = useState<AgentState | null>(null);
+  const [chatRefreshId, setChatRefreshId] = useState(0);
   const [chatComposingNew, setChatComposingNew] = useState(false);
   const [chatSending, setChatSending] = useState(false);
+  const [chatReplies, setChatReplies] = useState<Record<string, ChatStreamingReply[]>>({});
+  const renameRequestsRef = useRef(new Set<string>());
   const chatSendingRef = useRef(false);
+  const chatModeSavingRef = useRef(false);
+  const [chatModeSaving, setChatModeSaving] = useState(false);
+  const chatSelectionRef = useRef(0);
+  const [desktopRuntime, setDesktopRuntime] = useState<DesktopStatus | null>(desktopStatus);
+  const chatDraftScope = desktopRuntime ? `desktop:${desktopRuntime.stateDir}` : `browser:${import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"}`;
+  const [chatDraftId, setChatDraftId] = useState(() => getNewChatDraftId(chatDraftScope));
+  useEffect(() => { setChatDraftId(getNewChatDraftId(chatDraftScope)); }, [chatDraftScope]);
+  const chatRequestsRef = useRef(new Map<string, { taskId: string; runId: string; requestId: string; controller: AbortController }>());
+  const chatRetriesRef = useRef(new Map<string, { message: string; taskId: string; runId: string; requestId: string }>());
+  const chatErrorsRef = useRef(new Map<string, string>());
+  const chatComposerKeysRef = useRef(new Map<string, string>());
+  const [deletedChatDraftKeys, setDeletedChatDraftKeys] = useState<string[]>([]);
+  const [chatStateMessage, setChatStateMessage] = useState<string | null>(null);
+  const [chatSetupTaskId, setChatSetupTaskId] = useState<string | null>(null);
+  const [chatSetupOpen, setChatSetupOpen] = useState(false);
+  const [chatSetupStarting, setChatSetupStarting] = useState(false);
+  const [chatSetupError, setChatSetupError] = useState<string | null>(null);
+  const [validationDirty, setValidationDirty] = useState(false);
+  const [completionDirty, setCompletionDirty] = useState(false);
+  const [planDirty, setPlanDirty] = useState(false);
+  const chatSetupFeedbackRef = useRef("");
   const [chatAction, setChatAction] = useState<AgentAction | null>(null);
   const [railTab, setRailTab] = useState<"cowork" | "code">("cowork");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -231,6 +283,7 @@ function App() {
   const [testError, setTestError] = useState<string | null>(null);
   const [validationSaving, setValidationSaving] = useState(false);
   const [completionSaving, setCompletionSaving] = useState(false);
+  const [planSaving, setPlanSaving] = useState(false);
   const [completionConfirming, setCompletionConfirming] = useState(false);
   const [validationAgentState, setValidationAgentState] = useState<AgentState | null>(null);
   const [patchPath, setPatchPath] = useState("");
@@ -240,6 +293,7 @@ function App() {
   const [patchRunning, setPatchRunning] = useState(false);
   const [patchApplied, setPatchApplied] = useState<string | null>(null);
   const [patchRationale, setPatchRationale] = useState<string | null>(null);
+  const [patchNoChanges, setPatchNoChanges] = useState(false);
   const [patchError, setPatchError] = useState<string | null>(null);
   const [iterations, setIterations] = useState<TaskIteration[]>([]);
   const [iterationRunning, setIterationRunning] = useState(false);
@@ -271,7 +325,6 @@ function App() {
   const [patchOperation, setPatchOperation] = useState<PatchFileInput["operation"]>("update");
   const [repositoryDialogOpen, setRepositoryDialogOpen] = useState(false);
   const [repositoryPathInput, setRepositoryPathInput] = useState("");
-  const [desktopRuntime, setDesktopRuntime] = useState<DesktopStatus | null>(desktopStatus);
   const [repositorySaving, setRepositorySaving] = useState(false);
   const repositoryOpeningRef = useRef(false);
   const [confirmAction, setConfirmAction] = useState<"cancel" | "delete" | "validation" | null>(null);
@@ -292,16 +345,35 @@ function App() {
     [activeTaskId, tasks],
   );
   const activeRepository = repositories.find(repository => repository.id === activeTask?.repositoryId);
-  const activeTaskHasGit = activeRepository?.has_git === true;
+  const activeWorkspaceMissing = Boolean(activeTask?.workspacePath && !activeRepository);
+  useEffect(() => {
+    if (!activeWorkspaceMissing) return;
+    const controller = new AbortController();
+    listRepositories(controller.signal).then(payload => { if (!controller.signal.aborted) setRepositories(payload.items); }).catch(() => undefined);
+    return () => controller.abort();
+  }, [activeTask?.repositoryId, activeWorkspaceMissing]);
+  const activeTaskHasGit = activeTask?.workspaceKind === "git" || activeRepository?.has_git === true;
   const activeTaskStarted = (activeTask?.currentIteration ?? 0) > 0;
+  const completedLocalTask = !chatComposingNew && activeTask?.lifecycleStatus === "completed";
+  const createsCodeTask = chatComposingNew || !activeTask?.runId || completedLocalTask || ["done", "cancelled"].includes(activeTask?.status ?? "");
+  const chatSessionKey = !chatComposingNew && activeTask ? chatComposerKeysRef.current.get(activeTask.id) ?? activeTask.id : `new:${railTab}:${selectedRepositoryId}:${chatDraftId}`;
+  const chatSessionRef = useRef(chatSessionKey);
+  chatSessionRef.current = chatSessionKey;
+  useEffect(() => {
+    setChatSending(chatRequestsRef.current.has(chatSessionKey));
+    setChatError(chatErrorsRef.current.get(chatSessionKey) ?? null);
+    setChatStateMessage(null);
+    setChatAgentState(null);
+  }, [chatSessionKey]);
 
   // Two stores: Cowork (chat, flat by recency) and Code (coding, grouped by folder).
   const coworkTasks = useMemo(() => tasks.filter((task) => task.track === "cowork"), [tasks]);
   const railGroups = useMemo(() => {
-    const groups = new Map(repositories.map(repository => [repository.id, { id: repository.id, name: repository.name, path: repository.path, rows: [] as Task[] }]));
+    const executionIds = new Set(tasks.filter(task => task.sourceRepositoryId && task.sourceRepositoryId !== task.repositoryId).map(task => task.repositoryId));
+    const groups = new Map(repositories.filter(repository => !executionIds.has(repository.id)).map(repository => [repository.id, { id: repository.id, name: repository.name, path: repository.path, rows: [] as Task[] }]));
     for (const task of tasks) {
       if (task.track !== "code") continue;
-      const key = task.repositoryId ?? task.repo;
+      const key = task.sourceRepositoryId ?? task.repositoryId ?? task.repo;
       const group = groups.get(key) ?? { id: key, name: task.repo, path: "", rows: [] as Task[] };
       group.rows.push(task);
       groups.set(key, group);
@@ -341,7 +413,7 @@ function App() {
       try {
         const payload = await listRunEvents(runId);
         if (!disposed) {
-          setRunEvents(payload.items);
+          setRunEvents(current => mergeRunEvents(current, payload.items));
           setEventsError(null);
         }
       } catch (error) {
@@ -361,6 +433,7 @@ function App() {
     setValidationAgentState(null);
     setTestError(null);
     setPatchPreviewResult(null);
+    setPatchNoChanges(false);
     setConfirmAction(null);
     patchConfirmationRef.current = null;
     setPatchApplied(null);
@@ -396,7 +469,10 @@ function App() {
 
   useEffect(() => {
     if (!desktopBridge) return;
-    return desktopBridge.onStatusChanged(setDesktopRuntime);
+    return desktopBridge.onStatusChanged(status => {
+      setDesktopRuntime(status);
+      setApiStatus(status.backendReady ? "checking" : "offline");
+    });
   }, []);
 
   useEffect(() => {
@@ -433,6 +509,7 @@ function App() {
     setChatPollError(null);
     if (activeNav !== "chat" || chatComposingNew || activeTask?.track === "cowork" || !activeTask?.runId) {
       setLoopRunning(false);
+      setChatAgentState(null);
       return;
     }
     const runId = activeTask.runId;
@@ -448,10 +525,12 @@ function App() {
         setApiStatus("connected");
         setChatPollError(null);
         setLoopRunning(state.loop_running);
-        setRunEvents(events.items);
+        setRunEvents(current => mergeRunEvents(current, events.items));
         setChatPending(state.pending_approval ?? null);
         setChatBudget(state.task.budget ?? null);
+        setChatAgentState(state);
         setChatAction(state.action);
+        setChatStateMessage(state.message);
         updateTaskFromApi(state.task);
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -465,15 +544,29 @@ function App() {
     void tick();
     const timer = window.setInterval(() => void tick(), 2500);
     return () => { controller.abort(); window.clearInterval(timer); };
-  }, [activeNav, activeTask?.runId, activeTask?.id, activeTask?.track, chatComposingNew, t]);
+  }, [activeNav, activeTask?.runId, activeTask?.id, activeTask?.track, chatComposingNew, chatRefreshId, t]);
 
   // Cowork is a plain chat: no loop. Just load its transcript (chat.* events) when it is opened.
   useEffect(() => {
     if (activeNav !== "chat" || chatComposingNew || activeTask?.track !== "cowork" || !activeTask?.runId) return;
     let disposed = false;
-    listRunEvents(activeTask.runId).then((payload) => { if (!disposed) setRunEvents(payload.items); }).catch(() => { /* retry on next open */ });
+    const sessionKey = chatSessionKey;
+    listRunEvents(activeTask.runId).then((payload) => {
+      if (disposed) return;
+      setRunEvents(current => mergeRunEvents(current, payload.items));
+      setChatPollError(null);
+      setChatReplies(current => {
+        const replies = current[sessionKey];
+        if (!replies) return current;
+        const pending = replies.filter(reply => !payload.items.some(event => event.action === "chat.assistant" && event.details.request_id === reply.requestId));
+        if (pending.length === replies.length) return current;
+        const next = { ...current, [sessionKey]: pending };
+        if (!pending.length) delete next[sessionKey];
+        return next;
+      });
+    }).catch(error => { if (!disposed) setChatPollError(describeError(error, t("chat.refreshError"))); });
     return () => { disposed = true; };
-  }, [activeNav, chatComposingNew, activeTask?.track, activeTask?.runId, activeTask?.id]);
+  }, [activeNav, chatComposingNew, activeTask?.track, activeTask?.runId, activeTask?.id, chatRefreshId, chatSessionKey]);
 
   const loadOverviewData = async () => {
     setOverviewLoading(true);
@@ -492,7 +585,7 @@ function App() {
         setTasks((current) => [...nextTasks, ...current.filter((task) => !nextTasks.some((item) => item.id === task.id))]);
         if (!taskRef.current) {
           setActiveTaskId(nextTasks[0].id);
-          setSelectedRepositoryId(nextTasks[0].repositoryId ?? "");
+          setSelectedRepositoryId(nextTasks[0].sourceRepositoryId ?? nextTasks[0].repositoryId ?? "");
           setRailTab(nextTasks[0].track);
         }
       }
@@ -542,6 +635,7 @@ function App() {
   const reviewTasks = tasks.filter((task) => task.status === "review");
   const planApproval = approvals.find((item) => item.type === "plan");
   const writeApproval = approvals.find((item) => item.type === "write" && item.scope_hash === commitPreviewResult?.scope_hash);
+  const commitScopeBlocked = Boolean(commitPreviewResult?.scope_blocked_files?.length);
   const pushApproval = approvals.find((item) => item.type === "push");
   const pullRequestApproval = approvals.find((item) => item.type === "pr");
 
@@ -550,6 +644,7 @@ function App() {
       const config = await getConfig();
       // Prefer the saved profile's label: it is what the user picked, not the raw model id.
       setModelName((config.models ?? []).find((item) => item.id === config.active_model_id)?.label ?? config.model);
+      setChatModelConfig(config);
     } catch {
       /* the chip is decoration; a failed read must not surface as an error */
     }
@@ -559,12 +654,37 @@ function App() {
     void refreshModelName();
   }, []);
 
+  const changeChatModel = async (id: string) => {
+    if (loopRunning || chatSendingRef.current || chatModeSavingRef.current || chatModelSavingRef.current || id === chatModelConfig?.active_model_id) return;
+    chatModelSavingRef.current = true;
+    setChatModelSaving(true);
+    setChatError(null);
+    try {
+      const config = await updateConfig({ active_model_id: id });
+      setChatModelConfig(config);
+      setModelName(config.models.find(item => item.id === config.active_model_id)?.label ?? config.model);
+    } catch (error) {
+      setChatError(describeError(error, t("settings.models.saveError")));
+    } finally {
+      chatModelSavingRef.current = false;
+      setChatModelSaving(false);
+    }
+  };
+
   const deleteSession = async (session: { id: string; title: string }) => {
+    if (chatSendingRef.current) return;
     if (!window.confirm(t("chat.deleteConfirm").replace("{title}", session.title))) return;
     try {
       await deleteTask(session.id);
+      removeChatDraft(chatDraftScope, session.id);
+      const sessionKey = chatComposerKeysRef.current.get(session.id) ?? session.id;
+      removeChatDraft(chatDraftScope, sessionKey);
+      chatComposerKeysRef.current.delete(session.id);
+      for (const key of [session.id, sessionKey]) { chatRetriesRef.current.delete(key); chatErrorsRef.current.delete(key); }
+      setDeletedChatDraftKeys(current => [...current, session.id, sessionKey]);
+      setChatReplies(current => { const next = { ...current }; delete next[sessionKey]; return next; });
       setTasks((current) => current.filter((task) => task.id !== session.id));
-      if (activeTaskId === session.id) {
+      if (taskRef.current === session.id) {
         setActiveTaskId("");
         startNewChatSession();
       }
@@ -590,9 +710,19 @@ function App() {
         }
       }
       setRepositories((current) => current.filter((item) => item.id !== repositoryId));
-      if (selectedRepositoryId === repositoryId) setSelectedRepositoryId("");
-      if (activeTask?.repositoryId === repositoryId) { setActiveTaskId(""); startNewChatSession(); }
-      setTasks((current) => current.filter((task) => task.repositoryId !== repositoryId));
+      const deletedSessionKeys = tasks.filter(item => item.repositoryId === repositoryId || item.sourceRepositoryId === repositoryId).map(task => {
+        removeChatDraft(chatDraftScope, task.id);
+        const key = chatComposerKeysRef.current.get(task.id) ?? task.id;
+        removeChatDraft(chatDraftScope, key);
+        chatComposerKeysRef.current.delete(task.id);
+        for (const id of [task.id, key]) { chatRetriesRef.current.delete(id); chatErrorsRef.current.delete(id); }
+        setDeletedChatDraftKeys(current => [...current, task.id, key]);
+        return key;
+      });
+      setChatReplies(current => { const next = { ...current }; for (const key of deletedSessionKeys) delete next[key]; return next; });
+      setSelectedRepositoryId(current => current === repositoryId ? "" : current);
+      if (tasks.some(task => (task.repositoryId === repositoryId || task.sourceRepositoryId === repositoryId) && task.id === taskRef.current)) startNewChatSession();
+      setTasks((current) => current.filter((task) => task.repositoryId !== repositoryId && task.sourceRepositoryId !== repositoryId));
     } catch (reason) {
       setRepositoryError(describeError(reason, t("repositoryError")));
     }
@@ -618,105 +748,240 @@ function App() {
     }
   };
 
-  const sendChatMessage = async (message: string): Promise<boolean> => {
+  const changeChatMode = async (mode: AgentMode) => {
+    if (loopRunning || chatSendingRef.current || chatModeSavingRef.current) return;
+    if (createsCodeTask) {
+      setChatMode(mode);
+      return;
+    }
+    if (!activeTask || activeTask.track !== "code" || mode === activeTask.mode) return;
+    const taskId = activeTask.id;
+    chatModeSavingRef.current = true;
+    setChatModeSaving(true);
+    setChatError(null);
+    try {
+      updateTaskFromApi(await setTaskMode(taskId, mode));
+    } catch (error) {
+      if (taskRef.current === taskId) setChatError(describeError(error, t("chat.error")));
+    } finally {
+      chatModeSavingRef.current = false;
+      setChatModeSaving(false);
+    }
+  };
+
+  const sendChatMessage = async (message: string, completionCriteria?: CompletionCriterion[], attachments?: ChatAttachment[], messageText?: string): Promise<boolean> => {
     const trimmed = message.trim();
-    if (!trimmed || loopRunning || chatSendingRef.current) return false;
+    const sessionKey = chatSessionKey;
+    if (!trimmed || loopRunning || chatRequestsRef.current.has(sessionKey) || chatModeSavingRef.current || chatModelSavingRef.current) return false;
+    const retry = chatRetriesRef.current.get(sessionKey);
+    const request = { taskId: "", runId: "", requestId: retry?.message === trimmed ? retry.requestId : crypto.randomUUID(), controller: new AbortController() };
+    chatRequestsRef.current.set(sessionKey, request);
     chatSendingRef.current = true;
     setChatSending(true);
+    chatErrorsRef.current.delete(sessionKey);
     setChatError(null);
     const track: TaskTrack = chatComposingNew ? railTab : (activeTask?.track ?? railTab);
+    const selection = chatSelectionRef.current;
+    let taskId = retry?.message === trimmed ? retry.taskId : chatComposingNew ? "" : (activeTask?.id ?? "");
+    const currentChat = () => taskId ? taskRef.current === taskId : chatSelectionRef.current === selection && chatSessionRef.current === sessionKey;
 
     try {
       if (track === "cowork") {
-        // Cowork: a plain synchronous chat. Create the conversation on the first message, then post turns.
-        let taskId = chatComposingNew ? "" : (activeTask?.id ?? "");
-        let runId = chatComposingNew ? "" : (activeTask?.runId ?? "");
+        setChatReplies(current => ({ ...current, [sessionKey]: [...(current[sessionKey] ?? []).filter(reply => reply.requestId !== request.requestId), { requestId: request.requestId, content: "", status: "streaming", userMessage: messageText ?? trimmed, attachments }] }));
+        // Create the conversation on the first message, then stream the reply into its source session.
+        let runId = retry?.message === trimmed ? retry.runId : chatComposingNew ? "" : (activeTask?.runId ?? "");
         if (!taskId) {
-          const created = await createTask(trimmed, selectedRepositoryId || undefined, undefined, "cowork");
+          const created = await createTask(trimmed, selectedRepositoryId || undefined, undefined, "cowork", undefined, undefined, attachments, messageText);
           const newTask = taskFromApi(created);
+          chatComposerKeysRef.current.set(newTask.id, sessionKey);
           setTasks((current) => [newTask, ...current.filter((item) => item.id !== newTask.id)]);
-          setActiveTaskId(newTask.id);
-          setChatComposingNew(false);
+          if (chatSelectionRef.current === selection && currentChat()) {
+            taskRef.current = newTask.id;
+            setActiveTaskId(newTask.id);
+            setChatComposingNew(false);
+          }
           taskId = newTask.id;
           runId = created.run_id;
         }
-        await sendCoworkChat(taskId, trimmed);
-        if (runId) setRunEvents((await listRunEvents(runId)).items);
+        request.taskId = taskId;
+        request.runId = runId;
+        chatRequestsRef.current.set(taskId, request);
+        if (request.controller.signal.aborted) throw new Error(t("cancelled"));
+        const response = await sendCoworkChat(taskId, trimmed, request.requestId, request.controller.signal, text => {
+          if (request.controller.signal.aborted || chatRequestsRef.current.get(sessionKey) !== request) return;
+          setChatReplies(current => {
+            const replies = current[sessionKey];
+            return replies ? { ...current, [sessionKey]: replies.map(reply => reply.requestId === request.requestId ? { ...reply, content: reply.content + text } : reply) } : current;
+          });
+        }, attachments, messageText);
+        setChatReplies(current => {
+          const replies = current[sessionKey];
+          return replies ? { ...current, [sessionKey]: replies.map(reply => reply.requestId === request.requestId ? { ...reply, content: response.reply, status: "completed" } : reply) } : current;
+        });
+        chatRetriesRef.current.delete(sessionKey);
+        chatRetriesRef.current.delete(taskId);
+        chatErrorsRef.current.delete(taskId);
+        if (runId) {
+          try {
+            const events = await listRunEvents(runId);
+            if (currentChat()) { setRunEvents(current => mergeRunEvents(current, events.items)); setChatPollError(null); }
+            setChatReplies(current => {
+              if (!currentChat()) return current;
+              const replies = current[sessionKey];
+              if (!replies) return current;
+              const pending = replies.filter(reply => !events.items.some(event => event.action === "chat.assistant" && event.details.request_id === reply.requestId));
+              if (pending.length === replies.length) return current;
+              const next = { ...current, [sessionKey]: pending };
+              if (!pending.length) delete next[sessionKey];
+              return next;
+            });
+          } catch (error) { if (currentChat()) setChatPollError(describeError(error, t("chat.refreshError"))); }
+        }
         return true;
       }
 
       // Code works in ordinary folders too; only Git publishing requires a repository.
       const runId = chatComposingNew ? undefined : activeTask?.runId;
-      const completedLocalTask = !chatComposingNew && activeTask?.lifecycleStatus === "ready_for_pr" && activeRepository?.has_git === false;
-      if (!runId || completedLocalTask || ["done", "cancelled"].includes(activeTask?.status ?? "")) {
-        const repositoryId = completedLocalTask ? activeTask?.repositoryId : selectedRepositoryId;
-        const mode = completedLocalTask && activeTask ? activeTask.mode : chatMode;
+      if (!runId || createsCodeTask) {
+        const repositoryId = completedLocalTask ? activeTask?.sourceRepositoryId ?? activeTask?.repositoryId : selectedRepositoryId;
+        const mode = chatMode;
         if (!repositoryId) throw new Error(t("chat.needRepository"));
-        const created = await createTask(trimmed, repositoryId, mode, "code");
+        const created = await createTask(trimmed, repositoryId, mode, "code", undefined, completionCriteria, attachments, messageText);
         const newTask = taskFromApi(created);
+        if (chatComposingNew || !activeTask) chatComposerKeysRef.current.set(newTask.id, sessionKey);
         setTasks((current) => [newTask, ...current.filter((item) => item.id !== newTask.id)]);
-        setActiveTaskId(newTask.id);
-        setChatComposingNew(false);
-        setChatPending(null);
-        // Start immediately: the composer already carries mode and goal, a setup dialog adds a step.
-        const started = await startAgentLoop(created.run_id, { mode, feedback: trimmed });
-        updateTaskFromApi(started.task);
-        setLoopRunning(started.loop_running);
-        setChatAction(started.action);
+        if (chatSelectionRef.current === selection && currentChat()) {
+          taskRef.current = newTask.id;
+          setActiveTaskId(newTask.id);
+          setChatComposingNew(false);
+          setChatPending(null);
+          setChatSetupTaskId(newTask.id);
+          setChatSetupOpen(true);
+          setChatSetupError(null);
+          setValidationDirty(false);
+          setCompletionDirty(false);
+          chatSetupFeedbackRef.current = trimmed;
+        }
         return true;
       } else if (!activeTaskStarted && !activeTask?.requiresRecovery && activeTask?.runId) {
-        const started = await startAgentLoop(activeTask.runId, { feedback: trimmed });
-        updateTaskFromApi(started.task);
-        setLoopRunning(started.loop_running);
-        setChatAction(started.action);
+        setChatSetupTaskId(activeTask.id);
+        setChatSetupOpen(true);
+        setChatSetupError(null);
+        chatSetupFeedbackRef.current = trimmed;
         return true;
       } else {
-        await startAgentLoop(runId, { feedback: trimmed });
+        const started = await startAgentLoop(runId, { feedback: trimmed });
+        updateTaskFromApi(started.task);
+        if (currentChat()) {
+          setLoopRunning(started.loop_running);
+          setChatAction(started.action);
+          setChatStateMessage(started.message);
+        }
       }
-      setLoopRunning(true);
-      setChatAction(null);
       return true;
     } catch (error) {
-      setChatError(describeError(error, t("chat.error")));
+      const description = request.controller.signal.aborted ? t("cancelled") : describeError(error, t("chat.error"));
+      chatErrorsRef.current.set(sessionKey, description);
+      if (taskId) chatErrorsRef.current.set(taskId, description);
+      if (track === "cowork" && taskId) {
+        const failed = { message: trimmed, taskId, runId: request.runId, requestId: request.requestId };
+        chatRetriesRef.current.set(sessionKey, failed);
+        chatRetriesRef.current.set(taskId, failed);
+      }
+      if (track === "cowork") setChatReplies(current => {
+        const replies = current[sessionKey];
+        return replies ? { ...current, [sessionKey]: replies.map(reply => reply.requestId === request.requestId ? { ...reply, status: request.controller.signal.aborted ? "cancelled" : "failed", message: description } : reply) } : current;
+      });
+      if (currentChat()) setChatError(description);
       return false;
     } finally {
-      chatSendingRef.current = false;
-      setChatSending(false);
+      for (const [key, item] of chatRequestsRef.current) {
+        if (item === request) chatRequestsRef.current.delete(key);
+      }
+      chatSendingRef.current = chatRequestsRef.current.size > 0;
+      setChatSending(chatRequestsRef.current.has(chatSessionRef.current));
     }
   };
 
+  const renameChatSession = async (taskId: string, name: string): Promise<boolean> => {
+    if (renameRequestsRef.current.has(taskId)) return false;
+    renameRequestsRef.current.add(taskId);
+    try {
+      const renamed = taskFromApi(await renameTask(taskId, name));
+      setTasks(current => {
+        const existing = current.find(task => task.id === taskId);
+        if (!existing || Date.parse(existing.updatedAt) > Date.parse(renamed.updatedAt)) return current;
+        return [renamed, ...current.filter(task => task.id !== taskId)];
+      });
+      return true;
+    } catch { return false; }
+    finally { renameRequestsRef.current.delete(taskId); }
+  };
+
   const stopChatLoop = async () => {
-    if (!activeTask?.runId) return;
+    if (!activeTask?.runId) return false;
+    const taskId = activeTask.id;
     try {
       const state = await stopAgentLoop(activeTask.runId);
-      setLoopRunning(state.loop_running);
+      if (taskRef.current === taskId) setLoopRunning(state.loop_running);
+      return true;
     } catch (error) {
-      setChatError(describeError(error, t("chat.error")));
+      if (taskRef.current === taskId) setChatError(describeError(error, t("chat.error")));
+      return false;
+    }
+  };
+
+  const stopCoworkRequest = async () => {
+    const request = chatRequestsRef.current.get(chatSessionKey);
+    if (!request) return false;
+    if (!request.taskId) { request.controller.abort(); return true; }
+    try {
+      await cancelCoworkChat(request.taskId, request.requestId);
+      request.controller.abort();
+      return true;
+    } catch (error) {
+      if (chatSessionRef.current === chatSessionKey) setChatError(describeError(error, t("chat.error")));
+      return false;
     }
   };
 
   // Inline approval: decide the pending push/pr/plan/write right in chat, then resume the loop on approve.
   const decideChatApproval = async (approvalId: string, decision: "approve" | "reject", reason?: string) => {
-    if (chatSendingRef.current) return;
+    if (!activeTask?.runId || chatRequestsRef.current.has(chatSessionKey)) return;
+    const taskId = activeTask.id;
+    const sessionKey = chatSessionKey;
+    const request = { taskId, runId: activeTask.runId, requestId: crypto.randomUUID(), controller: new AbortController() };
+    chatRequestsRef.current.set(sessionKey, request);
+    chatRequestsRef.current.set(taskId, request);
     chatSendingRef.current = true;
     setChatSending(true);
     setChatError(null);
     try {
       await decideApproval(approvalId, decision, reason);
-      setChatPending(null);
+      if (taskRef.current === taskId) setChatPending(null);
       if (decision === "approve" && activeTask?.runId) {
-        await startAgentLoop(activeTask.runId, {});  // resume with the task's existing posture
-        setLoopRunning(true);
+        const state = await startAgentLoop(activeTask.runId, {});
+        updateTaskFromApi(state.task);
+        if (taskRef.current === taskId) {
+          setLoopRunning(state.loop_running);
+          setChatAction(state.action);
+          setChatStateMessage(state.message);
+        }
       }
     } catch (error) {
-      setChatError(describeError(error, t("chat.error")));
+      if (taskRef.current === taskId) setChatError(describeError(error, t("chat.error")));
     } finally {
-      chatSendingRef.current = false;
-      setChatSending(false);
+      for (const [key, item] of chatRequestsRef.current) {
+        if (item === request) chatRequestsRef.current.delete(key);
+      }
+      chatSendingRef.current = chatRequestsRef.current.size > 0;
+      setChatSending(chatRequestsRef.current.has(chatSessionRef.current));
     }
   };
 
-  const startNewChatSession = () => {
+  const startNewChatSession = (preserveDraftKey?: string) => {
+    chatSelectionRef.current++;
+    taskRef.current = "";
     setActiveNav("chat");
     setChatComposingNew(true);
     setActiveTaskId("");
@@ -726,17 +991,29 @@ function App() {
     setChatAction(null);
     setChatError(null);
     setLoopRunning(false);
+    setChatSending(false);
+    setChatStateMessage(null);
+    if (!preserveDraftKey && activeTask?.sourceRepositoryId) setSelectedRepositoryId(activeTask.sourceRepositoryId);
+    if (!preserveDraftKey || chatRequestsRef.current.has(preserveDraftKey) || [...chatComposerKeysRef.current.values()].includes(preserveDraftKey)) setChatDraftId(createNewChatDraftId(chatDraftScope));
   };
 
   const selectChatSession = (taskId: string) => {
+    chatSelectionRef.current++;
+    taskRef.current = taskId;
     setActiveNav("chat");
     setChatComposingNew(false);
     setChatPending(null);
     setChatAction(null);
     setChatError(null);
+    setChatSending(chatRequestsRef.current.has(taskId));
+    setChatStateMessage(null);
+    setLoopRunning(false);
+    setChatAgentState(null);
+    setRunEvents([]);
+    setChatBudget(null);
     setActiveTaskId(taskId);
     const selectedTask = tasks.find(task => task.id === taskId);
-    setSelectedRepositoryId(selectedTask?.repositoryId ?? "");
+    setSelectedRepositoryId(selectedTask?.sourceRepositoryId ?? selectedTask?.repositoryId ?? "");
     if (selectedTask) setRailTab(selectedTask.track);
   };
 
@@ -744,7 +1021,7 @@ function App() {
     setSelectedRepositoryId(repositoryId);
     setSourceLocation(null);
     setRailTab("code");
-    startNewChatSession();
+    startNewChatSession(`new:code:${repositoryId}:${chatDraftId}`);
     setSidebarOpen(false);
     setRepositoryDialogOpen(false);
     setRepositoryError(null);
@@ -842,28 +1119,34 @@ function App() {
 
   const draftActivePatch = async () => {
     if (!activeTask?.runId || patchRunning) return;
+    const taskId = activeTask.id;
     setPatchRunning(true);
     setPatchError(null);
     setPatchApplied(null);
+    setPatchNoChanges(false);
     try {
       const preview = await draftPatch(activeTask.runId, {
         context_paths: patchPath.trim() ? [patchPath.trim()] : [],
         feedback: patchFeedback.trim() || undefined,
       });
+      if (taskRef.current !== taskId) return;
       setPatchFeedback("");
-      setPatchPreviewResult(preview);
+      if (preview.no_changes) await refreshActiveTask();
+      if (taskRef.current !== taskId) return;
+      setPatchPreviewResult(preview.no_changes ? null : preview);
+      setPatchNoChanges(preview.no_changes === true);
       setPatchRationale(preview.rationale);
       const events = await listRunEvents(activeTask.runId);
-      setRunEvents(events.items);
+      if (taskRef.current === taskId) setRunEvents(events.items);
     } catch (error) {
-      setPatchError(describeError(error, t("patch.draftError")));
+      if (taskRef.current === taskId) setPatchError(describeError(error, t("patch.draftError")));
     } finally {
       setPatchRunning(false);
     }
   };
 
   const applyActivePatch = async (confirmation?: "delete" | "validation") => {
-    if (!activeTask?.runId || !patchPreviewResult || patchRunning) return;
+    if (!activeTask?.runId || !patchPreviewResult?.patch_id || patchRunning) return;
     let confirmed = patchConfirmationRef.current;
     if (confirmation) {
       if (!confirmed || confirmed.runId !== activeTask.runId || confirmed.patchId !== patchPreviewResult.patch_id) { closeConfirmation(); return; }
@@ -939,7 +1222,7 @@ function App() {
   };
 
   const commitTask = async () => {
-    if (!activeTask || !commitPreviewResult?.ready || gitRunning) return;
+    if (!activeTask || !commitPreviewResult?.ready || commitPreviewResult.scope_blocked_files?.length || gitRunning) return;
     setGitRunning(true);
     setGitError(null);
     try {
@@ -956,7 +1239,7 @@ function App() {
   };
 
   const requestWriteApproval = async () => {
-    if (!activeTask || !commitPreviewResult || gitRunning) return;
+    if (!activeTask || !commitPreviewResult?.ready || commitPreviewResult.scope_blocked_files?.length || gitRunning) return;
     setGitRunning(true);
     setGitError(null);
     try {
@@ -1083,7 +1366,11 @@ function App() {
 
   const updateTaskFromApi = (task: AgentTask) => {
     const nextTask = taskFromApi(task);
-    setTasks((current) => [nextTask, ...current.filter((item) => item.id !== nextTask.id)]);
+    setTasks((current) => {
+      const existing = current.find((item) => item.id === nextTask.id);
+      if (existing && Date.parse(existing.updatedAt) > Date.parse(nextTask.updatedAt)) return current;
+      return [nextTask, ...current.filter((item) => item.id !== nextTask.id)];
+    });
   };
 
   const beginIteration = async () => {
@@ -1107,7 +1394,7 @@ function App() {
     setIterationRunning(true);
     setIterationError(null);
     try {
-      const approval = await requestApproval(activeTask.id, "plan", `Approve the plan for: ${activeTask.title}`);
+      const approval = await requestApproval(activeTask.id, "plan", `Approve the plan for: ${activeTask.goal}`);
       setApprovals((current) => [approval, ...current.filter((item) => item.id !== approval.id)]);
     } catch (error) {
       setIterationError(describeError(error, t("approvalRequestError")));
@@ -1206,7 +1493,7 @@ function App() {
   };
 
   const agentRevision = [activeTask?.updatedAt, iterations.map(item => item.updated_at + String(item.rolled_back)).join(), approvals.map(item => item.id + item.status).join(), publishState?.pull_request?.updated_at].join(":");
-  const operationBusy = Boolean(isRunning || testRunning || validationSaving || completionSaving || completionConfirming || patchRunning || gitRunning || iterationRunning || publishRunning || repositorySaving || confirmAction || agentBusyAction || approvalRunning);
+  const operationBusy = Boolean(isRunning || testRunning || validationSaving || completionSaving || planSaving || completionConfirming || patchRunning || gitRunning || iterationRunning || publishRunning || repositorySaving || confirmAction || agentBusyAction || approvalRunning);
   const filteredTasks = tasks.filter(task => taskFilter === "all" || task.status === taskFilter);
   const chatTrack: TaskTrack = chatComposingNew ? railTab : (activeTask?.track ?? railTab);
   const chatRepositoryId = !chatComposingNew && activeTask && !["done", "completed", "cancelled"].includes(activeTask.lifecycleStatus) ? activeTask.repositoryId ?? "" : selectedRepositoryId;
@@ -1220,11 +1507,117 @@ function App() {
   };
   const completionConfirmed = (task: AgentTask) => {
     updateTaskFromApi(task);
-    setValidationAgentState(current => current?.task.id === task.id ? { ...current, task, completion_status: "confirmed", can_confirm_completion: false } : current);
+    setValidationAgentState(current => current?.task.id === task.id ? { ...current, task, completion_status: "confirmed", can_confirm_completion: false, can_complete_local: false } : current);
+    void getAgentState(task.id).then(state => { if (taskRef.current === task.id) setValidationAgentState(state); }).catch(error => { if (taskRef.current === task.id) setTestError(describeError(error, t("chat.refreshError"))); });
+  };
+
+  const setupTask = tasks.find(task => task.id === chatSetupTaskId);
+  const prepareChatTask = () => {
+    if (!activeTask || activeTaskStarted || loopRunning || activeTask.requiresRecovery) return;
+    if (chatSetupTaskId !== activeTask.id) {
+      setValidationDirty(false);
+      setCompletionDirty(false);
+      setPlanDirty(false);
+      chatSetupFeedbackRef.current = "";
+    }
+    setChatSetupTaskId(activeTask.id);
+    setChatSetupOpen(true);
+    setChatSetupError(null);
+  };
+  const startPreparedTask = async () => {
+    if (!setupTask?.runId || chatSetupStarting || validationSaving || completionSaving || planSaving || validationDirty || completionDirty || planDirty || setupTask.plan?.steps.some(step => !setupTask.completionCriteria.some(criterion => criterion.step_id === step.id)) || setupTask.requiresRecovery || setupTask.currentIteration > 0) return;
+    setChatSetupStarting(true);
+    setChatSetupError(null);
+    try {
+      const state = await startAgentLoop(setupTask.runId, { feedback: chatSetupFeedbackRef.current });
+      updateTaskFromApi(state.task);
+      if (taskRef.current === setupTask.id) {
+        setLoopRunning(state.loop_running);
+        setChatAction(state.action);
+        setChatStateMessage(state.message);
+      }
+      setChatSetupOpen(false);
+    } catch (error) {
+      setChatSetupError(describeError(error, t("chat.error")));
+    } finally {
+      setChatSetupStarting(false);
+    }
+  };
+  const continueChatTask = async () => {
+    if (!activeTask?.runId || loopRunning || activeTask.requiresRecovery || chatRequestsRef.current.has(chatSessionKey)) return;
+    const taskId = activeTask.id;
+    const request = { taskId, runId: activeTask.runId, requestId: crypto.randomUUID(), controller: new AbortController() };
+    chatRequestsRef.current.set(chatSessionKey, request);
+    chatRequestsRef.current.set(taskId, request);
+    chatSendingRef.current = true;
+    setChatSending(true);
+    try {
+      if (activeTask.lifecycleStatus === "paused") updateTaskFromApi((await resumeTask(taskId)).task);
+      const state = await startAgentLoop(activeTask.runId, {});
+      updateTaskFromApi(state.task);
+      if (taskRef.current === taskId) {
+        setLoopRunning(state.loop_running);
+        setChatAction(state.action);
+        setChatStateMessage(state.message);
+      }
+    } catch (error) {
+      if (taskRef.current === taskId) setChatError(describeError(error, t("chat.error")));
+    } finally {
+      for (const [key, item] of chatRequestsRef.current) {
+        if (item === request) chatRequestsRef.current.delete(key);
+      }
+      chatSendingRef.current = chatRequestsRef.current.size > 0;
+      setChatSending(chatRequestsRef.current.has(chatSessionRef.current));
+    }
+  };
+  const recoverChatTask = async () => {
+    if (!activeTask || loopRunning || chatRequestsRef.current.has(chatSessionKey)) return;
+    const taskId = activeTask.id;
+    const request = { taskId, runId: activeTask.runId ?? "", requestId: crypto.randomUUID(), controller: new AbortController() };
+    chatRequestsRef.current.set(chatSessionKey, request);
+    chatRequestsRef.current.set(taskId, request);
+    chatSendingRef.current = true;
+    setChatSending(true);
+    try {
+      const state = await recoverTask(taskId);
+      updateTaskFromApi(state.task);
+      const refreshed = await getAgentState(taskId);
+      if (taskRef.current === taskId) { setChatAction(refreshed.action); setChatStateMessage(refreshed.message); }
+    } catch (error) {
+      if (taskRef.current === taskId) setChatError(describeError(error, t("chat.error")));
+    } finally {
+      for (const [key, item] of chatRequestsRef.current) {
+        if (item === request) chatRequestsRef.current.delete(key);
+      }
+      chatSendingRef.current = chatRequestsRef.current.size > 0;
+      setChatSending(chatRequestsRef.current.has(chatSessionRef.current));
+    }
+  };
+  const retryDesktopBackend = async () => {
+    if (!desktopBridge) return;
+    setApiStatus("checking");
+    try {
+      setDesktopRuntime(await desktopBridge.restartBackend());
+      await loadOverviewData();
+    } catch (error) {
+      setOverviewError(describeError(error, t("overview.error")));
+      setApiStatus("offline");
+    }
   };
 
   return (
-    <div className="app-shell" data-page={activeNav}>
+    <div className="app-shell" data-page={settingsOpen ? "settings" : activeNav}>
+      <Dialog open={chatSetupOpen && Boolean(setupTask)} title={t("chat.setupTitle")} onClose={() => { if (!chatSetupStarting && !validationSaving && !completionSaving && !planSaving) setChatSetupOpen(false); }}>
+        {setupTask ? <>
+          <p className="empty-detail">{setupTask.goal}</p><p className="empty-detail">{t("chat.setupHint")}</p>
+          {setupTask.workspacePath ? <p className="empty-detail">{t("workspace.execution")} · <code style={{ overflowWrap: "anywhere" }}>{setupTask.workspacePath}</code></p> : null}
+          {setupTask.plan ? <TaskPlanEditor key={`plan-${setupTask.id}`} taskId={setupTask.id} plan={setupTask.plan} criteria={setupTask.completionCriteria} currentIteration={setupTask.currentIteration} disabled={chatSetupStarting || validationSaving || completionSaving} onSaved={updateTaskFromApi} onBusyChange={setPlanSaving} onDirtyChange={setPlanDirty} /> : null}
+          <ValidationChecklist key={setupTask.id} taskId={setupTask.id} checks={setupTask.validationChecks} currentIteration={setupTask.currentIteration} revision={setupTask.updatedAt} hidden={!chatSetupOpen} disabled={chatSetupStarting || planSaving || completionSaving} onSaved={updateTaskFromApi} onBusyChange={setValidationSaving} onDirtyChange={setValidationDirty} />
+          <CompletionCriteria key={setupTask.id} taskId={setupTask.id} goal={setupTask.goal} criteria={setupTask.completionCriteria} plan={setupTask.plan} confirmation={setupTask.completionConfirmation} currentIteration={setupTask.currentIteration} preparation disabled={chatSetupStarting || planSaving || validationSaving} onSaved={updateTaskFromApi} onBusyChange={setCompletionSaving} onDirtyChange={setCompletionDirty} />
+          {chatSetupError ? <p className="inline-error" role="alert">{chatSetupError}</p> : null}
+          <div className="dialog-actions"><button className="small-action small-action--muted" disabled={chatSetupStarting || validationSaving || completionSaving || planSaving} onClick={() => setChatSetupOpen(false)}>{t("common.back")}</button><button className="small-action" disabled={chatSetupStarting || validationSaving || completionSaving || planSaving || validationDirty || completionDirty || planDirty || setupTask.requiresRecovery || setupTask.currentIteration > 0} onClick={() => void startPreparedTask()}>{t(chatSetupStarting ? "working" : "startTask")}</button></div>
+        </> : null}
+      </Dialog>
       <Dialog open={repositoryDialogOpen} title={t("folder.openLocal")} onClose={() => { if (!repositorySaving) setRepositoryDialogOpen(false); }}>
         <form className="folder-dialog" onSubmit={event => { event.preventDefault(); saveRepository(); }}>
           <div className="folder-dialog-intro"><span className="folder-dialog-icon"><FolderOpen size={24} strokeWidth={1.5} /></span><p>{t("folder.dialogDescription")}</p></div>
@@ -1251,9 +1644,7 @@ function App() {
         {confirmAction === "validation" ? <pre>{patchPreviewResult?.validation_changes?.join("\n")}</pre> : confirmAction === "delete" ? <pre>{patchPreviewResult?.files.join("\n")}</pre> : null}
         <div className="dialog-actions"><button className="small-action small-action--muted" onClick={closeConfirmation}>{t("common.back")}</button><button className="small-action" onClick={() => confirmAction === "delete" || confirmAction === "validation" ? void applyActivePatch(confirmAction) : void changeTaskState("cancel", true)}>{t("common.confirm")}</button></div>
       </Dialog>
-      <Dialog open={settingsOpen} title={t("settings.title")} onClose={() => { setSettingsOpen(false); void refreshModelName(); }}>
-        <SettingsPanel embedded />
-      </Dialog>
+      {settingsOpen ? <SettingsPage initialCategory={settingsCategory} onBack={() => { setSettingsOpen(false); void refreshModelName(); }} /> : null}
       <Sidebar
         open={sidebarOpen}
         activeNav={activeNav}
@@ -1263,27 +1654,38 @@ function App() {
         groups={railGroups}
         approvalCount={approvalCount}
         folderOpening={repositorySaving}
+        deletionBusy={chatSending}
         onClose={closeSidebar}
-        onTrackChange={track => { if (railTab !== track) { setRailTab(track); startNewChatSession(); } }}
+        onTrackChange={track => { if (railTab !== track) { setRailTab(track); startNewChatSession(`new:${track}:${selectedRepositoryId}:${chatDraftId}`); } }}
         onNavigate={setActiveNav}
         onNewSession={startNewChatSession}
         onOpenFolder={addRepository}
         onSelectSession={selectChatSession}
         onOpenRegisteredFolder={openRegisteredFolder}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => { closeSidebar(); setSettingsCategory("general"); setSettingsOpen(true); }}
         onDeleteSession={deleteSession}
+        onRenameSession={renameChatSession}
       />
 
-      <main className="main-content" inert={sidebarOpen}>
-        <WorkspaceHeader title={activeNav === "chat" ? t(`rail.${chatTrack}`) : pageTitle} apiStatus={apiStatus} navigationOpen={sidebarOpen} folderOpening={repositorySaving} onOpenNavigation={() => setSidebarOpen(true)} onOpenFolder={addRepository} />
+      <main className="main-content" inert={sidebarOpen || settingsOpen}>
+        <WorkspaceHeader title={activeNav === "chat" ? (!chatComposingNew && activeTask ? activeTask.title : t(`rail.${chatTrack}`)) : pageTitle} chat={activeNav === "chat"} apiStatus={apiStatus} navigationOpen={sidebarOpen} folderOpening={repositorySaving} onOpenNavigation={() => setSidebarOpen(true)} onOpenFolder={addRepository} onOpenRun={!chatComposingNew && chatTrack === "code" && activeTask ? openChatRun : undefined} />
+        {!chatComposingNew && activeTask?.workspacePath ? <div className="recovery-note" style={{ margin: "0 24px 12px", minWidth: 0 }}><FolderSync size={14} /><span style={{ minWidth: 0 }}><strong>{t("workspace.isolated")}</strong> · {t("workspace.execution")} <code style={{ overflowWrap: "anywhere" }}>{activeTask.workspacePath}</code>{repositories.find(repository => repository.id === activeTask.sourceRepositoryId)?.path ? <><br />{t("workspace.source")} <code style={{ overflowWrap: "anywhere" }}>{repositories.find(repository => repository.id === activeTask.sourceRepositoryId)?.path}</code></> : null}</span></div> : null}
 
         <div id="workspace-content" className="page-wrap" data-view={activeNav} role={activeNav === "chat" ? "tabpanel" : undefined} aria-labelledby={activeNav === "chat" ? `track-${chatTrack}` : undefined}>
+          {desktopRuntime && !desktopRuntime.backendReady && (desktopRuntime.error || desktopRuntime.backendState === "failed") ? <div className="inline-error" role="alert">{desktopRuntime.error || t("overview.error")} <button className="small-action" disabled={apiStatus === "checking"} onClick={() => void retryDesktopBackend()}>{t("common.retry")}</button></div> : null}
           <ChatPanel
-            goal={chatComposingNew || chatTrack === "cowork" ? null : (activeTask?.title ?? null)}
+            sessionKey={chatSessionKey}
+            draftScope={chatDraftScope}
+            draftTaskKeys={Object.fromEntries([...chatComposerKeysRef.current].map(([taskId, key]) => [key, taskId]))}
+            deletedDraftKeys={deletedChatDraftKeys}
+            draftSessionKey={!chatComposingNew && activeTask ? activeTask.id : `new:${chatTrack}:${chatRepositoryId}:${chatDraftId}`}
+            streamingReplies={chatTrack === "cowork" ? chatReplies[chatSessionKey] : undefined}
+            goal={chatComposingNew || chatTrack === "cowork" ? null : (activeTask?.goal ?? null)}
             plan={chatComposingNew || chatTrack === "cowork" ? undefined : (activeTask?.plan ?? undefined)}
             events={chatComposingNew ? [] : runEvents}
             loopRunning={chatTrack === "code" && loopRunning}
-            sending={chatSending}
+            sending={chatSending || chatModeSaving || chatModelSaving}
+            stateLoaded={chatTrack === "cowork" || (activeNav === "chat" && !chatComposingNew && chatAgentState?.task.id === activeTask?.id)}
             status={chatComposingNew ? null : (activeTask?.lifecycleStatus ?? null)}
             hasActiveRun={!chatComposingNew && Boolean(activeTask?.runId)}
             track={chatTrack}
@@ -1293,20 +1695,41 @@ function App() {
             onImportFolder={addRepository}
             onBrowseFolder={() => { setSelectedRepositoryId(chatRepositoryId); setActiveNav("repositories"); }}
             onSend={sendChatMessage}
+            canSetCompletionCriteria={chatTrack === "code" && createsCodeTask}
             onStop={stopChatLoop}
+            onCancelCowork={stopCoworkRequest}
+            stateMessage={chatComposingNew ? null : chatStateMessage}
+            action={chatComposingNew ? null : chatAction}
+            agentState={!chatComposingNew && chatAgentState?.task.id === activeTask?.id && chatAgentState?.task.updated_at === activeTask?.updatedAt ? chatAgentState : null}
+            requiresRecovery={!chatComposingNew && activeTask?.requiresRecovery}
+            blockedReason={chatComposingNew || !activeTask?.agentBlockedReason ? null : describeError(new ApiRequestError(activeTask.agentBlockedReason, activeTask.error || activeTask.agentBlockedReason), t("chat.error"))}
+            onResume={continueChatTask}
+            onRecover={recoverChatTask}
+            onOpenRun={openChatRun}
+            onPrepare={chatTrack === "code" && !createsCodeTask && !activeTaskStarted && !loopRunning && !activeTask?.requiresRecovery ? prepareChatTask : undefined}
+            onOpenContextPath={path => openFailure(path, 1)}
+            onOpenFile={(path, line) => openFailure(path, line ?? 1)}
+            onOpenValidation={openCompletionReview}
+            onRefresh={chatPollError && !chatError ? () => setChatRefreshId(current => current + 1) : undefined}
             onOpenPublish={openChatRun}
             reviewCompletion={!chatComposingNew && chatAction === "review_completion" && !loopRunning}
             onOpenCompletion={openCompletionReview}
             reviewPatch={!chatComposingNew && activeTask?.mode === "conservative" && chatAction === "review_patch" && !loopRunning}
             onReviewPatch={openChatRun}
             error={chatError ?? chatPollError}
-            mode={chatComposingNew || !activeTask ? chatMode : activeTask.mode}
-            modeLocked={!chatComposingNew && Boolean(activeTask)}
-            onModeChange={setChatMode}
+            mode={createsCodeTask ? chatMode : (activeTask?.mode ?? chatMode)}
+            modeLocked={chatModeSaving || operationBusy}
+            onModeChange={mode => void changeChatMode(mode)}
             pending={chatComposingNew ? null : chatPending}
             onDecide={decideChatApproval}
             budget={chatComposingNew ? null : chatBudget}
             modelName={modelName}
+            models={chatModelConfig?.models}
+            activeModelId={chatModelConfig?.active_model_id ?? undefined}
+            modelLocked={loopRunning || operationBusy || chatModelSaving}
+            onModelChange={id => void changeChatModel(id)}
+            onOpenModelSettings={() => { setSettingsCategory("models"); setSettingsOpen(true); }}
+            contextLimit={chatModelConfig?.llm_max_context_bytes}
           />
           {activeNav === "repositories" ? <RepositoryBrowser repositories={repositories} repositoryId={selectedRepositoryId} onRepositoryChange={(id) => { setSelectedRepositoryId(id); setSourceLocation(null); }} onOpenFolder={addRepository} onEdit={prepareSourceChange} canEdit={Boolean(activeTask?.repositoryId === selectedRepositoryId && activeTask.lifecycleStatus === "coding")} initialFile={sourceLocation} onDelete={removeRepository} /> : null}
           <section className="hero-block">
@@ -1369,7 +1792,7 @@ function App() {
               {activeTask ? <div className="iteration-bar"><div className="iteration-status"><strong>{t("iteration")} {activeTask.currentIteration || iterations.length || 0}</strong><span>{activeTask.nextAction ?? activeTask.plan?.objective ?? t("currentCodingLoop")}</span></div><div className="iteration-actions">{activeTask.status === "failed" ? <button className="small-action" onClick={() => void beginRepair()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("repair")}</button> : activeTask.status === "paused" ? <button className="small-action" onClick={() => void changeTaskState("resume")} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("resume")}</button> : (activeTask.status === "review" && !iterations.length || activeTask.lifecycleStatus === "coding" && Boolean(iterations.at(-1)?.rolled_back)) ? planApproval?.status === "approved" ? <button className="small-action" onClick={() => void beginIteration()} disabled={iterationRunning || Boolean(agentBusyAction) || Boolean(activeTaskHasGit && !activeTask.taskBranch)} title={activeTaskHasGit && !activeTask.taskBranch ? t("createBranchBeforeCommit") : undefined}>{t("startIteration")}</button> : <button className="small-action" onClick={() => void requestPlanApproval()} disabled={iterationRunning || Boolean(agentBusyAction)}>{planApproval ? t("awaitingApproval") : t("requestPlanApproval")}</button> : null}{planApproval?.status === "pending" ? <button className="small-action small-action--muted" onClick={() => void approvePlan()} disabled={iterationRunning || Boolean(agentBusyAction)}>{t("approvePlan")}</button> : null}{["coding", "testing", "running"].includes(activeTask.status) ? <button className="small-action small-action--muted" onClick={() => void changeTaskState("pause")} disabled={iterationRunning || Boolean(agentBusyAction && agentBusyAction !== "run_tests")}>{t("pause")}</button> : null}{!["cancelled", "done"].includes(activeTask.status) ? <button className="text-button" onClick={() => void changeTaskState("cancel")} disabled={iterationRunning || Boolean(agentBusyAction && agentBusyAction !== "run_tests")}>{t("cancel")}</button> : null}</div></div> : null}
               {iterationError ? <div className="inline-error">{iterationError}</div> : null}
               {activeTask?.agentBlockedReason ? <div className="inline-error" role="alert"><strong>{describeError(new ApiRequestError(activeTask.agentBlockedReason, activeTask.error ?? activeTask.nextAction ?? ""), t("common.error"))}</strong>{activeTask.error ? <p>{activeTask.error}</p> : null}</div> : null}
-              {activeTask?.plan ? <div className="plan-list"><div className="plan-label">{t("plan")} / {activeTask.plan.steps.length} {t("steps")}</div>{activeTask.plan.steps.map((step, index) => <div className="plan-step" key={step.id}><span className={`plan-step-index ${index === 0 ? "plan-step-index--active" : ""}`}>{index + 1}</span><div className="plan-step-copy"><strong>{step.title}</strong><span>{step.description}</span></div><span className={`plan-risk plan-risk--${step.risk}`}>{t(`risk.${step.risk}`)}</span></div>)}</div> : null}
+              {activeTask?.plan ? <PlanProgress key={activeTask.id} taskId={activeTask.id} revision={agentRevision} plan={activeTask.plan} hidden={activeNav === "repositories" || activeNav === "chat"} /> : null}
               {iterations.length ? <div className="iteration-history"><div className="plan-label">{t("iterations")} / {iterations.length}</div>{iterations.map((iteration) => <div className="iteration-row" key={iteration.id}><span className={`iteration-dot iteration-dot--${iteration.status}`} /><div className="iteration-row-copy"><strong>#{iteration.number} {t(`iterationStatus.${iteration.status}`)}</strong><span>{iteration.goal}</span>{iteration.failure_summary ? <small>{iteration.failure_summary}</small> : null}</div>{iteration.test_result?.failed_tests?.[0] ? <span className="failure-location">{iteration.test_result.failed_tests[0].path ?? t("testOutput")}{iteration.test_result.failed_tests[0].line ? `:${iteration.test_result.failed_tests[0].line}` : ""}</span> : null}</div>)}</div> : null}
               <div className="stream-list">
                 {displayedStreamEvents.map((event) => {
@@ -1392,7 +1815,7 @@ function App() {
             <section className="panel test-panel" ref={validationPanelRef}>
               <div className="panel-header"><div><div className="section-kicker"><PackageCheck size={13} /> {t("validation")}</div><h2>{t("testConsole")}</h2></div><button className="small-action" onClick={() => void executeTests()} disabled={!activeTask?.runId || operationBusy || !iterations.length || Boolean(iterations.at(-1)?.rolled_back) || ["paused", "cancelled", "done"].includes(activeTask.status)}>{testRunning ? <><Activity size={13} className="spin" /> {t("running")}</> : <><TerminalSquare size={13} /> {t(activeTask?.validationChecks.length ? "validation.next" : "runTests")}</>}</button></div>
               {activeTask?.runId ? <ValidationChecklist key={activeTask.id} taskId={activeTask.id} checks={activeTask.validationChecks} currentIteration={activeTask.currentIteration} revision={agentRevision} hidden={activeNav !== "runs"} disabled={operationBusy || ["paused", "cancelled", "done"].includes(activeTask.status)} onSaved={updateTaskFromApi} onBusyChange={setValidationSaving} onStateChange={updateValidationState} /> : null}
-              {activeTask?.runId ? <CompletionCriteria key={`criteria-${activeTask.id}`} taskId={activeTask.id} goal={activeTask.title} criteria={activeTask.completionCriteria} confirmation={activeTask.completionConfirmation} currentIteration={activeTask.currentIteration} state={validationAgentState} disabled={operationBusy || ["paused", "cancelled", "done"].includes(activeTask.status)} onSaved={completionConfirmed} onBusyChange={setCompletionConfirming} /> : null}
+              {activeTask?.runId ? <CompletionCriteria key={`criteria-${activeTask.id}`} taskId={activeTask.id} goal={activeTask.goal} criteria={activeTask.completionCriteria} plan={activeTask.plan} confirmation={activeTask.completionConfirmation} currentIteration={activeTask.currentIteration} state={validationAgentState} disabled={operationBusy || ["paused", "cancelled", "done"].includes(activeTask.status)} onSaved={completionConfirmed} onBusyChange={setCompletionConfirming} /> : null}
               {!activeTask?.validationChecks.length ? <div className="validation-options"><label>{t("validation.kind")}<select value={testKind} onChange={event => setTestKind(event.target.value as TestKind)} disabled={testRunning}>{["auto", "pytest", "frontend", "static"].map(kind => <option value={kind} key={kind}>{t("validation." + kind)}</option>)}</select></label><input value={testTarget} onChange={event => setTestTarget(event.target.value)} aria-label={t("validation.target")} placeholder={t("validation.target")} disabled={testRunning} /></div> : null}
               {testResult ? <div className="test-result">
                 <div className="test-result-top"><span className={`result-badge result-badge--${testResult.status}`}>{t("validation." + testResult.status)}</span><span>{testResult.duration_ms} ms · exit {testResult.exit_code ?? "—"}</span></div>
@@ -1413,15 +1836,17 @@ function App() {
                 <input className="patch-feedback" value={patchFeedback} maxLength={4000} disabled={patchRunning} onChange={(event) => setPatchFeedback(event.target.value)} placeholder={t("patch.feedbackPlaceholder")} aria-label={t("patch.feedbackPlaceholder")} />
                 <div className="patch-form-actions"><span>{patchPath.trim() ? `${t("patch.draftContext")}：${patchPath.trim()}` : t("updateOnly")}</span><div className="patch-form-buttons"><button className="small-action small-action--muted" onClick={() => void draftActivePatch()} disabled={!activeTask?.runId || patchRunning}>{patchRunning ? t("patch.drafting") : t("patch.draft")}</button><button className="small-action" onClick={() => void previewActivePatch()} disabled={!activeTask?.runId || !patchPath.trim() || patchRunning}>{patchRunning ? t("working") : t("previewDiff")}</button></div></div>
               </div>
-              {patchPreviewResult ? <div className="patch-result">{patchRationale ? <div className="patch-rationale"><strong>{t("patch.rationale")}</strong> {patchRationale}</div> : null}<div className="patch-summary"><span>{patchPreviewResult.files.length} {t("file")}</span><span className="diff-add">+{patchPreviewResult.additions}</span><span className="diff-del">-{patchPreviewResult.deletions}</span><span>{patchPreviewResult.bytes_changed} {t("bytes")}</span></div><pre className="diff-view">{patchPreviewResult.diff || t("patch.emptyFileChanges")}</pre><div className="patch-result-actions"><span>{t("reviewUnifiedDiff")}</span><div className="patch-result-buttons"><button className="small-action small-action--muted" onClick={cancelPatchPreview} disabled={patchRunning}>{t("cancel")}</button><button className="small-action" onClick={() => void applyActivePatch()} disabled={patchRunning || !patchPreviewResult.files.length}>{t("applyCheckpoint")}</button></div></div></div> : <div className="empty-operation"><FileCode2 size={17} /><span>{t("previewBeforeRepository")}</span></div>}
+              {patchPreviewResult ? <div className="patch-result">{patchRationale ? <div className="patch-rationale"><strong>{t("patch.rationale")}</strong> {patchRationale}</div> : null}<div className="patch-summary"><span>{patchPreviewResult.files.length} {t("file")}</span><span className="diff-add">+{patchPreviewResult.additions}</span><span className="diff-del">-{patchPreviewResult.deletions}</span><span>{patchPreviewResult.bytes_changed} {t("bytes")}</span></div><pre className="diff-view">{patchPreviewResult.diff || t("patch.emptyFileChanges")}</pre><div className="patch-result-actions"><span>{t("reviewUnifiedDiff")}</span><div className="patch-result-buttons"><button className="small-action small-action--muted" onClick={cancelPatchPreview} disabled={patchRunning}>{t("cancel")}</button><button className="small-action" onClick={() => void applyActivePatch()} disabled={patchRunning || !patchPreviewResult.patch_id || !patchPreviewResult.files.length}>{t("applyCheckpoint")}</button></div></div></div> : !patchNoChanges ? <div className="empty-operation"><FileCode2 size={17} /><span>{t("previewBeforeRepository")}</span></div> : null}
               {patchApplied ? <div className="success-note"><Check size={14} /> {patchApplied}</div> : null}
+              {patchNoChanges ? <div className="recovery-note"><PackageCheck size={16} /><div><strong>{t("patch.noChanges")}</strong><p>{patchRationale}</p><p>{t("patch.noChangesHint")}</p><button className="small-action" onClick={() => void executeTests()} disabled={operationBusy || !iterations.length || ["paused", "cancelled", "done"].includes(activeTask?.status ?? "")}>{t("runTests")}</button></div></div> : null}
               {patchError ? <div className="inline-error">{patchError}</div> : null}
             </section>
           </section>
 
           {activeTask && activeTask.currentIteration === 0 && activeNav === "runs" ? (
             <section className="panel completion-panel">
-              <CompletionCriteria key={`criteria-${activeTask.id}`} taskId={activeTask.id} goal={activeTask.title} criteria={activeTask.completionCriteria} confirmation={activeTask.completionConfirmation} currentIteration={0} preparation disabled={operationBusy} onSaved={updateTaskFromApi} onBusyChange={setCompletionSaving} />
+              {activeTask.plan ? <TaskPlanEditor key={`plan-${activeTask.id}`} taskId={activeTask.id} plan={activeTask.plan} criteria={activeTask.completionCriteria} currentIteration={0} disabled={operationBusy} onSaved={updateTaskFromApi} onBusyChange={setPlanSaving} /> : null}
+              <CompletionCriteria key={`criteria-${activeTask.id}`} taskId={activeTask.id} goal={activeTask.goal} criteria={activeTask.completionCriteria} plan={activeTask.plan} confirmation={activeTask.completionConfirmation} currentIteration={0} preparation disabled={operationBusy} onSaved={updateTaskFromApi} onBusyChange={setCompletionSaving} />
             </section>
           ) : null}
 
@@ -1434,7 +1859,7 @@ function App() {
             <section className="panel git-panel">
               <div className="panel-header"><div><div className="section-kicker"><GitPullRequest size={13} /> {t("commitReview")}</div><h2>{t("commitPreview")}</h2></div><span className="patch-safety"><LockKeyhole size={12} /> {t("localOnly")}</span></div>
               <div className="git-form"><input value={commitMessage} onChange={(event) => { setCommitMessage(event.target.value); setCommitPreviewResult(null); }} maxLength={2000} placeholder={t("commitMessagePlaceholder")} aria-label={t("commitMessage")} /><button className="small-action" onClick={() => void previewTaskCommit()} disabled={!activeTask || !commitMessage.trim() || gitRunning}>{t("previewCommit")}</button></div>
-              {commitPreviewResult ? <div className="patch-result"><div className="patch-summary"><span>{commitPreviewResult.changed_files.length} {t("files")}</span><span>{commitPreviewResult.branch}</span><span>{commitPreviewResult.ready ? t("ready") : t("empty")}</span></div><pre className="diff-view">{commitPreviewResult.diff || t("noUncommittedChanges")}</pre>{commitPreviewResult.excluded_files.length ? <p className="commit-excluded">{t("commit.excluded")}: {commitPreviewResult.excluded_files.join(", ")}</p> : null}<div className="patch-result-actions"><span>{t("testsBeforeCommit")}</span><div className="patch-result-buttons">{writeApproval?.status === "approved" ? <button className="small-action" onClick={() => void commitTask()} disabled={!commitPreviewResult.ready || gitRunning}>{t("createCommit")}</button> : <><button className="small-action small-action--muted" onClick={() => void requestWriteApproval()} disabled={!commitPreviewResult.ready || gitRunning}>{writeApproval ? t("awaitingApproval") : t("requestWriteApproval")}</button>{writeApproval?.status === "pending" ? <button className="small-action" onClick={() => void approveWrite()} disabled={gitRunning}>{t("approve")}</button> : null}</>}</div></div></div> : <div className="empty-operation"><GitPullRequest size={17} /><span>{t("previewLocalDiff")}</span></div>}
+              {commitPreviewResult ? <div className="patch-result"><div className="patch-summary"><span>{commitPreviewResult.changed_files.length} {t("files")}</span><span>{commitPreviewResult.branch}</span><span>{commitScopeBlocked ? t("commit.blocked") : commitPreviewResult.ready ? t("ready") : t("empty")}</span></div><pre className="diff-view">{commitPreviewResult.diff || t("noUncommittedChanges")}</pre>{commitPreviewResult.excluded_files.length ? <p className="commit-excluded">{t("commit.excluded")}: {commitPreviewResult.excluded_files.join(", ")}</p> : null}{commitScopeBlocked ? <div className="inline-error" role="alert"><p>{t("commit.scopeBlocked")}</p><code style={{ overflowWrap: "anywhere" }}>{commitPreviewResult.scope_blocked_files?.join(", ")}</code></div> : null}<div className="patch-result-actions"><span>{t("testsBeforeCommit")}</span><div className="patch-result-buttons">{writeApproval?.status === "approved" ? <button className="small-action" onClick={() => void commitTask()} disabled={!commitPreviewResult.ready || commitScopeBlocked || gitRunning}>{t("createCommit")}</button> : <><button className="small-action small-action--muted" onClick={() => void requestWriteApproval()} disabled={!commitPreviewResult.ready || commitScopeBlocked || gitRunning}>{writeApproval ? t("awaitingApproval") : t("requestWriteApproval")}</button>{writeApproval?.status === "pending" ? <button className="small-action" onClick={() => void approveWrite()} disabled={commitScopeBlocked || gitRunning}>{t("approve")}</button> : null}</>}</div></div></div> : <div className="empty-operation"><GitPullRequest size={17} /><span>{t("previewLocalDiff")}</span></div>}
               {gitError ? <div className="inline-error">{gitError}</div> : null}
             </section>
           </section>

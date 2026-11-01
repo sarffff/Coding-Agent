@@ -36,8 +36,8 @@ function isPortFree(port) {
 }
 
 /**
- * A remembered port keeps the renderer's module-scope API base URL valid across a
- * backend restart. Anything already answering there is not ours, so it is skipped.
+ * Reuse the remembered port when available. Anything already answering there is
+ * not ours, so it is skipped and the shell publishes the replacement address.
  */
 async function resolvePort(preferred) {
   if (!preferred) return freePort();
@@ -60,10 +60,11 @@ function probeHealth(port, timeoutMs = 1500) {
   });
 }
 
-async function waitForHealth(port, deadlineMs) {
+async function waitForHealth(port, deadlineMs, hasExited) {
   const started = Date.now();
   while (Date.now() - started < deadlineMs) {
-    if (await probeHealth(port)) return true;
+    if (hasExited()) return false;
+    if (await probeHealth(port)) return !hasExited();
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
@@ -82,6 +83,7 @@ async function startBackend(options) {
 
   fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
   const logStream = fs.createWriteStream(logFile, { flags: "a" });
   const startedAt = new Date().toISOString();
   logStream.write(`\n===== ${startedAt} backend launch (port ${port}) =====\n`);
@@ -106,6 +108,8 @@ async function startBackend(options) {
   );
 
   let exited = null;
+  let ready = false;
+  let stopping = false;
   child.stdout.on("data", (chunk) => logStream.write(chunk));
   child.stderr.on("data", (chunk) => logStream.write(chunk));
   child.on("error", (error) => {
@@ -113,50 +117,55 @@ async function startBackend(options) {
     logStream.write(`spawn error: ${error.message}\n`);
   });
   child.on("close", (code, signal) => {
-    exited = { code, signal, error: null };
-    logStream.write(`closed code=${code} signal=${signal}\n`);
+    exited = { code, signal, error: exited?.error || null };
+    logStream.end(`closed code=${code} signal=${signal}\n`);
+    if (ready && !stopping) options.onExit?.(exited);
   });
 
-  const healthy = await waitForHealth(port, 30_000);
+  const healthy = await waitForHealth(port, 30_000, () => exited !== null);
   if (!healthy) {
     const failure = exited;
     await stopBackend(child);
-    logStream.end(`startup failed: backend never became healthy\n`);
+    if (!logStream.writableEnded) logStream.end(`startup failed: backend never became healthy\n`);
     const tail = readLogTail(logFile);
     throw new Error(
       failure?.error
         ? `无法启动本地 API：${failure.error}（Python: ${python}）`
+        : failure
+          ? `本地 API 在启动时退出（code=${failure.code}, signal=${failure.signal}，日志: ${logFile}）\n${tail}`
         : `本地 API 在 30 秒内没有就绪（Python: ${python}，日志: ${logFile}）\n${tail}`
     );
   }
 
+  ready = true;
   return {
     port,
     python,
     logFile,
     child,
-    stop: () => stopBackend(child),
+    isRunning: () => exited === null,
+    stop: () => { stopping = true; return stopBackend(child); },
   };
 }
 
 function stopBackend(child) {
-  if (!child || child.killed || child.exitCode !== null) return Promise.resolve();
+  if (!child || !child.pid || child.exitCode != null || child.signalCode != null) return Promise.resolve();
   return new Promise((resolve) => {
     const finish = () => {
       clearTimeout(killTimer);
       resolve();
     };
     child.once("close", finish);
+    const killTimer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish();
+    }, 2_000);
     if (process.platform === "win32") {
       const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { shell: false, stdio: "ignore", windowsHide: true });
       killer.on("error", () => child.kill());
     } else {
       child.kill("SIGTERM");
     }
-    const killTimer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish();
-    }, 2_000);
   });
 }
 

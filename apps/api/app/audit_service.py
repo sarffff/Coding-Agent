@@ -22,15 +22,24 @@ class AuditService:
 
     def _prune(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
-        eligible = [event for event in self._events if event.created_at >= cutoff]
+        conversations = [event for event in self._events if event.action.startswith("chat.")]
+        eligible = [event for event in self._events if not event.action.startswith("chat.") and event.created_at >= cutoff]
         kept = eligible[-self.max_events:] if self.max_events else []
-        kept_ids = {event.id for event in kept}
+        kept_ids = {event.id for event in [*kept, *conversations]}
         for event in self._events:
             if event.id not in kept_ids:
                 key = self._keys.pop(event.id, None)
                 if self.store and key:
                     self.store.delete("audit_events", key)
-        self._events = kept
+        self._events = [event for event in self._events if event.id in kept_ids]
+
+    def delete_chat_for_run(self, run_id: str) -> None:
+        for event in tuple(self._events):
+            if event.run_id == run_id and event.action.startswith("chat."):
+                key = self._keys.pop(event.id, None)
+                if self.store and key:
+                    self.store.delete("audit_events", key)
+                self._events.remove(event)
 
     def record(
         self,

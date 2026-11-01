@@ -8,8 +8,8 @@ from test_api_workflow import apply_value, approve, post
 
 
 CRITERIA = [
-    {"id": "value", "text": "Return 2 from value()."},
-    {"id": "scope", "text": "Keep unrelated notes unchanged."},
+    {"id": "value", "text": "Return 2 from value().", "step_id": None},
+    {"id": "scope", "text": "Keep unrelated notes unchanged.", "step_id": None},
 ]
 EVIDENCE = [
     {"criterion_id": "value", "evidence": "app.py returns 2; test_value passes."},

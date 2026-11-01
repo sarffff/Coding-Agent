@@ -5,7 +5,7 @@ import { AsyncMessage } from "@coding-agent/ui";
 import { advanceAgent, getAgentState, type AgentAction, type AgentAdvanceAction, type AgentState, type TaskBudget, type TestKind } from "../lib/api";
 import { usePreferences } from "../lib/preferences";
 
-const actionLabels: Record<AgentAction, string> = {
+export const actionLabels: Record<AgentAction, string> = {
   recover: "recovery.action",
   request_plan_approval: "requestPlanApproval",
   await_plan_approval: "awaitingApproval",
@@ -17,6 +17,7 @@ const actionLabels: Record<AgentAction, string> = {
   wait_for_tests: "running",
   start_repair: "repair",
   review_completion: "agent.manualReview",
+  review_local_completion: "completion.local",
   review_commit: "previewLocalDiff",
   review_push: "publish.pushTitle",
   review_pr: "publish.prTitle",
@@ -131,7 +132,7 @@ export function AgentPanel({ taskId, revision, testKind, testTarget, disabled, h
   </section>;
 }
 
-function BudgetMeter({ budget }: { budget: TaskBudget }) {
+export function BudgetMeter({ budget }: { budget: TaskBudget }) {
   const { t } = usePreferences();
   const clock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
   const governors = [

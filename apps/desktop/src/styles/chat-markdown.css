@@ -1,0 +1,22 @@
+.chat-markdown > :first-child { margin-top: 0; }
+.chat-markdown > :last-child { margin-bottom: 0; }
+.chat-markdown blockquote { margin: 12px 0; padding: 2px 0 2px 14px; border-left: 3px solid var(--line-strong); color: var(--text-secondary); }
+.chat-markdown blockquote .chat-markdown { font-size: inherit; }
+.chat-markdown .chat-task-item { display: flex; align-items: flex-start; gap: 8px; list-style: none; }
+.chat-task-item > input { flex: 0 0 auto; margin: 6px 0 0; accent-color: var(--cyan); }
+.chat-task-item > input:disabled { opacity: 1; }
+.chat-task-item > span { min-width: 0; }
+.chat-code-block, .chat-table-scroll { min-width: 0; max-width: 100%; }
+.chat-code-header { flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.chat-code-header > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%; }
+.chat-code-header > button { min-height: 26px; padding: 3px 6px; border-radius: 4px; }
+.chat-code-header > button:hover { background: var(--surface-active); color: var(--text-primary); }
+.chat-code-header > [role="status"] { flex-basis: 100%; overflow-wrap: anywhere; }
+.chat-code-block pre { max-height: 420px; tab-size: 4; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.chat-code-block pre:focus-visible, .chat-table-scroll:focus-visible, .chat-code-header > button:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
+.chat-table-scroll { overscroll-behavior: contain; border-radius: 4px; }
+.chat-markdown th, .chat-markdown td { min-width: 90px; vertical-align: top; }
+@media (max-width: 720px) {
+  .chat-code-block pre { max-height: 300px; }
+  .chat-markdown blockquote { padding-left: 10px; }
+}

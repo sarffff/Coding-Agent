@@ -33,9 +33,13 @@ const cssContent = fs.readFileSync(path.join(assetsDir, cssBundle), "utf-8");
 assert(cssContent.includes("plan-step-copy"), "CSS 缺少 plan-step-copy 样式定义");
 assert(cssContent.includes("async-message"), "CSS 缺少 async-message 状态样式");
 assert(cssContent.includes("focus-visible"), "CSS 缺少 focus-visible 焦点环");
+for (const className of ["rail-session-search", "rail-session-rename", "chat-sent-attachments", "chat-iteration-diff", "chat-draft-warning"]) {
+  assert(cssContent.includes(className), `CSS 缺少 ${className} 功能样式`);
+}
 
 // 4. 校验 JS 产物包含关键核心交互逻辑(Cowork/Code 工作区分栏文案)
 const jsContent = fs.readFileSync(path.join(assetsDir, jsBundle), "utf-8");
 assert(jsContent.includes("Cowork") && jsContent.includes("Code"), "JS 缺少应用核心文本");
+assert(jsContent.includes("/chat/stream"), "JS 缺少 Cowork 流式请求入口");
 
 console.log("[Smoke Test] Desktop 核心冒烟测试通过！构建产物健康且完整。");

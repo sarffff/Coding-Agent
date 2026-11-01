@@ -23,6 +23,9 @@ let mainWindow = null;
 let backend = null;
 let config = null;
 let lastError = "";
+let backendState = "stopped";
+let backendStart = null;
+let backendRestart = null;
 
 function logFile() {
   return path.join(app.getPath("userData"), "logs", "backend.log");
@@ -62,9 +65,14 @@ function statusPayload() {
     electron: process.versions.electron,
     node: process.versions.node,
     platform: process.platform,
-    backendReady: Boolean(backend),
+    backendReady: backendState === "ready" && Boolean(backend?.isRunning()),
+    backendState,
     error: lastError,
   };
+}
+
+function publishStatus() {
+  mainWindow?.webContents.send("forge:status-changed", statusPayload());
 }
 
 function corsOrigins() {
@@ -80,27 +88,69 @@ function resolveApiRoot() {
 }
 
 async function startManagedBackend() {
-  const apiRoot = resolveApiRoot();
-  if (!apiRoot) {
-    throw new Error("打包版没有内置 Python API。请设置 FORGE_API_ROOT 指向仓库根目录，或先用 pnpm desktop:electron 以源码方式运行。");
-  }
-  const workspaceRoot = currentWorkspaceRoot();
-  backend = await startBackend({
-    repoRoot: apiRoot,
-    workspaceRoot,
-    stateDir: stateDir(),
-    corsOrigins: corsOrigins(),
-    logFile: logFile(),
-    port: config.read().apiPort,
-  });
-  config.update({ apiPort: backend.port });
+  if (backendStart) return backendStart;
+  backendState = "starting";
   lastError = "";
+  publishStatus();
+  backendStart = (async () => {
+    let started;
+    try {
+      const apiRoot = resolveApiRoot();
+      if (!apiRoot) {
+        throw new Error("打包版没有内置 Python API。请设置 FORGE_API_ROOT 指向仓库根目录，或先用 pnpm desktop:electron 以源码方式运行。");
+      }
+      started = await startBackend({
+        repoRoot: apiRoot,
+        workspaceRoot: currentWorkspaceRoot(),
+        stateDir: stateDir(),
+        corsOrigins: corsOrigins(),
+        logFile: logFile(),
+        port: config.read().apiPort,
+        onExit: (exit) => {
+          if (backend !== started) return;
+          backend = null;
+          backendState = "failed";
+          lastError = `本地 API 意外退出（code=${exit.code}, signal=${exit.signal}${exit.error ? `, ${exit.error}` : ""}）。请重试启动，日志: ${logFile()}`;
+          publishStatus();
+        },
+      });
+      if (!started.isRunning()) throw new Error("本地 API 在启动完成前退出，请重试启动。");
+      config.update({ apiPort: started.port });
+      backend = started;
+      backendState = "ready";
+      publishStatus();
+    } catch (error) {
+      if (started) await started.stop();
+      backend = null;
+      backendState = "failed";
+      lastError = describe(error);
+      publishStatus();
+      throw error;
+    }
+  })().finally(() => { backendStart = null; });
+  return backendStart;
 }
 
 async function stopManagedBackend() {
+  if (backendStart) await backendStart.catch(() => {});
   const current = backend;
   backend = null;
+  backendState = current ? "stopping" : "stopped";
+  publishStatus();
   if (current) await current.stop();
+  backendState = "stopped";
+  publishStatus();
+}
+
+function restartManagedBackend() {
+  if (backendRestart) return backendRestart;
+  backendRestart = (async () => {
+    await stopManagedBackend();
+    try { await startManagedBackend(); }
+    catch { /* startManagedBackend has already published the failure. */ }
+    return statusPayload();
+  })().finally(() => { backendRestart = null; });
+  return backendRestart;
 }
 
 function describe(error) {
@@ -112,11 +162,12 @@ function errorPage(message) {
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Forge 未就绪</title>
 <style>body{font-family:'Segoe UI',sans-serif;background:#111313;color:#ebece8;padding:34px 40px;line-height:1.6}
 h1{font-size:17px;margin:0 0 12px}p{font-size:13px;color:#b7bdb6;margin:0 0 12px}
-pre{background:#171a1a;border:1px solid rgba(231,238,223,.12);border-radius:6px;padding:14px;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+pre{background:#171a1a;border:1px solid rgba(231,238,223,.12);border-radius:6px;padding:14px;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}button{padding:8px 14px;cursor:pointer}
 code{color:#c9e26a}</style></head><body>
 <h1>桌面壳已就绪，但工作台还起不来。</h1>
 <p>请确认 <code>apps/api</code> 存在，Python 3.11+ 已安装 <code>apps/api/requirements.txt</code>（可用 <code>FORGE_PYTHON</code> 指定解释器），并已执行 <code>pnpm build</code>。日志：<code>${logFile()}</code></p>
 <pre>${safe}</pre>
+<button onclick="this.disabled=true;window.forge.restartBackend().then(s=>{if(s.error){document.querySelector('pre').textContent=s.error;this.disabled=false}}).catch(e=>{document.querySelector('pre').textContent=e.message;this.disabled=false})">重试启动</button>
 </body></html>`;
   return "data:text/html;charset=utf-8," + encodeURIComponent(html);
 }
@@ -336,6 +387,7 @@ async function runSmokeChecks() {
   const allSteps = steps.length ? steps : [{ step: "探针未跑完", ok: false, detail: error }];
   const pass = Boolean(probe && health && !error && !lastError && allSteps.every((step) => step.ok));
   console.log(JSON.stringify({ smoke: "forge-electron", pass, health, error, lastError, ...probe, steps: allSteps.map((step) => `${step.ok ? "PASS" : "FAIL"} ${step.step}${step.ok ? "" : ` -> ${step.detail}`}`) }, null, 2));
+  await stopManagedBackend();
   app.exit(pass ? 0 : 1);
 }
 
@@ -344,6 +396,13 @@ function registerIpc() {
     event.returnValue = statusPayload();
   });
   ipcMain.handle("forge:status", () => statusPayload());
+  ipcMain.handle("forge:restart-backend", async () => {
+    const status = await restartManagedBackend();
+    if (status.backendReady && mainWindow?.webContents.getURL().startsWith("data:")) {
+      await mainWindow.loadURL(DEV_URL || `${APP_ORIGIN}/index.html`);
+    }
+    return status;
+  });
   ipcMain.handle("forge:pick-directory", async (_event, options) => {
     const fallback = typeof options?.fallbackPath === "string" ? options.fallbackPath : statusPayload().workspaceRoot;
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -355,6 +414,7 @@ function registerIpc() {
     return path.resolve(result.filePaths[0]);
   });
   ipcMain.handle("forge:pick-workspace-root", async () => {
+    if (backendStart || backendRestart) return { canceled: true, ...statusPayload() };
     const current = statusPayload().workspaceRoot;
     const result = await dialog.showOpenDialog(mainWindow, {
       title: "选择工作区根目录（打开文件夹的默认起点）",
@@ -364,15 +424,7 @@ function registerIpc() {
     if (result.canceled || !result.filePaths.length) return { canceled: true, ...statusPayload() };
     const nextRoot = path.resolve(result.filePaths[0]);
     config.update({ workspaceRoot: nextRoot });
-    await stopManagedBackend();
-    try {
-      await startManagedBackend();
-    } catch (error) {
-      lastError = describe(error);
-      return { canceled: false, error: lastError, ...statusPayload() };
-    }
-    const status = statusPayload();
-    mainWindow?.webContents.send("forge:status-changed", status);
+    const status = await restartManagedBackend();
     return { canceled: false, ...status };
   });
   ipcMain.handle("forge:open-log", async () => {
@@ -405,7 +457,7 @@ if (!app.requestSingleInstanceLock()) {
     })
     .catch((error) => {
       console.error("[forge] fatal:", describe(error));
-      app.exit(1);
+      void stopManagedBackend().finally(() => app.exit(1));
     });
 }
 
@@ -415,10 +467,10 @@ app.on("window-all-closed", () => {
 
 let quitting = false;
 app.on("will-quit", (event) => {
-  if (!backend || quitting) return;
+  if ((!backend && !backendStart && !backendRestart) || quitting) return;
   event.preventDefault();
   quitting = true;
-  void stopManagedBackend().finally(() => app.exit(0));
+  void (backendRestart || Promise.resolve()).catch(() => {}).then(stopManagedBackend).finally(() => app.exit(0));
 });
 
 app.on("web-contents-created", (_event, contents) => {

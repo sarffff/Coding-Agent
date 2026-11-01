@@ -53,6 +53,20 @@ def test_commit_matches_preview_and_preserves_other_staging(demo_repository, git
     assert service.snapshot(repository_id).changed_files == ["notes.txt", "unrelated.txt"]
 
 
+def test_commit_accepts_the_full_preview_message_limit(demo_repository, git_services):
+    _, service, repository_id = git_services
+    branch = "codex/long-commit-message"
+    service.create_task_branch(repository_id, branch)
+    (demo_repository / "app.py").write_text("value = 2\n", encoding="utf-8")
+    message = "m" * 2_000
+    preview = service.preview(repository_id, ["app.py"], message)
+    service.commit(repository_id, ["app.py"], message, preview.scope_hash, branch)
+    assert git_output(demo_repository, "log", "-1", "--format=%B").strip() == message
+    with pytest.raises(RepositoryError) as error:
+        service.commit(repository_id, ["app.py"], message + "x", preview.scope_hash, branch)
+    assert error.value.code == "INVALID_COMMIT_MESSAGE"
+
+
 @pytest.mark.parametrize("change", ["content", "message", "head", "branch"])
 def test_changed_preview_cannot_be_committed(demo_repository, git_services, change):
     _, service, repository_id = git_services

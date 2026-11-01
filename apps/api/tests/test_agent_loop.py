@@ -169,7 +169,9 @@ def test_plain_folder_loop_validates_and_rolls_back_without_git(model_api, tmp_p
 
     post(client, f"/api/v1/runs/{task['run_id']}/loop", {})
     final = _wait_for_loop(client, task["id"])
-    assert final["action"] == "manual_review"
+    assert final["action"] == "review_completion"
+    assert final["can_confirm_completion"] is True
+    assert final["can_complete_local"] is False
     assert "Local validation passed" in final["message"]
     assert final["last_test"]["status"] == "passed"
     assert final["last_test"]["validation_hash"]

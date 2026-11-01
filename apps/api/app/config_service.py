@@ -33,20 +33,19 @@ EDITABLE_FIELDS = (
 
 MODEL_LIST_KEY = "models"
 ACTIVE_MODEL_KEY = "active_model_id"
+MODEL_FIELDS = EDITABLE_FIELDS[:6]
 
 
 def apply_model_profile(settings: Settings, profile: ModelProfile) -> None:
-    """Point the flat settings at one saved profile; empty base_url/key leave the current value."""
+    """Point the flat settings at a saved profile; blank URLs use the provider default."""
     settings.llm_provider = profile.provider
     settings.llm_model = profile.model
     if profile.provider == "openai":
-        if profile.base_url:
-            settings.openai_api_url = profile.base_url
+        settings.openai_api_url = profile.base_url or Settings.model_fields["openai_api_url"].default
         if profile.api_key is not None:
             settings.openai_api_key = profile.api_key
     elif profile.provider == "anthropic":
-        if profile.base_url:
-            settings.anthropic_api_url = profile.base_url
+        settings.anthropic_api_url = profile.base_url or Settings.model_fields["anthropic_api_url"].default
         if profile.api_key is not None:
             settings.anthropic_api_key = profile.api_key
 
@@ -74,7 +73,16 @@ def overrides_path(settings: Settings) -> Path:
     return (settings.state_dir / "config.json").resolve()
 
 
-def apply_overrides(settings: Settings) -> list[str]:
+def apply_saved_model(settings: Settings) -> bool:
+    models, active = _load_saved_models(overrides_path(settings))
+    profile = next((item for item in models if item.id == active), None)
+    if profile is None:
+        return False
+    apply_model_profile(settings, profile)
+    return True
+
+
+def apply_overrides(settings: Settings, *, apply_profiles: bool = True) -> list[str]:
     """Apply saved overrides before the services are built.
 
     A corrupt or unreadable file must not stop the API from starting: the env file is still a
@@ -96,10 +104,7 @@ def apply_overrides(settings: Settings) -> list[str]:
         if isinstance(value, (str, int)) and not isinstance(value, bool):
             setattr(settings, name, value)
             applied.append(name)
-    models, active = _load_saved_models(path)
-    profile = next((item for item in models if item.id == active), None)
-    if profile is not None:
-        apply_model_profile(settings, profile)
+    if apply_profiles and apply_saved_model(settings):
         applied.append(ACTIVE_MODEL_KEY)
     return applied
 
@@ -107,9 +112,13 @@ def apply_overrides(settings: Settings) -> list[str]:
 class ConfigService:
     """Reads and updates the runtime configuration; the API keys never leave this object."""
 
-    def __init__(self, settings: Settings, *, on_provider_change: Callable[[ModelProvider], None] | None = None) -> None:
+    def __init__(self, settings: Settings, *, model_defaults: dict[str, object] | None = None,
+                 on_provider_change: Callable[[ModelProvider], None] | None = None,
+                 before_model_change: Callable[[], None] | None = None) -> None:
         self.settings = settings
+        self._model_defaults = model_defaults or {name: getattr(settings, name) for name in MODEL_FIELDS}
         self._on_provider_change = on_provider_change
+        self._before_model_change = before_model_change
         self._restart_required = False
         self._models, self._active_model_id = _load_saved_models(overrides_path(settings))
 
@@ -155,11 +164,17 @@ class ConfigService:
             if isinstance(value, str) and not value.strip() and name in {"anthropic_api_url", "openai_api_url"}:
                 raise RepositoryError("CONFIG_INVALID_VALUE", f"{name} cannot be empty.", {"field": name})
 
-        previous_provider = self.settings.llm_provider
+        candidate = self.settings.model_copy(deep=True)
+        model_defaults = dict(self._model_defaults)
+        model_defaults.update({name: value for name, value in changes.items() if name in MODEL_FIELDS})
+        for name, value in model_defaults.items():
+            setattr(candidate, name, value)
         for name, value in changes.items():
-            setattr(self.settings, name, value)
+            setattr(candidate, name, value)
 
         saved: dict[str, object] = dict(changes)
+        candidate_models = self._models
+        candidate_active = self._active_model_id
         if models is not None:
             # The UI never sees stored keys, so an entry without one keeps the key it already had.
             # Sending an explicit empty string is how a key gets cleared.
@@ -168,27 +183,39 @@ class ConfigService:
             for item in incoming:
                 if item.api_key is None and item.id in existing_keys:
                     item.api_key = existing_keys[item.id]
-            self._models = incoming
-            saved[MODEL_LIST_KEY] = [item.model_dump() for item in self._models]
-            if self._active_model_id not in {item.id for item in self._models}:
+            candidate_models = incoming
+            saved[MODEL_LIST_KEY] = [item.model_dump() for item in candidate_models]
+            if candidate_active not in {item.id for item in candidate_models}:
                 # The active entry was removed (or renamed): fall back to the flat settings.
-                self._active_model_id = None
+                candidate_active = None
                 saved[ACTIVE_MODEL_KEY] = None
         if active is not None:
-            if active not in {item.id for item in self._models}:
+            if active not in {item.id for item in candidate_models}:
                 raise RepositoryError("CONFIG_INVALID_VALUE", "The selected model is not in the saved list.", {"field": ACTIVE_MODEL_KEY})
-            self._active_model_id = active
+            candidate_active = active
             saved[ACTIVE_MODEL_KEY] = active
 
+        profile = next((item for item in candidate_models if item.id == candidate_active), None)
+        if profile is not None:
+            apply_model_profile(candidate, profile)
+        candidate = Settings.model_validate(candidate.model_dump())
+        model_changed = any(getattr(candidate, name) != getattr(self.settings, name) for name in MODEL_FIELDS)
+        if self._before_model_change and any(getattr(candidate, name) != getattr(self.settings, name)
+                                             for name in EDITABLE_FIELDS if name != "command_timeout_seconds"):
+            self._before_model_change()
+        provider = build_model_provider(candidate) if model_changed and self._on_provider_change is not None else None
         self._persist(saved)
 
-        profile = next((item for item in self._models if item.id == self._active_model_id), None)
-        if profile is not None:
-            apply_model_profile(self.settings, profile)
-        if profile is not None or self.settings.llm_provider != previous_provider:
-            if self._on_provider_change is not None:
+        for name in EDITABLE_FIELDS:
+            setattr(self.settings, name, getattr(candidate, name))
+        self._model_defaults = model_defaults
+        self._models = candidate_models
+        self._active_model_id = candidate_active
+        if model_changed:
+            if provider is not None:
                 # The provider object is built from settings once; swap it so the change takes effect now.
-                self._on_provider_change(build_model_provider(self.settings))
+                provider.settings = self.settings
+                self._on_provider_change(provider)
                 self._restart_required = False
             else:
                 self._restart_required = True

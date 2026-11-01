@@ -437,13 +437,9 @@ dialog::backdrop {
 }
 
 .rail-folder-group > summary::-webkit-details-marker { display: none; }
-.rail-folder-group > summary > span:first-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-folder-group > summary > span:first-of-type { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rail-folder-group > summary::after { content: '›'; margin-left: 2px; transform: rotate(0); }
 .rail-folder-group[open] > summary::after { transform: rotate(90deg); }
-.rail-folder-count { margin-left: auto;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-  font-size: 10px; }
 .rail-folder-sessions { margin-left: 12px; border-left: 1px solid var(--line); padding-left: 6px; }
 .rail-folder-new { display: flex; align-items: center; gap: 7px; padding: 8px 9px; background: transparent; color: var(--text-faint); font-size: 11px; }
 .rail-folder-new:hover { color: var(--text-primary); }
@@ -4927,6 +4923,29 @@ h2 {
   font-size: 11px;
 }
 
+.chat-completion-criteria {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.chat-completion-criteria summary {
+  cursor: pointer;
+}
+
+.chat-completion-criteria label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chat-completion-criteria textarea {
+  min-height: 72px;
+  font-size: 13px;
+}
+
 /* ---------- 设置：模型列表 ---------- */
 
 .settings-models {
@@ -5071,6 +5090,10 @@ h2 {
   background: var(--surface-2);
 }
 
+.chat-session-row.is-active {
+  background: var(--surface-active);
+}
+
 .chat-session-row .chat-session {
   flex: 1 1 auto;
   width: auto;
@@ -5122,7 +5145,7 @@ h2 {
   place-items: center;
   width: 24px;
   height: 24px;
-  margin-top: 2px;
+  margin-left: auto;
   flex-shrink: 0;
   border: 0;
   border-radius: 6px;
@@ -5137,4 +5160,13 @@ h2 {
 
 .completion-panel {
   margin-top: 18px;
+}
+
+.app-shell[data-page="settings"] {
+  display: block;
+}
+
+.app-shell[data-page="settings"] > .sidebar,
+.app-shell[data-page="settings"] > .main-content {
+  display: none;
 }

@@ -56,6 +56,14 @@ export type TaskPlanStep = {
   verification: string[];
 };
 
+export type PlanStepProgress = {
+  step_id: string;
+  status: "pending" | "changed" | "validated" | "confirmed";
+  changed_files: string[];
+  iteration_ids: string[];
+  evidence: Array<{ criterion_id: string; evidence: string }>;
+};
+
 export type TaskBudget = {
   max_iterations: number;
   max_wall_time_seconds: number;
@@ -72,11 +80,17 @@ export type TaskBudget = {
 export type AgentMode = "conservative" | "standard" | "autonomous";
 export type TaskTrack = "cowork" | "code";
 
+export type ChatAttachment = { name: string; content: string };
+
 export type AgentTask = {
   id: string;
   run_id: string;
   goal: string;
+  display_name?: string | null;
   repository_id: string | null;
+  source_repository_id?: string | null;
+  workspace_path?: string | null;
+  workspace_kind?: "git" | "local" | null;
   status: "queued" | "planning" | "coding" | "testing" | "repairing" | "running" | "review" | "awaiting_approval" | "ready_for_pr" | "pr_created" | "completed" | "done" | "failed" | "cancelled" | "paused";
   plan: {
     objective: string;
@@ -104,7 +118,7 @@ export type AgentTask = {
 
 export type AgentAdvanceAction = "request_plan_approval" | "start_iteration" | "start_repair" | "run_tests";
 
-export type AgentAction = AgentAdvanceAction | "recover" | "await_plan_approval" | "connect_repository" | "create_branch" | "review_patch" | "wait_for_tests" | "review_completion" | "review_commit" | "review_push" | "review_pr" | "await_pr" | "completed" | "paused" | "cancelled" | "manual_review";
+export type AgentAction = AgentAdvanceAction | "recover" | "await_plan_approval" | "connect_repository" | "create_branch" | "review_patch" | "wait_for_tests" | "review_completion" | "review_local_completion" | "review_commit" | "review_push" | "review_pr" | "await_pr" | "completed" | "paused" | "cancelled" | "manual_review";
 
 export type AgentState = {
   task: AgentTask;
@@ -122,6 +136,8 @@ export type AgentState = {
   completion_scope_hash: string | null;
   completion_validation_hash: string | null;
   can_confirm_completion: boolean;
+  can_complete_local?: boolean;
+  plan_progress?: PlanStepProgress[];
 };
 
 export type AgentLoopRequest = {
@@ -158,6 +174,7 @@ export type TaskIteration = {
   status: "coding" | "testing" | "passed" | "failed" | "cancelled";
   changed_files: string[];
   patch_id: string | null;
+  no_changes?: boolean;
   checkpoint_id: string | null;
   test_result: TestRunResult | null;
   test_runs: TestRunResult[];
@@ -169,7 +186,7 @@ export type TaskIteration = {
 
 export type TestKind = "auto" | "pytest" | "frontend" | "static" | "script";
 
-export type CompletionCriterion = { id: string; text: string };
+export type CompletionCriterion = { id: string; text: string; step_id?: string | null };
 
 export type CompletionConfirmation = {
   scope_hash: string;
@@ -238,7 +255,7 @@ export type PatchPreview = {
   validation_changes: string[];
 };
 
-export type DraftPatch = PatchPreview & { rationale: string };
+export type DraftPatch = PatchPreview & { rationale: string; no_changes?: boolean };
 
 export type GitSnapshot = {
   branch: string;
@@ -253,6 +270,7 @@ export type CommitPreview = Omit<GitSnapshot, "clean"> & {
   scope_hash: string;
   excluded_files: string[];
   ready: boolean;
+  scope_blocked_files?: string[];
 };
 
 export type Approval = {

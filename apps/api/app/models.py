@@ -2,8 +2,11 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
+
+MAX_MESSAGE_CHARS = 32_000
+MAX_COMMIT_MESSAGE_CHARS = 2_000
 
 
 class ApiError(BaseModel):
@@ -150,6 +153,10 @@ AgentMode = Literal["conservative", "standard", "autonomous"]
 TaskTrack = Literal["cowork", "code"]
 
 
+class TaskModeRequest(BaseModel):
+    mode: AgentMode
+
+
 TestKind = Literal["auto", "pytest", "frontend", "static", "script"]
 
 
@@ -197,6 +204,7 @@ class ValidationChecksRequest(BaseModel):
 class CompletionCriterion(BaseModel):
     id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     text: str = Field(min_length=1, max_length=500)
+    step_id: str | None = Field(default=None, min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
 
     @model_validator(mode="after")
     def nonempty_text(self):
@@ -247,23 +255,77 @@ class CompletionConfirmation(CompletionConfirmationRequest):
 CompletionStatus = Literal["not_required", "pending", "stale", "confirmed"]
 
 
+class ChatAttachment(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    content: str = Field(max_length=65_536)
+
+    @model_validator(mode="after")
+    def bounded_file(self):
+        if not self.name.strip() or any(character in self.name for character in "\r\n\x00"):
+            raise PydanticCustomError("attachment_name", "Attachment names must be nonempty and contain no line breaks or NUL.")
+        if len(self.content.encode("utf-8")) > 65_536:
+            raise PydanticCustomError("attachment_size", "Each attachment must be at most 64 KiB of UTF-8 text.")
+        return self
+
+
+def validate_chat_metadata(payload: str, message_text: str | None, attachments: list[ChatAttachment] | None) -> None:
+    if message_text is None and attachments is None:
+        return
+    if message_text is None:
+        raise PydanticCustomError("attachment_metadata", "Attachment metadata requires the original message text.")
+    assembled = message_text
+    if attachments:
+        assembled += "\n\n" + "\n\n".join(f"# Attached: {item.name}\n```\n{item.content}\n```" for item in attachments)
+    if assembled != payload:
+        raise PydanticCustomError("attachment_metadata", "Message metadata must match the complete message and attachments.")
+
+
 class TaskCreateRequest(BaseModel):
-    goal: str = Field(min_length=1, max_length=32_000)
+    goal: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     repository_id: str | None = None
+    isolated_workspace: bool = False
     mode: AgentMode = "standard"
     track: TaskTrack = "code"
     validation_checks: list[ValidationCheck] = Field(default_factory=list, max_length=12)
     completion_criteria: list[CompletionCriterion] = Field(default_factory=list, max_length=12)
+    attachments: list[ChatAttachment] | None = Field(default=None, max_length=5)
+    message_text: str | None = Field(default=None, max_length=MAX_MESSAGE_CHARS)
 
     @model_validator(mode="after")
     def unique_ids(self):
         unique_checks(self.validation_checks)
         unique_completion_criteria(self.completion_criteria)
+        validate_chat_metadata(self.goal, self.message_text, self.attachments)
         return self
 
 
 class ChatMessageRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=32_000)
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    attachments: list[ChatAttachment] | None = Field(default=None, max_length=5)
+    message_text: str | None = Field(default=None, max_length=MAX_MESSAGE_CHARS)
+
+    @model_validator(mode="after")
+    def matching_metadata(self):
+        validate_chat_metadata(self.message, self.message_text, self.attachments)
+        return self
+
+
+class TaskNameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def trim_name(cls, value):
+        if isinstance(value, str):
+            if any(character in value for character in "\r\n\x00"):
+                raise PydanticCustomError("session_name", "A session name must contain no line breaks or NUL.")
+            return value.strip()
+        return value
+
+
+class ChatCancelRequest(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ChatMessageResponse(BaseModel):
@@ -271,18 +333,43 @@ class ChatMessageResponse(BaseModel):
 
 
 class PlanStep(BaseModel):
-    id: str
-    title: str
-    description: str
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    title: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=500)
     files: list[str] = Field(default_factory=list)
     risk: RiskLevel = "low"
     verification: list[str] = Field(default_factory=list)
 
+    @field_validator("title", "description")
+    @classmethod
+    def nonempty_text(cls, value):
+        value = value.strip()
+        if not value:
+            raise PydanticCustomError("empty_plan_step", "Plan steps must have a title and description.")
+        return value
+
+
+class PlanStepProgress(BaseModel):
+    step_id: str
+    status: Literal["pending", "changed", "validated", "confirmed"] = "pending"
+    changed_files: list[str] = Field(default_factory=list)
+    iteration_ids: list[str] = Field(default_factory=list)
+    evidence: list[CompletionEvidence] = Field(default_factory=list)
+
 
 class TaskPlan(BaseModel):
-    objective: str
-    repository_summary: str
-    steps: list[PlanStep]
+    objective: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    repository_summary: str = Field(max_length=1_000)
+    steps: list[PlanStep] = Field(min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def valid_steps(self):
+        self.objective = self.objective.strip()
+        if not self.objective:
+            raise PydanticCustomError("empty_plan_objective", "The task plan must have an objective.")
+        if len({step.id for step in self.steps}) != len(self.steps):
+            raise PydanticCustomError("duplicate_step_id", "Plan step ids must be unique.")
+        return self
 
 
 class TaskBudget(BaseModel):
@@ -304,7 +391,11 @@ class TaskSummary(BaseModel):
     id: str
     run_id: str
     goal: str
+    display_name: str | None = None
     repository_id: str | None = None
+    source_repository_id: str | None = None
+    workspace_path: str | None = None
+    workspace_kind: Literal["git", "local"] | None = None
     status: TaskStatus
     plan: TaskPlan | None = None
     error: str | None = None
@@ -341,6 +432,7 @@ class TaskIteration(BaseModel):
     status: IterationStatus
     changed_files: list[str] = Field(default_factory=list)
     patch_id: str | None = None
+    no_changes: bool = False
     checkpoint_id: str | None = None
     test_result: "TestRunResponse | None" = None
     test_runs: list["TestRunResponse"] = Field(default_factory=list)
@@ -356,11 +448,11 @@ class TaskIterationListResponse(BaseModel):
 
 
 class IterationCreateRequest(BaseModel):
-    goal: str | None = Field(default=None, min_length=1, max_length=32_000)
+    goal: str | None = Field(default=None, min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
 class RepairCreateRequest(BaseModel):
-    feedback: str | None = Field(default=None, max_length=4_000)
+    feedback: str | None = Field(default=None, max_length=MAX_MESSAGE_CHARS)
 
 
 class TaskActionResponse(BaseModel):
@@ -394,7 +486,7 @@ class GitSnapshotResponse(BaseModel):
 
 
 class CommitPreviewRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=2_000)
+    message: str = Field(min_length=1, max_length=MAX_COMMIT_MESSAGE_CHARS)
 
 
 class CommitPreviewResponse(BaseModel):
@@ -406,10 +498,11 @@ class CommitPreviewResponse(BaseModel):
     commit_message: str
     scope_hash: str
     ready: bool
+    scope_blocked_files: list[str] = Field(default_factory=list)
 
 
 class CommitCreateRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=MAX_COMMIT_MESSAGE_CHARS)
     scope_hash: str = Field(min_length=64, max_length=64)
 
 
@@ -636,13 +729,14 @@ class PatchApplyResponse(BaseModel):
 
 class DraftPatchRequest(BaseModel):
     context_paths: list[str] = Field(default_factory=list, max_length=20)
-    feedback: str | None = Field(default=None, max_length=4_000)
+    feedback: str | None = Field(default=None, max_length=MAX_MESSAGE_CHARS)
 
 
 class DraftPatchResponse(PatchPreviewResponse):
     """A model-drafted patch preview: the same shape the manual flow produces, plus the model's rationale."""
 
     rationale: str = ""
+    no_changes: bool = False
 
 
 class RollbackRequest(BaseModel):
@@ -705,6 +799,7 @@ AgentAction = Literal[
     "wait_for_tests",
     "start_repair",
     "review_completion",
+    "review_local_completion",
     "review_commit",
     "review_push",
     "review_pr",
@@ -718,14 +813,14 @@ AgentAction = Literal[
 
 class AgentAdvanceRequest(TestRunRequest):
     action: Literal["auto", "request_plan_approval", "start_iteration", "start_repair", "run_tests"] = "auto"
-    goal: str | None = Field(default=None, min_length=3, max_length=4_000)
-    feedback: str | None = Field(default=None, max_length=4_000)
+    goal: str | None = Field(default=None, min_length=1, max_length=MAX_MESSAGE_CHARS)
+    feedback: str | None = Field(default=None, max_length=MAX_MESSAGE_CHARS)
 
 
 class AgentLoopRequest(BaseModel):
-    """Kick the autonomous agent loop. `mode` sets the posture on the first start (None keeps the task's current posture on resume); `feedback` steers the next coding/repair iteration."""
+    """Kick the autonomous agent loop. An explicit `mode` updates the task posture (None keeps it); `feedback` steers the next coding/repair iteration."""
 
-    feedback: str | None = Field(default=None, max_length=4_000)
+    feedback: str | None = Field(default=None, max_length=MAX_MESSAGE_CHARS)
     mode: AgentMode | None = None
 
 
@@ -745,6 +840,8 @@ class AgentStateResponse(BaseModel):
     completion_scope_hash: str | None = None
     completion_validation_hash: str | None = None
     can_confirm_completion: bool = False
+    can_complete_local: bool = False
+    plan_progress: list[PlanStepProgress] = Field(default_factory=list)
 
 
 class AgentAdvanceResponse(AgentStateResponse):

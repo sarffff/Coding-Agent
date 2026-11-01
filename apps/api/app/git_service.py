@@ -15,8 +15,10 @@ from threading import RLock
 
 from .config import Settings
 from .file_policy import is_protected_path
+from .models import MAX_COMMIT_MESSAGE_CHARS
 from .process_env import child_env, is_process_startup_failure
 from .repository_service import RepositoryError, RepositoryRecord, RepositoryService
+from .test_service import _generated
 
 
 PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "production", "release"})
@@ -59,6 +61,16 @@ class GitService:
 
     def lock(self, repository_id: str) -> RLock:
         return self._locks.setdefault(repository_id, RLock())
+
+    @staticmethod
+    def out_of_scope_inputs(prepared: PreparedCommit) -> list[str]:
+        return [name for name in prepared.excluded_files if not is_protected_path(Path(name))
+                and not any(_generated(part) for part in Path(name).parts)]
+
+    def assert_scoped_inputs(self, repository_id: str, files: list[str]) -> None:
+        paths = self.out_of_scope_inputs(self.preview(repository_id, files, ""))
+        if paths:
+            raise RepositoryError("PUBLISH_INPUTS_OUT_OF_SCOPE", "Validation used uncommitted inputs outside this task's commit scope. Review them before committing or publishing; local completion remains available.", {"files": paths})
 
     def validation_hash(self, repository_id: str, files: list[str]) -> str:
         repository = self.repositories.get(repository_id)
@@ -127,8 +139,8 @@ class GitService:
 
     def commit(self, repository_id: str, files: list[str], message: str, scope_hash: str, branch: str) -> str:
         repository = self.repositories.get(repository_id)
-        if not message.strip() or len(message) > 256:
-            raise RepositoryError("INVALID_COMMIT_MESSAGE", "Commit message must be between 1 and 256 characters.")
+        if not message.strip() or len(message) > MAX_COMMIT_MESSAGE_CHARS:
+            raise RepositoryError("INVALID_COMMIT_MESSAGE", f"Commit message must be between 1 and {MAX_COMMIT_MESSAGE_CHARS} characters.")
         with self.lock(repository_id):
             prepared = self.preview(repository_id, files, message)
             if prepared.scope_hash != scope_hash:

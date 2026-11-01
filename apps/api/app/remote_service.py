@@ -449,6 +449,8 @@ class RemoteService:
 
     def _publish_snapshot(self, task: TaskSummary, require_pushed: bool = False):
         repository_id = self._require_repository(task)
+        if task.source_repository_id:
+            self.git.assert_scoped_inputs(repository_id, self.tasks.changed_files(task.id))
         changes = validation_guard_changes(self.repositories.get(repository_id), self.tasks.prepare_validation_guard(task.id))
         if changes:
             raise RepositoryError("VALIDATION_REVIEW_REQUIRED", "Review and explicitly confirm changed verification inputs before publishing.", {"paths": changes})

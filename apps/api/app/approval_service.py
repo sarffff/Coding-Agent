@@ -11,7 +11,7 @@ from .store import StateStore
 
 
 def plan_scope_hash(task: TaskSummary) -> str:
-    scope = task.id + "\n" + task.goal + "\n" + (task.plan.objective if task.plan else "")
+    scope = task.id + "\n" + task.goal + "\n" + (task.plan.model_dump_json() if task.plan else "")
     if task.validation_checks:
         scope += "\n" + "\n".join(check.model_dump_json() for check in task.validation_checks)
     if task.completion_criteria:

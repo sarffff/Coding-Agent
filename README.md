@@ -4,12 +4,22 @@
 
 2026-10-24 核心实现与回归已收口：489 个独立 API 用例去重覆盖为 487 通过、2 项 Windows 符号链接环境跳过；真实模型完成单文件修复、两文件修改与故障注入后的修复，并显式确认完成证据。真实 GitHub 链路已完成审批提交、推送、[Draft PR #1](https://github.com/sarffff/ai-agent/pull/1) 创建和远端核对；完整浏览器点击仍被本机权限策略阻断。结果、预算边界与证据口径见 [核心 Agent 验收报告](docs/core-agent-acceptance-20261024.md)。
 
+2026-10-31 的功能修正已通过当前 API 全套回归：568 passed、2 项 Windows 符号链接环境跳过，570 项去重核对无遗漏；隔离真实 HTTP 验收 6/6 通过。会话输入隔离、执行前准备、Cowork 取消重试、模型门禁和桌面后端恢复的结果及未验证范围见[功能修正报告](docs/functional-fixes-20261031.md)。
+
+同日后续完善了聊天执行摘要、工具结果、Markdown 阅读、上下文与预算展示，以及停止和刷新反馈。这批修改的本地检查与保留边界见[聊天展示完善报告](docs/chat-presentation-20261031.md)；真实使用与视觉验收由用户完成，上述 API/HTTP 数字属于前一批功能修正。
+
+上一批已补齐 Cowork 流式回复、已发送附件卡片、会话搜索/重命名、重启草稿恢复和聊天内本轮差异；同时修正刷新失败后连续发送、迟到创建、重命名和删除目录的会话归属。该批完整本地 API 回归 600 passed / 2 skipped，602 项去重覆盖无遗漏；桌面 9 组检查、类型、构建和产物检查通过。实现范围与草稿恢复方式见[聊天功能补齐报告](docs/chat-features-20261031.md)。
+
+前一批完善 Agent Coding 核心：修正最后一次调用回复的应用/验证流程、回滚及重启预算计时、异常模型响应和损坏备份回滚；增加命令写盘后的停止检测与选中上下文缺失提示。该批完整本地 API 回归 658 passed / 2 skipped，660 项收集和执行去重覆盖无遗漏；新增 58 项核心回归全部通过，桌面类型、聊天/工具结果检查、构建及产物检查通过。历史结果见[核心编码完善报告](docs/agent-coding-improvements-20261031.md)。
+
+2026-11-01 继续补齐每任务独立工作区、命令修改预览与重启恢复、大文件区段修改、嵌套目录规则、计划步骤与完成证据，以及普通目录和无需改动任务的本地完成。新建 Code 默认在独立目录执行，页面展示来源与执行路径；验证使用的未提交依赖超出任务范围时，阻止提交与发布。完整 API 回归 808 passed / 3 skipped，811 项收集与执行去重无遗漏；新增 151 个用例，原 660 个全部保留。类型、9 组桌面组件检查、构建、产物和 Python 语法检查通过。实现与使用边界见[剩余功能补齐报告](docs/agent-gap-completion-20261031.md)，真实模型、页面点击与视觉验收由用户完成。
+
 ## 目录
 
 ```text
 apps/
   desktop/   React + Vite + TypeScript 工作台
-    electron/  桌面壳（main / backend 生命周期 / preload / config），可选
+    electron/  默认桌面入口（main / backend 生命周期 / preload / config）
   api/       FastAPI 服务（仓库接入、编码循环、审批、Git、远程发布、审计）
 packages/
   types/     前后端共享领域类型
@@ -32,7 +42,7 @@ scripts/
 ## 环境要求
 
 - Node.js 20+，pnpm 12
-- Python 3.11+（开发与验证使用 3.14）
+- Python 3.11+（当前仓库 .venv 本地验证使用 3.12.13）
 - 可用的 `git` 命令行
 
 ## 安装与启动
@@ -42,9 +52,9 @@ pnpm install
 python -m venv .venv && .venv/Scripts/pip install -r apps/api/requirements-dev.txt   # Windows
 pnpm api:test        # 脚本会自动优先使用 .venv 中的解释器
 
-pnpm start          # 同时启动 API 与 Desktop（run.js）
+pnpm start          # 构建前端并启动 Electron，桌面托管本地 API
 pnpm api:dev        # 只启动 API：http://127.0.0.1:8000
-pnpm dev            # 只启动 Desktop：http://127.0.0.1:5173
+pnpm dev            # 启动 Electron 与 Vite 开发服务器，桌面托管 API
 ```
 
 `scripts/py.js` 与 `run.js` 会在存在 `.venv` 时使用其中的 Python，否则回落到 `python`/`python3`。
@@ -70,17 +80,17 @@ pnpm dev            # 只启动 Desktop：http://127.0.0.1:5173
 | `FORGE_ANTHROPIC_API_KEY` / `FORGE_OPENAI_API_KEY` | 同上 | 对应 Provider 的 API key，用于补丁起草；只进请求头 | 空 |
 | `FORGE_LLM_MODEL` | 同上 | 起草模型，须与 provider 匹配（anthropic 可设 `claude-opus-5-5`，openai 设 gpt 模型；其余 `FORGE_LLM_*`/`FORGE_OPENAI_API_URL` 见 `.env.example`） | `claude-sonnet-5-5` |
 | `FORGE_CORS_ORIGINS` | 同上 | 允许访问 API 的源 | `http://localhost:5173`、`http://127.0.0.1:5173` |
-| `VITE_API_BASE_URL` | `apps/desktop/.env` | Desktop 连接的 API 地址 | `http://127.0.0.1:8000` |
+| `VITE_API_BASE_URL` | `apps/desktop/.env` | 浏览器开发模式的 API 地址；Electron 使用托管地址 | `http://127.0.0.1:8000` |
 
 复制 `apps/api/.env.example` 与 `apps/desktop/.env.example` 为 `.env` 后再修改。
 
-设置页（账号菜单「设置」弹窗）可以保存多组「供应商 + 模型」，随时切换使用中的一组；切换会立即重建模型实例并写入 `config.json`，下次启动沿用。同一弹窗里还能改 API Key、接口地址、模型/命令超时和上下文上限。改动写入 `FORGE_STATE_DIR/config.json`（仅本人可读），启动时覆盖 `.env`；密钥只回显「已配置 / 未配置」，不会出现在界面、审计事件或错误响应里。保留期限、任务预算和工作区根仍是只读项，需要改环境变量并重启。
+设置页（账号菜单「设置」）可以保存多组「供应商 + 模型」，切换使用中的一组；切换会重建模型实例并写入 `config.json`，下次启动沿用。模型请求、编码循环或手动起草仍在运行时，服务端会在保存之前拒绝影响模型的改动；停止并等待请求退出后再切换。设置页还能改 API Key、接口地址、模型/命令超时和上下文上限。改动写入 `FORGE_STATE_DIR/config.json`（仅本人可读），启动时覆盖 `.env`；密钥只回显「已配置 / 未配置」，不会出现在界面、审计事件或错误响应里。保留期限、任务预算和工作区根仍是只读项，需要改环境变量并重启。
 
 > CORS 默认只放行 5173。Desktop 运行在其他端口时必须把该端口加入 `FORGE_CORS_ORIGINS`，否则请求会被浏览器拦截，界面表现为“没有仓库、没有任务”。桌面壳不需要这一步——它会把自己的来源注入 `FORGE_CORS_ORIGINS`。
 
 ## 桌面壳（Electron）
 
-`pnpm desktop:electron` 会构建前端、**自己拉起并托管本地 API**，然后打开原生窗口。与 `pnpm start`（浏览器 + `run.js`）并存，互不影响。
+`pnpm start` 与 `pnpm desktop:electron` 会构建前端、**拉起并托管本地 API**，然后打开原生窗口。`pnpm dev` 与 `pnpm desktop:electron:dev` 使用 Vite 热更新。需要单独运行 API 时使用 `pnpm api:dev` 或 `node run.js backend`。
 
 ```bash
 pnpm desktop:electron        # 构建产物 + 托管 API + 打开窗口
@@ -94,8 +104,8 @@ pnpm desktop:electron:smoke  # 隐藏窗口交互自检：14 条断言，全过�
 
 壳负责的事情：
 
-- **进程生命周期**：用 `.venv` 里的解释器（可用 `FORGE_PYTHON` 指定）以 `python -m uvicorn app.main:app --app-dir apps/api` 启动，只绑定 `127.0.0.1` 的临时端口；退出窗口时连同子进程一起结束。
-- **端口记忆与认领校验**：端口记在 `%LOCALAPPDATA%/Forge Coding Agent/forge-desktop.json`。重启沿用同一端口，因此前端无需重载；但若发现该端口上已有别的进程在应答 `/health`，壳会换端口——**绝不认领不是自己启动的 API**。
+- **进程生命周期**：用 `.venv` 里的解释器（可用 `FORGE_PYTHON` 指定）以 `python -m uvicorn app.main:app --app-dir apps/api` 启动，只绑定 `127.0.0.1` 的临时端口；退出窗口时等待子进程结束。启动失败或异常退出会显示错误与重试入口。
+- **端口记忆与认领校验**：端口记在 `%LOCALAPPDATA%/Forge Coding Agent/forge-desktop.json`。重启优先沿用同一端口；若被占用则换端口，每次前端请求读取最新托管地址。后端未就绪时请求会明确失败，不回落到其他本地 API。
 - **来源与凭据边界**：窗口通过特权自定义协议 `forge-app://desktop` 加载产物（`file://` 的 Origin 是 `null`，CORS 无法放行），并把 `forge-app://desktop` 注入 `FORGE_CORS_ORIGINS`。渲染进程 `contextIsolation + sandbox + 无 nodeIntegration`，只暴露 `window.forge` 的少量方法；外链交给系统浏览器，禁止 `<webview>`。
 - **状态位置**：`state.db` 与检查点落在 `userData/state`，后端日志在 `userData/logs/backend.log`（面板里可一键打开），不再依赖启动上下文的工作目录。
 - **工作区根目录**：壳用原生目录选择器维护 `FORGE_WORKSPACE_ROOT`（默认 `~/forge-workspace`），更换会重启后端且保持端口不变。它只是默认起点：仓库本身可以在磁盘任意位置，API 只拒绝盘符与文件系统根。
@@ -129,6 +139,8 @@ pnpm desktop:electron:smoke  # 隐藏窗口交互自检：14 条断言，全过�
 一个 Code 任务可以有最多 12 条「必跑检查」，它们定义任务必须通过的验证。清单不是建议：**只有所有检查都跑在当前代码上并通过，任务才能提交或进入交付**；配置了完成条件时，还必须逐条提交证据并显式确认。
 
 Code 聊天首次发送后先打开任务准备对话框：确认执行模式、查看或编辑必跑检查，保存后点击「开始任务」才启动后台循环。未保存的修改会阻止启动；关闭对话框后可从该任务的准备入口重新打开，启动失败可以在同一任务上重试。保守模式停在首次计划审批时，尚未开始编码迭代，仍可重新准备；运行中的循环和已开始的首轮不开放该入口。
+
+同一任务的准备对话框关闭后再打开会保留未保存编辑；打开另一任务的准备对话框会切换编辑实例，因此切换前请保存检查与完成条件。
 
 创建任务时若没显式给 `validation_checks`，服务端按仓库根 `package.json` 的 `scripts` 推导默认清单——`test`、`api:test`（与 `test` 不同时）、`typecheck`/`check`/`lint` 中第一个、`build`。推导出的检查都是 `script` 类型、工作目录 `.`、超时 300 秒，且**只记录脚本名，不记录脚本体**。没有 `package.json` 或没有这些脚本时清单为空，退回原来的自动检测单命令。
 
@@ -216,9 +228,19 @@ Code 聊天还可启动后台循环（`POST /api/v1/runs/{run_id}/loop`），停
 - **标准**：自动完成计划、补丁、测试及 Git 提交；推送与 PR 等待人工批准。普通文件夹在本地验证通过后停止，保留审阅和回滚入口。
 - **自治**：在已启用 Git 的目录中，还可自动推送和创建 Draft PR；普通文件夹仍只执行本地流程。
 
-模型输出统一经过补丁保护路径、大小和检查点门禁。模型只能修改或删除已提供完整上下文的文件，服务端绑定读取时的内容哈希；等待模型期间的外部修改会触发冲突，保留用户的新内容。停止会取消正在等待的模型请求，并在写盘前再次检查停止标记。模型起草、模型命令、Cowork 对话、GitHub 校验/推送/PR/刷新共享任务调用预算；成功模型或远程调用不会清除连续失败记录，只有测试通过才清零。Cowork 仍是附带可选目录摘要的聊天，不执行文件修改或命令。
+模型输出统一经过补丁保护路径、大小和检查点门禁。模型只能修改或删除已提供完整上下文的文件，服务端绑定读取时的内容哈希；等待模型期间的外部修改会触发冲突，保留用户的新内容。停止会取消正在等待的模型请求，并在写盘前再次检查停止标记。Code 的模型起草、模型命令、GitHub 校验/推送/PR/刷新共享任务调用预算；成功模型或远程调用不会清除连续失败记录，只有测试通过才清零。
+
+Cowork 使用每次请求的超时和上下文字节上限，长期会话不受 Code 累计预算封锁。可附带目录摘要及有限源码作为只读上下文，不执行文件修改或命令；发给模型的历史最多保留最近 40 条，并遵守上下文总字节上限，原始聊天记录仍完整保存。等待回复时可以停止，超时或取消后重新发送同一文本会复用原请求 ID；成功回复重试直接回放。助手正文支持基础 Markdown、表格和代码复制。聊天输入及附件按会话隔离，切换会话不会把迟到结果写进其他输入框。
 
 模型每轮只回一个 JSON 对象，二选一：请求上下文，或提交改动。请求上下文用 `context_requests`（每次最多 8 条 `search`、`read` 或 `run`），服务端执行后把命中的路径与文件并入下一轮的目标和上下文，最多 4 轮；仍然只提要求就返回 `MODEL_CONTEXT_LIMIT`，不会无限循环。改文件优先用 `edits`（`old_text` / `new_text`，每次替换必须在当前内容里唯一匹配，累计最多 100 处），也可以用 `content` 整文件重写；`create` / `delete` 不接受 `edits`。越界路径（`..`、绝对路径、盘符、`\0`）直接拒绝，未完整读过的已有文件不允许修改（`MODEL_CONTEXT_REQUIRED`）。每次检索与读取都记 `context.request` 审计事件，并计入任务调用预算。`run` 只能执行一个白名单程序（`python`/`pytest`/`node`/`npm`/`pnpm`/`yarn`/`go`/`cargo`/`ruff`/`mypy`/`tsc`/`eslint`），无 shell、工作目录为仓库根、超时受 `FORGE_COMMAND_TIMEOUT_SECONDS` 约束，子进程环境会剥离 `FORGE_*` 与凭据类变量；保守模式直接拒绝。白名单里包含 `npm`/`pnpm`/`yarn`，因此模型仍可能通过包脚本执行仓库里定义的任意代码——这是本地 Agent 的已知边界，不是沙箱。模型自己跑的命令不算验证证据，必跑检查仍会在改动后执行；真正执行的命令按次计入任务调用预算，被白名单挡下的不计。模型返回时若任务已被暂停或取消，这份回复会被丢弃，不落补丁。
+
+## 聊天结果与上下文
+
+Code 聊天正文末尾提供执行摘要，可查看当前轮次的改动文件、必跑检查、实际命令和完成条件进度，并进入文件浏览、执行记录或完成复核。过期检查不会计为通过，回滚后的改动不计为当前改动；修改前验证单独标记，不能代表改动后的验证完成。工具事件可展开查看修改行数、检查点、检查结果和失败文件行号。
+
+助手正文支持标题、列表、引用、任务列表、表格、行内代码与代码围栏。表格保留转义分隔符和行内代码中的竖线；代码复制保留原始缩进，并提示复制成功或失败。长代码局部滚动并支持键盘聚焦，原始 HTML 保持文本，链接仅开放安全协议。
+
+上下文菜单区分当前待发送输入/附件和上次实际请求，展示附件大小、请求模型与 Provider、读取时间、来源路径及上下文字节数。Code 预算展示轮次、耗时、调用次数和连续失败，并说明耗尽原因与下一步；字符数、字节数和调用预算不换算成 token 使用率。停止请求显示等待退出的状态，失败可重试；聊天记录加载或轮询失败时可刷新。
 
 ## 验证
 
@@ -229,7 +251,15 @@ pnpm check        # Desktop 类型检查
 pnpm build        # Desktop 生产构建
 pnpm desktop:smoke # 校验构建产物完整性与关键样式/DOM 字符串（不是交互回放）
 pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅、发布入口与验证清单编辑/锁定（不是浏览器点击）
+pnpm desktop:session-check # 编译实际 App/API 回调，检查会话归属、取消、重试及端口切换
+pnpm desktop:runtime-check # 托管进程生命周期、崩溃重试和桌面桥状态检查
+pnpm desktop:run-summary-check # 执行摘要：检查过期、回滚、失败定位和完成证据状态
+pnpm desktop:markdown-check # Markdown 子集、安全链接、原始代码复制与反馈
+pnpm desktop:event-details-check # 工具事件元数据、修改前验证和文件定位回调
+pnpm desktop:presentation-check # 上下文/附件、预算、停止反馈、刷新和摘要集成
 ```
+
+新增展示检查使用实际组件渲染和受控回调夹具，不连接真实模型或远端，也不代表真实窗口点击与视觉验收。
 
 ## 故障排查
 
@@ -261,7 +291,7 @@ pnpm desktop:chat-check # 真实组件渲染回归：文件夹、错误、审阅
 Phase 1（单仓库理解 → 计划 → 低风险修改 → 测试 → 审计 → 回滚）已实现，保留此前浏览器与 API 验证记录；本轮完整浏览器点击验收仍未完成。
 Phase 2 的本地部分与远程代码路径均已完成：多轮编码、验证循环、审批门禁、任务分支、提交、推送、GitHub Provider 与 Draft PR、幂等键、持久化与恢复。
 
-- 状态保存在本地 sqlite（默认 `.forge/state`，含检查点文件与提交/远程分支/PR 记录）；API 重启后未完成任务必须显式确认才继续写入。审计与测试输出有保留期限与上限（`FORGE_AUDIT_*` / `FORGE_TEST_OUTPUT_*`）。
+- 状态保存在本地 sqlite（默认 `.forge/state`，含检查点文件与提交/远程分支/PR 记录）；API 重启后未完成任务必须显式确认才继续写入。普通审计与测试输出有保留期限与上限（`FORGE_AUDIT_*` / `FORGE_TEST_OUTPUT_*`）；聊天记录保留到对应会话或文件夹会话被删除。
 - 真实 GitHub 验收已在 `sarffff/ai-agent` 完成独立夹具修复、完成确认、精确审批提交、任务分支推送与 [Draft PR #1](https://github.com/sarffff/ai-agent/pull/1) 创建/刷新；GitHub 独立核对 head、main 基点和两个夹具文件。离线回归仍使用 fake Provider，主应用和远端 main 未修改。
 - 幂等键覆盖 Agent 推进、推送和创建 PR；提交仍需审批与预览确认。
 - 任务预算熔断已接入：最大轮次、总耗时、远程调用次数、连续失败阈值（`FORGE_TASK_MAX_*`），任一触顶即锁定并转人工复核。

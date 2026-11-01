@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import RLock
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -11,11 +13,13 @@ from pydantic import BaseModel
 from .approval_service import plan_scope_hash
 from .config import Settings
 from .models import (
+    MAX_MESSAGE_CHARS,
     AgentMode,
     CompletionConfirmation,
     CompletionConfirmationRequest,
     CompletionCriterion,
     CompletionStatus,
+    PlanStepProgress,
     TaskBudget,
     TaskCheckpoint,
     TaskIteration,
@@ -115,6 +119,10 @@ class TaskService:
                                 record.summary.budget.consecutive_failures += 1
                 if record.summary.status in self.IN_FLIGHT_STATES:
                     record.summary.requires_recovery = True
+                    budget = record.summary.budget
+                    if budget.started_at and budget.waiting_since is None:
+                        # The API was not working after the last persisted activity.
+                        budget.waiting_since = max(record.summary.updated_at, budget.started_at + timedelta(seconds=budget.elapsed_seconds))
                     record.summary.next_action = "服务已重启。请确认要继续该任务，或选择回滚与取消。"
                     store.put("tasks", key, self._stored(record), record.summary.updated_at.isoformat())
                 self._tasks[record.summary.id] = record
@@ -222,11 +230,28 @@ class TaskService:
             max_consecutive_failures=self.settings.task_max_consecutive_failures,
         )
 
+    def _update_budget_wait(self, record: TaskRecord, waiting: bool, now: datetime) -> None:
+        budget = record.summary.budget
+        if not budget.started_at:
+            return
+        if waiting and budget.waiting_since is None:
+            budget.waiting_since = now
+        elif not waiting and budget.waiting_since is not None:
+            waited = max(0, (now - budget.waiting_since).total_seconds())
+            budget.started_at += timedelta(seconds=waited)
+            budget.waiting_since = None
+
     def _refresh_budget(self, record: TaskRecord, *, new_iteration: bool = False) -> TaskBudget:
         budget = record.summary.budget
+        if record.summary.track == "cowork":
+            # Chat is bounded per request, not by the lifetime of a conversation.
+            budget.started_at = budget.waiting_since = None
+            budget.elapsed_seconds = 0
+            budget.exhausted_reason = None
+            return budget
         budget.iterations = len(record.iterations)
         if budget.started_at:
-            if record.summary.status in self.HUMAN_WAIT_STATES and budget.waiting_since is None:
+            if (record.summary.status in self.HUMAN_WAIT_STATES or record.summary.requires_recovery) and budget.waiting_since is None:
                 # A task loaded mid-review (or parked by an older build) starts the pause here.
                 budget.waiting_since = datetime.now(timezone.utc)
             if budget.waiting_since is not None:
@@ -241,8 +266,6 @@ class TaskService:
                 budget.exhausted_reason = "wall_time"
             elif budget.consecutive_failures >= budget.max_consecutive_failures:
                 budget.exhausted_reason = "consecutive_failures"
-            elif budget.remote_calls >= budget.max_remote_calls:
-                budget.exhausted_reason = "remote_calls"
             elif budget.iterations >= budget.max_iterations and (
                 new_iteration or record.summary.status in {"failed", "repairing"}
                 or bool(record.iterations and record.iterations[-1].rolled_back)
@@ -272,7 +295,11 @@ class TaskService:
         with self._budget_lock:
             self.assert_budget_available(task_id)
             record = self._record(task_id)
-            record.summary.budget.started_at = record.summary.budget.started_at or datetime.now(timezone.utc)
+            if record.summary.track != "cowork":
+                if record.summary.budget.remote_calls >= record.summary.budget.max_remote_calls:
+                    record.summary.budget.exhausted_reason = "remote_calls"
+                    self.assert_budget_available(task_id)
+                record.summary.budget.started_at = record.summary.budget.started_at or datetime.now(timezone.utc)
             record.summary.budget.remote_calls += 1
             self._persist(record)
 
@@ -280,9 +307,11 @@ class TaskService:
         with self._budget_lock:
             record = self._record(task_id)
             budget = record.summary.budget
-            # Only a passing test proves the repair worked; a successful API call cannot reset failures.
+            # For code, only a passing test proves the repair worked; chat retries reset on success.
             if not succeeded:
                 budget.consecutive_failures += 1
+            elif record.summary.track == "cowork":
+                budget.consecutive_failures = 0
             self._refresh_budget(record)
             self._persist(record)
 
@@ -301,6 +330,7 @@ class TaskService:
             raise TaskStateError("Only tasks restored from a restart need recovery.", {"status": record.summary.status})
         record.summary.requires_recovery = False
         record.summary.updated_at = datetime.now(timezone.utc)
+        self._update_budget_wait(record, record.summary.status in self.HUMAN_WAIT_STATES, record.summary.updated_at)
         record.summary.next_action = "Continue the task from the last checkpoint."
         self._persist(record)
         return record.summary
@@ -344,6 +374,7 @@ class TaskService:
                 validation_checks=validation_checks or [],
                 completion_criteria=completion_criteria or [],
             )
+            self._validate_completion_steps(summary.plan, summary.completion_criteria)
         self._tasks[task_id] = TaskRecord(summary=summary)
         self._persist(self._tasks[task_id])
         return summary
@@ -368,11 +399,43 @@ class TaskService:
         self._persist(record)
         return record.summary
 
+    def bind_workspace(self, task_id: str, repository_id: str, source_repository_id: str,
+                       workspace_path: str, workspace_kind: Literal["git", "local"]) -> TaskSummary:
+        self.assert_recovered(task_id)
+        record = self._record(task_id)
+        if record.summary.track != "code" or record.iterations or record.summary.status != "awaiting_approval":
+            raise TaskStateError("Bind an isolated workspace before the first coding iteration.")
+        repository = self.repositories.get(repository_id)
+        self.repositories.get(source_repository_id)
+        self._validate_check_paths(repository, record.summary.validation_checks)
+        record.summary.repository_id = repository_id
+        record.summary.source_repository_id = source_repository_id
+        record.summary.workspace_path = workspace_path
+        record.summary.workspace_kind = workspace_kind
+        if record.summary.plan:
+            record.summary.plan.repository_summary = f"{repository.name} · 可恢复编码循环"
+        record.validation_guard = None
+        record.validation_baseline = []
+        record.validation_baseline_hash = None
+        record.validation_runners = {}
+        record.summary.completion_confirmation = None
+        record.summary.updated_at = datetime.now(timezone.utc)
+        self._persist(record)
+        return record.summary
+
     def set_mode(self, task_id: str, mode: AgentMode) -> TaskSummary:
         record = self._record(task_id)
         record.summary.mode = mode
         record.summary.updated_at = datetime.now(timezone.utc)
         self._persist(record)
+        return record.summary
+
+    def rename(self, task_id: str, name: str) -> TaskSummary:
+        record = self._record(task_id)
+        if record.summary.display_name != name:
+            record.summary.display_name = name
+            record.summary.updated_at = datetime.now(timezone.utc)
+            self._persist(record)
         return record.summary
 
     def changed_files(self, task_id: str) -> list[str]:
@@ -406,11 +469,56 @@ class TaskService:
                 if not target.is_relative_to(directory):
                     raise RepositoryError("INVALID_TEST_TARGET", "The test target must stay inside its working directory.")
 
+    def set_plan(self, task_id: str, plan: TaskPlan, criteria: list[CompletionCriterion] | None = None) -> TaskSummary:
+        self.assert_recovered(task_id)
+        record = self._record(task_id)
+        if record.summary.track != "code" or record.iterations or record.summary.status != "awaiting_approval":
+            raise TaskStateError("Configure the task plan before the first coding iteration.")
+        step_ids = {step.id for step in plan.steps}
+        conditions = list(criteria) if criteria is not None else [
+            criterion for criterion in record.summary.completion_criteria
+            if criterion.step_id is None or criterion.step_id in step_ids
+        ]
+        current_texts = {step.id: step.description if step.description.startswith(step.title) else step.title
+                         for step in plan.steps}
+        if criteria is None:
+            previous_texts = {step.id: {step.title, step.description if step.description.startswith(step.title) else step.title}
+                              for step in record.summary.plan.steps} if record.summary.plan else {}
+            conditions = [criterion.model_copy(update={"text": current_texts[criterion.step_id]})
+                          if criterion.step_id and criterion.text in previous_texts.get(criterion.step_id, set())
+                          else criterion for criterion in conditions]
+        bound = {criterion.step_id for criterion in conditions if criterion.step_id}
+        used_ids = {criterion.id for criterion in conditions}
+        for step in plan.steps:
+            if step.id not in bound:
+                criterion_id = step.id if step.id not in used_ids else f"criterion-{uuid4().hex[:10]}"
+                conditions.append(CompletionCriterion(id=criterion_id, text=current_texts[step.id], step_id=step.id))
+                used_ids.add(criterion_id)
+        self._validate_completion_steps(plan, conditions, require_steps=True)
+        record.summary.plan = plan.model_copy(deep=True)
+        record.summary.completion_criteria = [criterion.model_copy(deep=True) for criterion in conditions]
+        record.summary.completion_confirmation = None
+        record.summary.updated_at = datetime.now(timezone.utc)
+        record.summary.next_action = "Review and approve the updated plan and each step's completion conditions."
+        self._persist(record)
+        return record.summary
+
+    @staticmethod
+    def _validate_completion_steps(plan: TaskPlan | None, criteria: list[CompletionCriterion], *, require_steps: bool = False) -> None:
+        if len(criteria) > 12 or len({criterion.id for criterion in criteria}) != len(criteria):
+            raise RepositoryError("INVALID_COMPLETION_CRITERIA", "Provide at most 12 completion conditions with unique ids.")
+        step_ids = {step.id for step in plan.steps} if plan else set()
+        bound = {criterion.step_id for criterion in criteria if criterion.step_id}
+        if not bound.issubset(step_ids) or ((require_steps or bound) and bound != step_ids):
+            raise RepositoryError("INVALID_COMPLETION_STEPS", "Bind a completion condition to every plan step and use only current step ids.")
+
     def set_completion_criteria(self, task_id: str, criteria: list[CompletionCriterion]) -> TaskSummary:
         self.assert_recovered(task_id)
         record = self._record(task_id)
         if record.summary.track != "code" or record.iterations or record.summary.status != "awaiting_approval":
             raise TaskStateError("Configure completion criteria before the first coding iteration.")
+        self._validate_completion_steps(record.summary.plan, criteria,
+                                        require_steps=any(criterion.step_id for criterion in record.summary.completion_criteria))
         record.summary.completion_criteria = criteria
         record.summary.completion_confirmation = None
         record.summary.updated_at = datetime.now(timezone.utc)
@@ -424,16 +532,24 @@ class TaskService:
         return bool(latest and latest.status == "passed" and latest.validation_hash == validation_hash
                     and self.validation_passed(task_id, validation_hash))
 
+    @staticmethod
+    def _completion_evidence_valid(summary: TaskSummary, payload: CompletionConfirmationRequest) -> bool:
+        expected = {criterion.id for criterion in summary.completion_criteria} or {"task-goal"}
+        supplied = [item.criterion_id for item in payload.evidence]
+        return (len(supplied) == len(expected) and set(supplied) == expected
+                and all(item.evidence.strip() for item in payload.evidence))
+
     def completion_status(self, task_id: str, validation_hash: str | None) -> CompletionStatus:
         record = self._record(task_id)
-        if not record.summary.completion_criteria:
-            return "not_required"
         confirmation = record.summary.completion_confirmation
+        if not record.summary.completion_criteria and confirmation is None:
+            return "not_required"
         if confirmation is None:
             return "pending"
         if (not record.iterations or confirmation.iteration_id != record.iterations[-1].id
                 or confirmation.scope_hash != plan_scope_hash(record.summary)
                 or confirmation.validation_hash != validation_hash
+                or not self._completion_evidence_valid(record.summary, confirmation)
                 or not self._completion_validation_passed(task_id, validation_hash)):
             return "stale"
         return "confirmed"
@@ -441,8 +557,8 @@ class TaskService:
     def confirm_completion(self, task_id: str, payload: CompletionConfirmationRequest, validation_hash: str | None) -> TaskSummary:
         self.assert_recovered(task_id)
         record = self._record(task_id)
-        if not record.summary.completion_criteria:
-            raise RepositoryError("COMPLETION_NOT_REQUIRED", "This task has no completion criteria to confirm.")
+        if record.summary.track != "code":
+            raise TaskStateError("Completion confirmation requires a coding task.")
         if record.summary.status != "ready_for_pr" or record.summary.agent_blocked_reason:
             raise RepositoryError("COMPLETION_VALIDATION_REQUIRED", "Passing current validation is required before confirming completion.")
         if (not record.iterations or payload.iteration_id != record.iterations[-1].id
@@ -451,9 +567,8 @@ class TaskService:
             raise RepositoryError("COMPLETION_CONFIRMATION_STALE", "The task scope, iteration or validation changed. Review completion again.")
         if not self._completion_validation_passed(task_id, validation_hash):
             raise RepositoryError("COMPLETION_VALIDATION_REQUIRED", "Passing current validation is required before confirming completion.")
-        expected = {criterion.id for criterion in record.summary.completion_criteria}
-        supplied = [item.criterion_id for item in payload.evidence]
-        if len(supplied) != len(expected) or set(supplied) != expected or any(not item.evidence.strip() for item in payload.evidence):
+        self._validate_completion_steps(record.summary.plan, record.summary.completion_criteria)
+        if not self._completion_evidence_valid(record.summary, payload):
             raise RepositoryError("INVALID_COMPLETION_EVIDENCE", "Provide nonempty evidence for every completion criterion exactly once.")
         now = datetime.now(timezone.utc)
         record.summary.completion_confirmation = CompletionConfirmation(
@@ -463,6 +578,46 @@ class TaskService:
         record.summary.next_action = "Review the final diff and approve commit or PR creation."
         self._persist(record)
         return record.summary
+
+    def complete_local(self, task_id: str, validation_hash: str | None) -> TaskSummary:
+        self.assert_recovered(task_id)
+        record = self._record(task_id)
+        if record.summary.track != "code" or record.summary.status != "ready_for_pr" or record.summary.agent_blocked_reason:
+            raise RepositoryError("LOCAL_COMPLETION_NOT_READY", "A local task can finish only after its current iteration passes validation.")
+        if not self._completion_validation_passed(task_id, validation_hash):
+            raise RepositoryError("COMPLETION_VALIDATION_REQUIRED", "Passing current validation is required before completing the local task.")
+        if self.completion_status(task_id, validation_hash) != "confirmed":
+            raise RepositoryError("COMPLETION_REQUIRED", "Confirm current completion evidence before completing the local task.")
+        self._transition(record, "completed")
+        record.summary.next_action = "Local task completed. Review the saved evidence and changed files."
+        self._persist(record)
+        return record.summary
+
+    def plan_progress(self, task_id: str, validation_hash: str | None) -> list[PlanStepProgress]:
+        record = self._record(task_id)
+        if not record.summary.plan:
+            return []
+        validated = self._completion_validation_passed(task_id, validation_hash)
+        confirmation = record.summary.completion_confirmation if self.completion_status(task_id, validation_hash) == "confirmed" else None
+        progress = []
+        for step in record.summary.plan.steps:
+            prefixes = [path.replace("\\", "/").removeprefix("./").rstrip("/") for path in step.files if path.strip()]
+            matches = []
+            for iteration in record.iterations:
+                if iteration.rolled_back:
+                    continue
+                files = [path for path in iteration.changed_files
+                         if any(prefix == "." or path.replace("\\", "/") == prefix
+                                or path.replace("\\", "/").startswith(prefix + "/") for prefix in prefixes)]
+                if files:
+                    matches.append((iteration.id, files))
+            criterion_ids = {criterion.id for criterion in record.summary.completion_criteria if criterion.step_id == step.id}
+            evidence = [item for item in confirmation.evidence if item.criterion_id in criterion_ids] if confirmation else []
+            status = "confirmed" if criterion_ids and len(evidence) == len(criterion_ids) else "validated" if matches and validated else "changed" if matches else "pending"
+            progress.append(PlanStepProgress(step_id=step.id, status=status,
+                                             changed_files=sorted({path for _, files in matches for path in files}),
+                                             iteration_ids=[iteration_id for iteration_id, _ in matches], evidence=evidence))
+        return progress
 
     def assert_completion_ready(self, task_id: str, validation_hash: str | None) -> None:
         status = self.completion_status(task_id, validation_hash)
@@ -541,11 +696,29 @@ class TaskService:
         if record.summary.status not in {"coding", "repairing", "failed"}:
             raise TaskStateError("A patch can only be applied during a coding iteration.", {"status": record.summary.status})
         iteration.patch_id = patch_id
+        iteration.no_changes = False
         iteration.checkpoint_id = checkpoint_id
         iteration.changed_files = files
         iteration.updated_at = datetime.now(timezone.utc)
         self._transition(record, "testing")
         record.summary.next_action = "Run the selected tests for this iteration."
+        self.clear_agent_block(record.summary.id)
+        self._persist(record)
+        return iteration
+
+    def mark_no_changes(self, run_id: str, rationale: str) -> TaskIteration:
+        record = self._record_by_run(run_id)
+        self.assert_recovered(record.summary.id)
+        iteration = self._current_iteration(record)
+        if record.summary.status not in {"coding", "repairing"} or iteration.patch_id or iteration.rolled_back:
+            raise TaskStateError("A no-change result requires a current coding iteration without an applied patch.")
+        iteration.no_changes = True
+        iteration.status = "testing"
+        iteration.updated_at = datetime.now(timezone.utc)
+        if record.summary.status == "repairing":
+            self._transition(record, "coding")
+        self._transition(record, "testing")
+        record.summary.next_action = f"No source changes proposed: {rationale.strip()}. Run all required validation before reviewing completion evidence."
         self.clear_agent_block(record.summary.id)
         self._persist(record)
         return iteration
@@ -622,11 +795,15 @@ class TaskService:
         if record.summary.status != "awaiting_approval" or record.iterations:
             raise TaskStateError("Only an unstarted task plan can be revised.", {"status": record.summary.status})
         goal = f"{record.summary.goal}\n\nReview feedback:\n{feedback}"
-        if len(goal) > 4_000:
-            raise RepositoryError("PLAN_GOAL_TOO_LONG", "The revised goal exceeds 4000 characters. Shorten the review feedback.")
+        if len(goal) > MAX_MESSAGE_CHARS:
+            raise RepositoryError("PLAN_GOAL_TOO_LONG", f"The revised goal exceeds {MAX_MESSAGE_CHARS} characters. Shorten the review feedback.")
         repository = self.repositories.get(record.summary.repository_id) if record.summary.repository_id else None
         record.summary.goal = goal
-        record.summary.plan = self._build_plan(goal, repository)
+        if record.summary.plan and any(criterion.step_id for criterion in record.summary.completion_criteria):
+            record.summary.plan = record.summary.plan.model_copy(update={"objective": goal})
+        else:
+            record.summary.plan = self._build_plan(goal, repository)
+        record.summary.completion_confirmation = None
         record.summary.updated_at = datetime.now(timezone.utc)
         record.summary.next_action = "Review and approve the revised task plan."
         self._persist(record)
@@ -640,7 +817,7 @@ class TaskService:
             raise TaskStateError("Review revisions require a coding, failed or validated task.", {"status": record.summary.status})
         if record.summary.status == "ready_for_pr":
             self._transition(record, "awaiting_approval")
-        return self.start_iteration(task_id, f"{record.summary.goal}\n\nReview feedback:\n{feedback}"[:4_000])
+        return self.start_iteration(task_id, f"{record.summary.goal}\n\nReview feedback:\n{feedback}")
 
     def pause(self, task_id: str) -> TaskSummary:
         record = self._record(task_id)
@@ -696,6 +873,7 @@ class TaskService:
         record.summary.resume_state = None
         record.summary.next_action = "Start a new coding iteration after reviewing the restored files."
         record.summary.updated_at = datetime.now(timezone.utc)
+        self._update_budget_wait(record, record.summary.requires_recovery, record.summary.updated_at)
         self.clear_agent_block(record.summary.id)
         self._persist(record)
         return record.summary
@@ -719,16 +897,7 @@ class TaskService:
         if target not in self.ALLOWED_TRANSITIONS.get(current, set()):
             raise TaskStateError(f"Cannot transition task from {current} to {target}.", {"from": current, "to": target})
         now = datetime.now(timezone.utc)
-        budget = record.summary.budget
-        if budget.started_at:
-            if target in self.HUMAN_WAIT_STATES and budget.waiting_since is None:
-                budget.waiting_since = now
-            elif current in self.HUMAN_WAIT_STATES and target not in self.HUMAN_WAIT_STATES and budget.waiting_since is not None:
-                # Push the start forward by the wait so `now - started_at` stays agent-only time.
-                waited = (now - budget.waiting_since).total_seconds()
-                if waited > 0:
-                    budget.started_at = budget.started_at + timedelta(seconds=waited)
-                budget.waiting_since = None
+        self._update_budget_wait(record, target in self.HUMAN_WAIT_STATES or record.summary.requires_recovery, now)
         record.summary.status = target
         record.summary.updated_at = now
 
@@ -752,6 +921,18 @@ class TaskService:
     def _build_plan(self, goal: str, repository: RepositoryRecord | None) -> TaskPlan:
         repository_name = repository.name if repository else "当前工作区"
         has_git = bool(repository and repository.has_git)
+        listed = re.findall(r"^\s*(?:[-*•]\s+|\d+[.)、]\s*|[一二三四五六七八九十]+[、.)]\s*)(.+?)\s*$", goal, re.MULTILINE)
+        if len(listed) < 2:
+            listed = [item.strip() for item in re.split(r"[;；]", goal) if item.strip()]
+        if len(listed) >= 2:
+            if len(listed) > 12:
+                raise RepositoryError("PLAN_TOO_MANY_STEPS", "A task can contain at most 12 explicit subgoals. Split this request into separate tasks.")
+            if any(len(item) > 500 for item in listed):
+                raise RepositoryError("PLAN_STEP_TOO_LONG", "Each explicit subgoal must contain at most 500 characters. Shorten the listed requirements.")
+            return TaskPlan(objective=goal.strip(), repository_summary=f"{repository_name} · 可恢复编码循环", steps=[
+                {"id": f"step-{index + 1}", "title": item[:120], "description": item}
+                for index, item in enumerate(listed)
+            ])
         lower_goal = goal.lower()
         if any(keyword in lower_goal for keyword in ("test", "测试", "bug", "修复", "fix")):
             first_title = "定位相关代码与失败路径"

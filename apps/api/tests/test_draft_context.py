@@ -84,8 +84,11 @@ def test_root_instructions_use_existing_safe_read_and_context_limits(model_api, 
         else:
             monkeypatch.setattr(main.settings, "llm_max_context_bytes", 1_000)
     FakeModelProvider.seed([PatchFile(path="app.py", content="def value():\n    return 2\n")])
-    post(client, f"/api/v1/runs/{task['run_id']}/patches/draft", {"context_paths": ["app.py"]})
-    _, context, _ = FakeModelProvider._calls[-1]
+    original = (directory / "app.py").read_bytes()
+    context = main.agent_service._gather_context(task["repository_id"], ["app.py"], task["id"], task["goal"], None)
+    response = client.post(f"/api/v1/runs/{task['run_id']}/patches/draft", json={"context_paths": ["app.py"]})
+    assert response.status_code == 400 and response.json()["code"] == "MODEL_CONTEXT_LIMIT", response.text
+    assert (directory / "app.py").read_bytes() == original
     assert "AGENTS.md" not in dict(context)
     assert dict(context)["app.py"].splitlines()[-1].strip() == "return 1"
     assert len(context) <= main.settings.llm_max_context_files

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
+from collections.abc import AsyncIterator
 from typing import Literal
 
 import httpx
@@ -31,9 +33,14 @@ class ContextRequest(BaseModel):
     query: str | None = Field(default=None, min_length=1, max_length=500)
     path: str | None = Field(default=None, min_length=1, max_length=4_096)
     command: list[str] | None = Field(default=None, min_length=1, max_length=32)
+    start_line: int | None = Field(default=None, ge=1, strict=True)
+    end_line: int | None = Field(default=None, ge=1, strict=True)
 
     @model_validator(mode="after")
     def validate_action(self) -> ContextRequest:
+        if self.start_line is not None or self.end_line is not None:
+            if self.action != "read" or self.start_line is None or self.end_line is None or self.end_line < self.start_line:
+                raise ValueError("Only read requests can select a range, with 1 <= start_line <= end_line.")
         if self.action == "run":
             if not self.command or self.query is not None or self.path is not None:
                 raise ValueError("A run request requires a command and cannot include a query or path.")
@@ -58,16 +65,18 @@ class PatchProposal:
     files: list[PatchFile] = field(default_factory=list)
     rationale: str = ""
     context_requests: list[ContextRequest] = field(default_factory=list)
+    no_changes: bool = False
 
 
 _SYSTEM_PROMPT = (
     "You are a coding agent that edits files in a user's repository. Given a goal and the "
     "current content of relevant files, produce the minimal set of edits that achieve it. "
     "First search and read more files if you need implementation, callers, or tests to understand the change. "
-    "Respond with ONLY one JSON object: request context OR propose edits, never both. "
+    "Respond with ONLY one JSON object: request context, propose edits, OR explicitly report no changes needed. "
     "To request context (at most 8 requests per response):\n"
     '{"context_requests": [{"action": "search", "query": "<literal text or filename>"}, '
     '{"action": "read", "path": "<repo-relative path>"}, '
+    '{"action": "read", "path": "<large file path>", "start_line": 100, "end_line": 180}, '
     '{"action": "run", "command": ["<program>", "<arg>"]}]}\n'
     "`run` executes one program (no shell, repository root, time-limited) and returns its exit code and output; "
     "use it to reproduce a failure or run a single test. It may be unavailable. "
@@ -84,7 +93,14 @@ _SYSTEM_PROMPT = (
     "Use at most 100 edits in total. Do not combine content and edits; create/delete cannot use edits. "
     "Rules: only touch files the goal needs; `content` is the whole file, never a diff; never "
     "write secrets or files under .env/keys/vendor/build dirs; keep the existing code style. "
-    "Only update or delete files whose complete contents are supplied in the context; request a read first otherwise. "
+    "Whole-file replacement or deletion requires the complete file contents in the context; request a read first otherwise. "
+    "For large files, read a bounded line range. Only `update` with `edits` is allowed on a range: "
+    "old_text must match uniquely inside the currently supplied range; never use content or delete. "
+    "Reading another range replaces that file's previous range. Follow each AGENTS.md only within its directory and descendants. "
+    "If the goal is already satisfied and no edits are necessary, respond with "
+    '{"no_changes": true, "rationale": "<specific evidence that no edits are needed>"}. '
+    "Do not combine no_changes with file edits or context requests. This only requests validation; "
+    "required checks and human completion evidence still determine whether the task is complete. "
     "All paths must be repository-relative with no '..' components."
 )
 
@@ -104,7 +120,7 @@ def extract_proposal_json(text: str) -> dict:
     """Pull the proposal JSON object out of a model reply.
 
     Tolerates ```json fences and surrounding prose by decoding the first `{...}` that
-    parses as an object with a `files` or `context_requests` key. Uses json.raw_decode (not a brace counter)
+    parses as an object with a `files`, `context_requests`, or `no_changes` key. Uses json.raw_decode (not a brace counter)
     so braces inside the generated file content never confuse the span boundaries.
     """
     if not text or not text.strip():
@@ -116,17 +132,24 @@ def extract_proposal_json(text: str) -> dict:
             parsed, _ = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and ("files" in parsed or "context_requests" in parsed):
+        if isinstance(parsed, dict) and ("files" in parsed or "context_requests" in parsed or "no_changes" in parsed):
             return parsed
     raise RepositoryError("MODEL_INVALID_OUTPUT", "The model response did not contain a valid patch proposal.")
 
 def _proposal_from_payload(payload: dict, context_files: list[tuple[str, str]] | None = None) -> PatchProposal:
     raw_files = payload.get("files", [])
     raw_requests = payload.get("context_requests", [])
+    no_changes = payload.get("no_changes", False)
     if not isinstance(raw_files, list) or not isinstance(raw_requests, list) or (raw_files and raw_requests):
         raise RepositoryError("MODEL_INVALID_OUTPUT", "Return either file edits or context requests, not both.")
+    if not isinstance(no_changes, bool):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "no_changes must be a boolean.")
     rationale = payload.get("rationale")
     rationale = rationale if isinstance(rationale, str) else ""
+    if no_changes:
+        if raw_files or raw_requests or not rationale.strip():
+            raise RepositoryError("MODEL_INVALID_OUTPUT", "An explicit no_changes reply requires a nonempty rationale and cannot include edits or context requests.")
+        return PatchProposal(rationale=rationale, no_changes=True)
     if raw_requests:
         if len(raw_requests) > 8:
             raise RepositoryError("MODEL_INVALID_OUTPUT", "Request at most 8 context operations at a time.")
@@ -138,6 +161,7 @@ def _proposal_from_payload(payload: dict, context_files: list[tuple[str, str]] |
     if not raw_files:
         raise RepositoryError("MODEL_INVALID_OUTPUT", "The model proposal did not list any file edits.")
     context = {os.path.normcase(_relative_path(path)): (path, content) for path, content in context_files or []}
+    partials = {os.path.normcase(_relative_path(path)): source for path, source in getattr(context_files, "partial_files", {}).items()}
     files: list[PatchFile] = []
     edit_count = 0
     for item in raw_files:
@@ -151,6 +175,7 @@ def _proposal_from_payload(payload: dict, context_files: list[tuple[str, str]] |
         except (ValidationError, ValueError) as exc:
             raise RepositoryError("MODEL_INVALID_OUTPUT", f"Invalid proposed edit: {exc}") from exc
         baseline = context.get(os.path.normcase(proposed.path))
+        partial = partials.get(os.path.normcase(proposed.path))
         if "edits" in item:
             edits = item["edits"]
             if proposed.operation != "update" or "content" in item or not isinstance(edits, list) or not edits:
@@ -162,16 +187,27 @@ def _proposal_from_payload(payload: dict, context_files: list[tuple[str, str]] |
             raise RepositoryError("MODEL_CONTEXT_REQUIRED", "Read the complete file before proposing changes.", {"path": proposed.path})
         if baseline is not None:
             proposed.path = _relative_path(baseline[0])
+        if partial is not None and (hashlib.sha256(partial.source_content.encode("utf-8")).hexdigest() != partial.content_hash or
+                                    baseline[1] != partial.source_content[partial.start:partial.end]):
+            raise RepositoryError("PATCH_CONFLICT", "The partial context no longer matches its captured complete file.", {"path": proposed.path})
+        if partial is not None and (proposed.operation != "update" or "edits" not in item):
+            raise RepositoryError("MODEL_CONTEXT_REQUIRED", "A partially read file can only use text edits within its supplied line range. Read the complete file before replacing or deleting it.", {"path": proposed.path})
         if "edits" in item:
-            content = baseline[1]
+            content = partial.source_content if partial is not None else baseline[1]
+            start, end = (partial.start, partial.end) if partial is not None else (0, len(content))
             for edit in edits:
                 if not isinstance(edit, dict) or not isinstance(edit.get("old_text"), str) or not edit["old_text"] or not isinstance(edit.get("new_text"), str):
                     raise RepositoryError("MODEL_INVALID_OUTPUT", "Each text edit requires nonempty old_text and string new_text.")
                 old_text = edit["old_text"]
-                match = content.find(old_text)
-                if match < 0 or match != content.rfind(old_text):
+                visible = content[start:end]
+                match = visible.find(old_text)
+                if match < 0 or match != visible.rfind(old_text):
+                    if partial is not None:
+                        raise RepositoryError("MODEL_EDIT_CONFLICT", "The text to replace must appear exactly once within the supplied line range. Read the required range first, use unique old_text, and preserve CRLF.", {"path": proposed.path})
                     raise RepositoryError("MODEL_EDIT_CONFLICT", "The text to replace must appear exactly once in the current file. Use the smallest unique old_text without a newline for a single-line change; preserve CRLF, or provide complete file content.", {"path": proposed.path})
+                match += start
                 content = content[:match] + edit["new_text"] + content[match + len(old_text):]
+                end += len(edit["new_text"]) - len(old_text)
             proposed.content = content
         files.append(proposed)
     return PatchProposal(files=files, rationale=rationale)
@@ -185,6 +221,12 @@ def _build_prompt(goal: str, context_files: list[tuple[str, str]], failure: str 
         parts.append("# Current files")
         for path, content in context_files:
             note = "\nThis file contains CRLF (\\r\\n); preserve \\r\\n in multiline old_text." if "\r\n" in content else ""
+            partial = getattr(context_files, "partial_files", {}).get(path)
+            if partial is not None:
+                note += (f"\nPartial file: lines {partial.start_line}-{partial.end_line} of {partial.total_lines}. "
+                         "Only these lines are supplied. Use update with edits within this range; content and delete are forbidden.")
+            if PurePosixPath(path).name == "AGENTS.md":
+                note += f"\nInstruction scope: {PurePosixPath(path).parent.as_posix()}/ and its descendants."
             parts.append(f"## {path}{note}\n```\n{content}\n```")
     else:
         parts.append("# Current files\n(None supplied; search and read existing files before modifying them.)")
@@ -212,6 +254,10 @@ class ModelProvider(ABC):
     async def chat(self, messages: list[tuple[str, str]], system: str | None = None) -> str:
         """Plain conversational turn: (role, content) history in, assistant text out. No file edits."""
         ...
+
+    async def chat_stream(self, messages: list[tuple[str, str]], system: str | None = None) -> AsyncIterator[str]:
+        # Providers without streaming return one complete reply; never simulate typing.
+        yield await self.chat(messages, system)
 
 
 # Backoff before the 2nd and 3rd attempts on 429/5xx (incl. 529 overloaded) or a dropped connection.
@@ -242,7 +288,80 @@ async def _post_json(settings: Settings, url: str, headers: dict[str, str], payl
         raise RepositoryError("MODEL_RATE_LIMITED", "The model API rate limit was exceeded.")
     if resp.status_code >= 400:
         raise RepositoryError("MODEL_ERROR", f"Model API error: {resp.status_code}")
-    return resp.json()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model API returned invalid JSON.") from exc
+    if not isinstance(data, dict):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model API response must be a JSON object.")
+    return data
+
+
+def _anthropic_text(data: dict) -> str:
+    reason = data.get("stop_reason")
+    if reason == "max_tokens":
+        raise _truncated()
+    if reason not in (None, "end_turn", "stop_sequence"):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model could not complete the reply.")
+    blocks = data.get("content")
+    if not isinstance(blocks, list) or any(not isinstance(block, dict) for block in blocks):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model API returned invalid content blocks.")
+    texts = [block.get("text") for block in blocks if block.get("type") == "text"]
+    if any(not isinstance(text, str) for text in texts):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model API returned invalid text content.")
+    return "".join(texts)
+
+
+def _openai_text(data: dict) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model API returned invalid completion choices.")
+    choice = choices[0]
+    if choice.get("finish_reason") == "length":
+        raise _truncated()
+    if choice.get("finish_reason") not in (None, "stop"):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model could not complete the reply.")
+    message = choice.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model API returned invalid text content.")
+    return message["content"]
+
+
+async def _stream_data(settings: Settings, url: str, headers: dict[str, str], payload: dict) -> AsyncIterator[str]:
+    """Read complete SSE data frames; a failed partial response is never restarted."""
+    try:
+        async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
+            async with client.stream("POST", url, headers=headers, json={**payload, "stream": True}) as response:
+                if response.status_code == 401:
+                    raise RepositoryError("MODEL_AUTH_FAILED", "The model API key is invalid or missing.")
+                if response.status_code == 429:
+                    raise RepositoryError("MODEL_RATE_LIMITED", "The model API rate limit was exceeded.")
+                if response.status_code >= 400:
+                    raise RepositoryError("MODEL_ERROR", f"Model API error: {response.status_code}")
+                data: list[str] = []
+                async for line in response.aiter_lines():
+                    if not line:
+                        if data:
+                            yield "\n".join(data)
+                            data = []
+                    elif line.startswith("data:"):
+                        data.append(line[5:].lstrip(" "))
+                if data:
+                    yield "\n".join(data)
+    except httpx.TimeoutException as exc:
+        raise RepositoryError("MODEL_TIMEOUT", "The model request did not finish in time.") from exc
+    except httpx.RequestError as exc:
+        raise RepositoryError("MODEL_NETWORK_ERROR", "The model stream was interrupted. Retry the request.") from exc
+
+
+def _stream_json(data: str) -> dict:
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model returned an invalid stream event.") from exc
+    if not isinstance(parsed, dict):
+        raise RepositoryError("MODEL_INVALID_OUTPUT", "The model returned an invalid stream event.")
+    return parsed
 
 
 class AnthropicModelProvider(ModelProvider):
@@ -258,11 +377,7 @@ class AnthropicModelProvider(ModelProvider):
             {"model": self.settings.llm_model, "max_tokens": self.settings.llm_max_tokens, "system": _SYSTEM_PROMPT,
              "messages": [{"role": "user", "content": _build_prompt(goal, context_files, failure)}]},
         )
-        if data.get("stop_reason") == "max_tokens":
-            raise _truncated()
-        blocks = data.get("content") or []
-        text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text")
-        return _proposal_from_payload(extract_proposal_json(text), context_files)
+        return _proposal_from_payload(extract_proposal_json(_anthropic_text(data)), context_files)
 
     async def chat(self, messages: list[tuple[str, str]], system: str | None = None) -> str:
         if not self.settings.anthropic_api_key:
@@ -274,8 +389,34 @@ class AnthropicModelProvider(ModelProvider):
             {"model": self.settings.llm_model, "max_tokens": self.settings.llm_max_tokens, "system": _compose_chat_system(system),
              "messages": [{"role": role, "content": content} for role, content in messages]},
         )
-        blocks = data.get("content") or []
-        return "".join(block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text").strip()
+        return _anthropic_text(data).strip()
+
+    async def chat_stream(self, messages: list[tuple[str, str]], system: str | None = None) -> AsyncIterator[str]:
+        if not self.settings.anthropic_api_key:
+            raise RepositoryError("MODEL_AUTH_FAILED", "FORGE_ANTHROPIC_API_KEY is not set.")
+        finished = False
+        stop_reason = None
+        async for data in _stream_data(self.settings, f"{self.settings.anthropic_api_url.rstrip('/')}/v1/messages",
+                                       {"x-api-key": self.settings.anthropic_api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                       {"model": self.settings.llm_model, "max_tokens": self.settings.llm_max_tokens,
+                                        "system": _compose_chat_system(system), "messages": [{"role": role, "content": content} for role, content in messages]}):
+            event = _stream_json(data)
+            kind = event.get("type")
+            if kind == "error":
+                raise RepositoryError("MODEL_ERROR", "The model API reported a streaming error.")
+            if kind == "message_delta":
+                stop_reason = event.get("delta", {}).get("stop_reason")
+                if stop_reason == "max_tokens":
+                    raise _truncated()
+            if kind == "message_stop":
+                finished = stop_reason is not None
+                break
+            block = event.get("delta", {}) if kind == "content_block_delta" else event.get("content_block", {}) if kind == "content_block_start" else {}
+            content = block.get("text") if block.get("type") in {"text", "text_delta"} else None
+            if isinstance(content, str) and content:
+                yield content
+        if not finished:
+            raise RepositoryError("MODEL_NETWORK_ERROR", "The model stream ended before completion. Retry the request.")
 
 
 class OpenAIModelProvider(ModelProvider):
@@ -297,11 +438,7 @@ class OpenAIModelProvider(ModelProvider):
              "messages": [{"role": "system", "content": _SYSTEM_PROMPT},
                           {"role": "user", "content": _build_prompt(goal, context_files, failure)}]},
         )
-        choices = data.get("choices") or []
-        if choices and isinstance(choices[0], dict) and choices[0].get("finish_reason") == "length":
-            raise _truncated()
-        text = choices[0].get("message", {}).get("content", "") if choices and isinstance(choices[0], dict) else ""
-        return _proposal_from_payload(extract_proposal_json(text), context_files)
+        return _proposal_from_payload(extract_proposal_json(_openai_text(data)), context_files)
 
     async def chat(self, messages: list[tuple[str, str]], system: str | None = None) -> str:
         if not self.settings.openai_api_key:
@@ -314,8 +451,40 @@ class OpenAIModelProvider(ModelProvider):
             {"Authorization": f"Bearer {self.settings.openai_api_key}", "content-type": "application/json"},
             {"model": self.settings.llm_model, "max_tokens": self.settings.llm_max_tokens, "messages": payload_messages},
         )
-        choices = data.get("choices") or []
-        return (choices[0].get("message", {}).get("content", "") if choices and isinstance(choices[0], dict) else "").strip()
+        return _openai_text(data).strip()
+
+    async def chat_stream(self, messages: list[tuple[str, str]], system: str | None = None) -> AsyncIterator[str]:
+        if not self.settings.openai_api_key:
+            raise RepositoryError("MODEL_AUTH_FAILED", "FORGE_OPENAI_API_KEY is not set.")
+        finished = False
+        async for data in _stream_data(self.settings, f"{self.settings.openai_api_url.rstrip('/')}/chat/completions",
+                                       {"Authorization": f"Bearer {self.settings.openai_api_key}", "content-type": "application/json"},
+                                       {"model": self.settings.llm_model, "max_tokens": self.settings.llm_max_tokens,
+                                        "messages": [{"role": "system", "content": _compose_chat_system(system)},
+                                                     *[{"role": role, "content": content} for role, content in messages]]}):
+            if data == "[DONE]":
+                break
+            event = _stream_json(data)
+            if "error" in event:
+                raise RepositoryError("MODEL_ERROR", "The model API reported a streaming error.")
+            choices = event.get("choices") or []
+            choice = next((item for item in choices if isinstance(item, dict) and item.get("index", 0) == 0), None)
+            if not choice:
+                continue
+            reason = choice.get("finish_reason")
+            if reason == "length":
+                raise _truncated()
+            if reason == "content_filter":
+                raise RepositoryError("MODEL_INVALID_OUTPUT", "The model could not complete the reply.")
+            if reason in {"stop", "tool_calls", "function_call"}:
+                finished = True
+            elif reason is not None:
+                raise RepositoryError("MODEL_INVALID_OUTPUT", "The model returned an unknown completion reason.")
+            content = choice.get("delta", {}).get("content")
+            if isinstance(content, str) and content:
+                yield content
+        if not finished:
+            raise RepositoryError("MODEL_NETWORK_ERROR", "The model stream ended before completion. Retry the request.")
 
 
 class FakeModelProvider(ModelProvider):
